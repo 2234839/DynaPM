@@ -1,5 +1,5 @@
 import pm2, { type StartOptions } from 'pm2';
-import type { DynaPM_Config } from './configDef';
+import type { DynaPM_Config, pm2ItemConfig } from './configDef';
 import { runCheck } from './runCheck';
 
 export const pm2Map = {
@@ -18,9 +18,8 @@ export const pm2Map = {
       // exec_mode: 'cluster',
       // instances: 1,
     } satisfies StartOptions,
-  } satisfies DynaPM_Config,
-};
-type pm2Item = (typeof pm2Map)[keyof typeof pm2Map];
+  },
+} satisfies DynaPM_Config;
 setInterval(() => {
   Object.entries(pm2Map).forEach(([hostname, target]) => {
     if (target.runStatus === 'running' && Date.now() - target.latestTime > target.stopTime) {
@@ -43,7 +42,7 @@ const pm2Connect = new Promise((r) => {
 });
 
 export const pm2Manage = {
-  async start(target: pm2Item) {
+  async start(target: pm2ItemConfig) {
     const time1 = Date.now();
     await pm2Connect;
     let status = await getProcessStatus(target.pm2Options.name);

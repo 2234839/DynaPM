@@ -2,7 +2,7 @@ import fastify from 'fastify';
 const proxyPort = 83;
 import reply from '@fastify/reply-from';
 import { pm2Manage, pm2Map } from './manage/pm2';
-pm2Manage;
+
 const proxy = fastify();
 
 proxy.register(reply, {});

@@ -12,7 +12,13 @@
 
 ```bash
 pnpm i dynapm -g
-dynapm ./apps.json
+```
+
+在要执行命令的目录下创建一个 dynapm.config.ts 配置文件，内容如下
+
+```ts
+// 需要满足 [DynaPM_Config](./src/manage/configDef.ts#DynaPM_Config) 接口的要求 ,我还没想好怎么才能给这里的文件类型约束
+export default {};
 ```
 
 ## 引言

@@ -1,4 +1,4 @@
-import type { DynaPM_Config } from './configDef';
+import type { DynaPM_Config, DynaPM_items } from './configDef';
 
 export function getBase200(base: string): Promise<boolean> {
   return fetch(base)
@@ -8,7 +8,7 @@ export function getBase200(base: string): Promise<boolean> {
     });
 }
 
-export async function runCheck(config: DynaPM_Config) {
+export async function runCheck(config: DynaPM_items) {
   const time1 = Date.now();
   if (config.runCheck === 'getBase200') {
     while (1) {
@@ -23,6 +23,7 @@ export async function runCheck(config: DynaPM_Config) {
         continue;
       }
     }
+    return true;
   } else {
     config.runCheck satisfies never;
 

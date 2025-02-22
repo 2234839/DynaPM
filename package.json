@@ -1,6 +1,6 @@
 {
   "name": "dynapm",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "DynaPM is a dynamic start-stop application management tool with serverless-like features designed for resource-constrained environments. It starts and stops programs on demand, optimizes resource usage, and is suitable for private deployments. ",
   "main": "index.js",
   "bin": {
@@ -9,7 +9,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "rslib build",
-    "publish2npm": "pnpm tsx ./script/updateVersion.ts &&  npm publish --registry=https://registry.npmjs.org",
+    "publish2npm": "pnpm build && pnpm tsx ./script/updateVersion.ts &&  npm publish --registry=https://registry.npmjs.org",
     "runTestServer": "pnpm tsx ./test/server1.ts"
   },
   "files": [
@@ -29,13 +29,15 @@
   },
   "dependencies": {
     "@fastify/reply-from": "^12.0.2",
+    "c12": "^2.0.4",
     "fastify": "^5.2.1",
     "pm2": "^5.4.3"
   },
   "devDependencies": {
     "@rslib/core": "^0.4.1",
-    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.51.0",
     "@types/node": "^22.13.4",
-    "tsx": "^4.19.3"
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.51.0"
   }
 }

@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "esnext", // 使用最新的 ECMAScript 特性
+    "module": "esnext", // 使用 ES 模块
+    "lib": ["esnext", "dom"], // 包含最新的 ES 特性和 DOM API
+    "strict": true, // 启用所有严格类型检查选项
+    "noImplicitAny": true, // 禁止隐式的 any 类型
+    "strictNullChecks": true, // 启用严格的 null 检查
+    "strictFunctionTypes": true, // 启用严格的函数类型检查
+    "strictBindCallApply": true, // 启用严格的 bind/call/apply 检查
+    "strictPropertyInitialization": true, // 启用严格的属性初始化检查
+    "noImplicitThis": true, // 禁止隐式的 this 类型
+    "alwaysStrict": true, // 在编译的 JS 文件中使用 "use strict"
+    "noUnusedLocals": false, // 禁止未使用的局部变量
+    "noUnusedParameters": false, // 禁止未使用的函数参数
+    "noImplicitReturns": true, // 禁止函数中未明确返回的路径
+    "noFallthroughCasesInSwitch": true, // 禁止 switch 语句中的 fallthrough
+    "esModuleInterop": true, // 允许使用 CommonJS 模块的默认导入
+    "forceConsistentCasingInFileNames": true, // 强制文件名大小写一致
+    "skipLibCheck": true, // 跳过声明文件的类型检查
+    "moduleResolution": "node", // 使用 Node.js 的模块解析策略
+    "resolveJsonModule": true, // 允许导入 JSON 模块
+    "isolatedModules": true, // 确保每个模块可以独立编译
+    "noEmitOnError": true // 在编译时遇到错误时不生成输出文件
+  },
+  "include": ["src/**/*"], // 仅包含 src 目录下的文件
+  "exclude": ["node_modules", "**/*.spec.ts"] // 排除 node_modules 和测试文件
+}
