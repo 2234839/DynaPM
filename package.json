@@ -1,6 +1,6 @@
 {
-  "name": "DynaPM",
-  "version": "1.0.0",
+  "name": "dynapm",
+  "version": "1.0.1",
   "description": "",
   "main": "index.js",
   "bin": {
@@ -9,25 +9,32 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "rslib build",
+    "publish2npm": "pnpm tsx ./script/updateVersion.ts &&  npm publish --registry=https://registry.npmjs.org",
     "runTestServer": "pnpm tsx ./test/server1.ts"
   },
-  "keywords": [],
-  "author": "",
+  "files": [
+    "dist/src/",
+    "*.md"
+  ],
+  "keywords": [
+    "serverless",
+    "pm2",
+    "self-host"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
+  "author": "崮生",
   "license": "ISC",
   "dependencies": {
     "@fastify/reply-from": "^12.0.2",
     "fastify": "^5.2.1",
-    "pm2": "^5.4.3",
-    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.51.0"
+    "pm2": "^5.4.3"
   },
   "devDependencies": {
     "@rslib/core": "^0.4.1",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.51.0",
     "@types/node": "^22.13.4",
     "tsx": "^4.19.3"
-  },
-  "pnpm": {
-    "overrides": {
-      "DynaPM": "link:"
-    }
   }
 }
