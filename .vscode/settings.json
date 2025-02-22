@@ -1,0 +1,8 @@
+{
+    "explorer.fileNesting.enabled": true,
+    "explorer.fileNesting.expand": true,
+    "explorer.fileNesting.patterns": {
+        "package.json": "pnpm-lock.yaml,rslib.config.ts,yarn.lock,LICENSE,CHANGELOG*,CNAME,.gitattributes,.eslintrc-auto-import.json,.gitignore,prettier.config.cjs,stylelint.config.js,commitlint.config.js,.stylelintignore,.prettierignore,.gitpod.yml,.eslintrc.cjs,.eslintignore",
+        "README.md": "README_zh.md,DEV.md"
+    },
+}
