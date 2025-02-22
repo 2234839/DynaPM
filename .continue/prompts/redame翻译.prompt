@@ -1,0 +1,16 @@
+name: readme翻译
+description: 从中文 readme 文件生成英文版
+---
+
+
+请翻译 @README_zh.md 输出为英文文档
+
+## 例如下面这样
+
+```md
+# mcp_agent_ts
+
+[中文文档](./README_zh.md)  //这里的锚文本使用中文
+
+<其他内容（使用英文）>
+```

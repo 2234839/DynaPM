@@ -15,8 +15,8 @@ export const pm2Map = {
       name: 'test',
       script: './dist/test/test.mjs',
       interpreter: 'node',
-      exec_mode: 'cluster',
-      instances: 1,
+      // exec_mode: 'cluster',
+      // instances: 1,
     } satisfies StartOptions,
   } satisfies DynaPM_Config,
 };

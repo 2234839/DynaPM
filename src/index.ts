@@ -24,6 +24,8 @@ proxy.listen({ port: proxyPort, host: '127.0.0.1' }, (err) => {
   if (err) {
     console.log('[err]', err);
   } else {
+    console.log('服务启动成功');
+
     console.log(`[proxy] listening on port ${proxyPort}`);
   }
 });

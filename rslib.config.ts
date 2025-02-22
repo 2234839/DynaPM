@@ -15,5 +15,18 @@ export default defineConfig({
         },
       },
     },
+    {
+      format: 'cjs',
+      source: {
+        entry: {
+          index: './src/index.ts',
+        },
+      },
+      output: {
+        distPath: {
+          root: './dist/src',
+        },
+      },
+    },
   ],
 });

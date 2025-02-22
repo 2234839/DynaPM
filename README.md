@@ -1,37 +1,42 @@
 # DynaPM
 
-这是一个动态启停程序的管理程序，具有一些类 serverless 特性。
-目的是为了在私有化部署\资源受限的情况下维持大量低频访问+少数高频访问的程序同时可以提供在线服务。
+[中文文档](./README_zh.md)
 
-每次用户访问其中某个程序时，如果该程序离线则网关暂时挂起请求同时立刻启动程序，程序启动完毕后网关充当反向代理。
+This is a program management tool for dynamically starting and stopping programs, with some serverless-like features. The goal is to maintain a large number of low-frequency accessed programs while keeping a few high-frequency accessed programs running online, all while dealing with limited resources in a private deployment environment.
 
-内存不足，或程序长时间无人访问时自动关闭程序解决服务器资源。
+Each time a user accesses one of these programs, if the program is offline, the gateway temporarily suspends the request and immediately starts the program. Once the program starts successfully, the gateway acts as a reverse proxy.
 
-## 引言
-我经常想写一些长期运行的程序，我既希望能够随时打开这些程序的网站，或者调用他们的接口。
-但显然这些程序并不是时刻都在工作的，所以我还希望在没有工作的时候他们除了磁盘空间外一点点 cpu 和 ram 都不占用。
-所以我以前看中了 serverless ,但 serverless 在部署等方面还是比较麻烦，而且并没有办法利用我的空闲服务器。
+When memory is insufficient or a program has been idle for a long time, the program is automatically shut down to free up server resources.
 
-现在我可以利用 DynaPM 保持成千上万个程序的随时伺服，只要我的磁盘空间还够用
-当然受限于机器的实际情况峰值同时运行的程序可能只有几十个，但事实上我过去写的大部分程序的伺服时间并不长，所以这个限制应该不会成为问题。
+Starting the simplest Node.js HTTP program using pm2 takes approximately 600ms.
 
-## 特性
+```log
+Starting [test]
+Starting [test] took 601 ms
+Stopping [test]
+Starting [test]
+Starting [test] took 592 ms
+Stopping [test]
+```
 
-- [x] 请求到来时才使用 pm2 启动 hostname 所对应的程序
-- [x] 空闲时关闭程序
-- [ ] 支持自动扩容
-- [ ] 支持持久运行（支持当空闲 ram 不足时才关闭程序）
-- [ ] 支持 cron 定时任务
-- [ ] 支持动态启停 docker 容器
+## Introduction
 
-## 性能
+I often want to write programs that run continuously, and I hope to be able to access their websites or call their APIs at any time. However, these programs are not always working, so I also hope that when they are not working, they consume almost no CPU or RAM except for disk space. Previously, I looked into serverless solutions, but they were still quite麻烦 in terms of deployment and did not fully utilize my idle servers.
+
+Now I can use DynaPM to keep thousands of programs ready for immediate access as long as my disk space allows. Of course, the actual number of programs that can run simultaneously may be limited to dozens depending on the machine's capacity, but most of the programs I have written in the past do not have long service times, so this limitation should not be a problem.
+
+## Features
+
+- [x] Start programs using pm2 when a request arrives
+- [x] Shut down programs when they are idle
+- [ ] Support auto-scaling
+- [ ] Support persistent operation (only shut down programs when idle RAM is insufficient)
+- [ ] Support cron jobs
+- [ ] Support dynamically starting and stopping Docker containers
+- [ ] Support starting programs using spawn/fork
+
+## Performance
 
 ### fastify + @fastify/reply-from
-在冷启动完毕后，运行 `autocannon http://127.0.0.1:83` 测试性能如下
-┌───────────┬────────┬────────┬────────┬────────┬────────┬─────────┬────────┐
-│ Stat      │ 1%     │ 2.5%   │ 50%    │ 97.5%  │ Avg    │ Stdev   │ Min    │
-├───────────┼────────┼────────┼────────┼────────┼────────┼─────────┼────────┤
-│ Req/Sec   │ 2,643  │ 2,643  │ 3,045  │ 3,177  │ 2,983  │ 174.7   │ 2,642  │
-├───────────┼────────┼────────┼────────┼────────┼────────┼─────────┼────────┤
-│ Bytes/Sec │ 449 kB │ 449 kB │ 518 kB │ 540 kB │ 507 kB │ 29.7 kB │ 449 kB │
-└───────────┴────────┴────────┴────────┴────────┴────────┴─────────┴────────┘
+
+After a cold start, testing performance with `autocannon http://127.0.0.1:83` yields an average of 3000 req/s.
