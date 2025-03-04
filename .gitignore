@@ -8,5 +8,4 @@ auto-*.d.ts
 .idea
 .history
 
-
-commit.sh
+.githooks
