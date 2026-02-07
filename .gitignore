@@ -9,3 +9,5 @@ auto-*.d.ts
 .history
 
 .githooks
+
+/logs

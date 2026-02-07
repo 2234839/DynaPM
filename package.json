@@ -7,7 +7,9 @@
     "dynapm": "dist/src/index.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "tsx test/test-all.ts",
+    "test:watch": "nodemon --watch src --exec 'pnpm test'",
+    "benchmark": "node test/benchmark.js",
     "build": "rslib build",
     "publish2npm": "pnpm build && pnpm tsx ./script/updateVersion.ts &&  npm publish --registry=https://registry.npmjs.org",
     "runTestServer": "pnpm tsx ./test/server1.ts"
@@ -31,7 +33,7 @@
     "@fastify/reply-from": "^12.0.2",
     "c12": "^2.0.4",
     "fastify": "^5.2.1",
-    "pm2": "^5.4.3"
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "@rslib/core": "^0.4.1",
