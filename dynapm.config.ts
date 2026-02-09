@@ -23,8 +23,8 @@ const config: DynaPMConfig = {
       startTimeout: 10 * 1000,
 
       commands: {
-        // 使用 nohup 后台启动，输出到日志文件
-        start: `nohup node ${process.cwd()}/test/services/app1.js > ${logDir}/app1.log 2>&1 &`,
+        // 使用 nohup 后台启动，统一输出到 services.log
+        start: `nohup node ${process.cwd()}/test/services/app1.js >> ${logDir}/services.log 2>&1 &`,
         // 使用端口查找并杀死进程（更可靠）
         stop: `lsof -ti:3001 | xargs -r kill -9`,
         // 使用 lsof 检查端口是否被监听
@@ -44,7 +44,7 @@ const config: DynaPMConfig = {
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup node ${process.cwd()}/test/services/app2.js > ${logDir}/app2.log 2>&1 &`,
+        start: `nohup node ${process.cwd()}/test/services/app2.js >> ${logDir}/services.log 2>&1 &`,
         stop: `lsof -ti:3002 | xargs -r kill -9`,
         check: `lsof -ti:3002 >/dev/null 2>&1`,
       },
@@ -64,9 +64,45 @@ const config: DynaPMConfig = {
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup node ${process.cwd()}/test/services/app3.js > ${logDir}/app3.log 2>&1 &`,
+        start: `nohup node ${process.cwd()}/test/services/app3.js >> ${logDir}/services.log 2>&1 &`,
         stop: `lsof -ti:3003 | xargs -r kill -9`,
         check: `lsof -ti:3003 >/dev/null 2>&1`,
+      },
+
+      healthCheck: {
+        type: 'tcp',
+      },
+    },
+
+    // SSE 测试服务
+    'sse.test': {
+      name: 'sse-server',
+      base: 'http://127.0.0.1:3010',
+      idleTimeout: 10 * 1000,
+      startTimeout: 10 * 1000,
+
+      commands: {
+        start: `nohup npx tsx ${process.cwd()}/test/server-sse.ts >> ${logDir}/services.log 2>&1 &`,
+        stop: `lsof -ti:3010 | xargs -r kill -9`,
+        check: `lsof -ti:3010 >/dev/null 2>&1`,
+      },
+
+      healthCheck: {
+        type: 'tcp',
+      },
+    },
+
+    // WebSocket 测试服务
+    'ws.test': {
+      name: 'ws-server',
+      base: 'http://127.0.0.1:3011',
+      idleTimeout: 10 * 1000,
+      startTimeout: 10 * 1000,
+
+      commands: {
+        start: `nohup npx tsx ${process.cwd()}/test/server-ws.ts >> ${logDir}/services.log 2>&1 &`,
+        stop: `lsof -ti:3011 | xargs -r kill -9`,
+        check: `lsof -ti:3011 >/dev/null 2>&1`,
       },
 
       healthCheck: {

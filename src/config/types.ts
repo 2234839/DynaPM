@@ -50,6 +50,8 @@ export interface ServiceConfig {
 export interface ServiceState {
   status: 'offline' | 'starting' | 'online';
   lastAccessTime: number;
+  /** 当前活动连接数（HTTP/SSE/WebSocket） */
+  activeConnections: number;
   pid?: number;
 }
 

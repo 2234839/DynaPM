@@ -7,5 +7,5 @@ const server = http.createServer((req, res) => {
 
 const PORT = 3002;
 server.listen(PORT, () => {
-  console.log(`App 2 listening on port ${PORT}`);
+  console.log(`[app2] 服务已启动，监听端口 ${PORT}`);
 });

@@ -1,28 +1,12 @@
 import { Gateway } from './core/gateway.js';
 import { loadDynaPMConfig } from './config/loader.js';
-import { createWriteStream, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import pino from 'pino';
 
 /**
- * 格式化时间为北京时间（UTC+8）
- */
-function formatTimestamp(): string {
-  // 获取 UTC 时间并转换为北京时间（UTC+8）
-  const utcDate = new Date();
-  const beijingDate = new Date(utcDate.getTime() + 8 * 60 * 60 * 1000);
-
-  const year = beijingDate.getFullYear();
-  const month = String(beijingDate.getMonth() + 1).padStart(2, '0');
-  const day = String(beijingDate.getDate()).padStart(2, '0');
-  const hours = String(beijingDate.getHours()).padStart(2, '0');
-  const minutes = String(beijingDate.getMinutes()).padStart(2, '0');
-  const seconds = String(beijingDate.getSeconds()).padStart(2, '0');
-
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-}
-
-/**
- * 创建日志写入流
+ * 创建高性能日志系统
+ * 使用 pino 异步日志，避免阻塞事件循环
  */
 function createLogger() {
   // 创建 logs 目录
@@ -34,35 +18,29 @@ function createLogger() {
   }
 
   const logFile = join(logDir, 'dynapm.log');
-  const stream = createWriteStream(logFile, { flags: 'w' }); // 改为 'w' 模式，每次启动清空旧日志
 
-  // 重写 console.log 和 console.error
-  const originalLog = console.log;
-  const originalError = console.error;
+  // 创建 pino logger（异步写入，性能优化）
+  const logger = pino(
+    {
+      level: 'info',
+      // 使用更简洁的时间格式
+      timestamp: pino.stdTimeFunctions.isoTime,
+      // 序列化错误对象
+      serializers: {
+        err: pino.stdSerializers.err,
+        error: pino.stdSerializers.err,
+      },
+      // 不需要自定义的 key
+      base: undefined,
+    },
+    pino.destination({
+      dest: logFile,
+      sync: false, // 异步写入（关键优化）
+      minLength: 0, // 立即写入，不缓冲
+    })
+  );
 
-  console.log = (...args: any[]) => {
-    const message = args.map(arg =>
-      typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
-    ).join(' ');
-    const timestamp = formatTimestamp();
-    const logMessage = `[${timestamp}] ${message}\n`;
-
-    originalLog(logMessage.trim());
-    stream.write(logMessage);
-  };
-
-  console.error = (...args: any[]) => {
-    const message = args.map(arg =>
-      typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
-    ).join(' ');
-    const timestamp = formatTimestamp();
-    const logMessage = `[${timestamp}] ERROR: ${message}\n`;
-
-    originalError(logMessage.trim());
-    stream.write(logMessage);
-  };
-
-  return stream;
+  return logger;
 }
 
 /**
@@ -72,16 +50,32 @@ function createLogger() {
 async function main() {
   const logger = createLogger();
 
+  // 全局错误处理，防止未捕获的异常导致进程退出
+  process.on('uncaughtException', (err: Error) => {
+    logger.error({ msg: '❌ 未捕获的异常', error: err.message, stack: err.stack });
+    // 不退出进程，只记录错误
+  });
+
+  process.on('unhandledRejection', (reason: unknown) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    logger.error({ msg: '❌ 未处理的 Promise rejection', error: message });
+    // 不退出进程，只记录错误
+  });
+
+  // 启动日志
+  logger.info({ msg: 'DynaPM 网关启动中...' });
+
   try {
     // 加载配置
     const config = await loadDynaPMConfig();
 
     // 创建并启动网关
-    const gateway = new Gateway(config);
+    const gateway = new Gateway(config, logger);
     await gateway.start();
+
+    logger.info({ msg: 'DynaPM 网关已启动', port: config.port || 3000 });
   } catch (error) {
-    console.error('启动失败:', error);
-    logger.end();
+    logger.error({ msg: '启动失败', error });
     process.exit(1);
   }
 }

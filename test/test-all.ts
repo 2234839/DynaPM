@@ -323,7 +323,7 @@ async function test9_POST请求() {
       { timeout: 5000 }
     );
 
-    const lines = stdout.trim().split('\n');
+    const lines = stdout.toString().trim().split('\n');
     const status = parseInt(lines[lines.length - 1]);
 
     if (status === 200 || status === 201) {
@@ -333,6 +333,166 @@ async function test9_POST请求() {
     }
   } catch (err: any) {
     throw new Error(`POST 请求失败: ${err.message}`);
+  }
+}
+
+async function test10_SSE连接() {
+  info('测试 SSE 流式传输');
+
+  // 确保 SSE 服务离线
+  try {
+    await execAsync('lsof -ti:3010 | xargs -r kill -9 2>/dev/null');
+    await sleep(500);
+  } catch {
+    // 服务可能未运行，忽略错误
+  }
+
+  try {
+    // 使用 curl 测试 SSE 连接（增加超时和更好的错误处理）
+    const { stdout } = await execAsync(
+      `curl --noproxy "*" -s -N -H "Host: sse.test" --max-time 10 "http://127.0.0.1:3000/events" 2>&1 || true`,
+      { timeout: 15000 }
+    );
+
+    const output = stdout.toString();
+
+    // 验证 SSE 响应内容
+    if (!output.includes('event: connected')) {
+      throw new Error('SSE 响应缺少连接确认事件');
+    }
+
+    if (!output.includes('event: message')) {
+      throw new Error('SSE 响应缺少消息事件');
+    }
+
+    if (!output.includes('data:')) {
+      throw new Error('SSE 响应缺少数据字段');
+    }
+
+    success('SSE 流式传输正常工作');
+  } catch (err: any) {
+    throw new Error(`SSE 连接测试失败: ${err.message}`);
+  }
+}
+
+async function test11_WebSocket连接() {
+  info('测试 WebSocket 双向通信');
+
+  // 确保 WebSocket 服务离线
+  try {
+    await execAsync('lsof -ti:3011 | xargs -r kill -9 2>/dev/null');
+    await sleep(500);
+  } catch {
+    // 服务可能未运行，忽略错误
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const WebSocket = require('ws');
+    const ws = new WebSocket('ws://127.0.0.1:3000/', {
+      headers: { 'Host': 'ws.test' },
+    });
+
+    let connected = false;
+    let receivedEcho = false;
+    let timeoutHandle: NodeJS.Timeout;
+
+    const cleanup = () => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    };
+
+    ws.on('open', () => {
+      connected = true;
+      // 发送测试消息
+      setTimeout(() => {
+        ws.send(JSON.stringify({ type: 'test', data: 'hello' }));
+      }, 500);
+    });
+
+    ws.on('message', (data: Buffer) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'connected') {
+          success('收到 WebSocket 连接确认');
+        } else if (msg.type === 'echo') {
+          receivedEcho = true;
+          success('收到 WebSocket echo 响应');
+          cleanup();
+          resolve();
+        }
+      } catch (err) {
+        // 忽略 JSON 解析错误
+      }
+    });
+
+    ws.on('error', (err: Error) => {
+      cleanup();
+      reject(new Error(`WebSocket 错误: ${err.message}`));
+    });
+
+    ws.on('close', () => {
+      cleanup();
+      if (!connected) {
+        reject(new Error('WebSocket 连接失败'));
+      } else if (!receivedEcho) {
+        reject(new Error('WebSocket 未收到 echo 响应'));
+      }
+    });
+
+    timeoutHandle = setTimeout(() => {
+      cleanup();
+      reject(new Error('WebSocket 测试超时'));
+    }, 15000);  // 增加到 15 秒
+  });
+}
+
+async function test12_长连接代理() {
+  info('测试 SSE 长连接代理');
+
+  // 等待测试 10 启动的 SSE 服务自然关闭
+  // 测试 10 (6秒) + 测试 11 (1秒) = 7秒，还需要等待约 4 秒让服务达到 10 秒闲置超时
+  await sleep(5000);
+
+  try {
+    // 启动一个长时间 SSE 连接，验证服务被按需启动
+    const startTime = Date.now();
+
+    const { stdout, stderr } = await execAsync(
+      `curl --noproxy "*" -s -N -H "Host: sse.test" --max-time 8 "http://127.0.0.1:3000/events" || true`,
+      { timeout: 15000 }
+    );
+
+    const duration = Date.now() - startTime;
+    const output = stdout.toString();
+    const err = stderr.toString();
+
+    // 打印调试信息
+    if (err.length > 0) {
+      console.log(`[DEBUG] stderr: ${err}`);
+    }
+
+    if (output.length === 0) {
+      throw new Error('curl 没有返回任何输出');
+    }
+
+    // 验证收到多个事件（说明连接保持了一段时间）
+    const messageCount = (output.match(/event: message/g) || []).length;
+
+    if (messageCount < 3) {
+      throw new Error(`收到的消息数量不足，实际收到 ${messageCount} 个。输出长度: ${output.length}, 输出内容: ${output.substring(0, 100)}`);
+    }
+
+    // 验证服务已启动
+    const isRunning = await checkProcess(3010);
+    if (!isRunning) {
+      throw new Error('SSE 服务应该已启动');
+    }
+
+    success(`SSE 长连接代理正常，收到 ${messageCount} 个事件，耗时 ${duration}ms`);
+  } catch (err: any) {
+    throw new Error(`长连接代理测试失败: ${err.message}`);
   }
 }
 
@@ -376,11 +536,14 @@ async function main() {
   await runTest('测试7: 路径代理', test7_路径代理);
   await runTest('测试8: 连续请求更新闲置时间', test8_连续请求更新闲置时间);
   await runTest('测试9: POST 请求', test9_POST请求);
+  await runTest('测试10: SSE 连接', test10_SSE连接);
+  await runTest('测试11: WebSocket 连接', test11_WebSocket连接);
+  await runTest('测试12: 长连接代理', test12_长连接代理);
 
   // 清理
   section('清理环境');
   try {
-    await execAsync('lsof -ti:3000,3001,3002,3003 | xargs -r kill -9 2>/dev/null');
+    await execAsync('lsof -ti:3000,3001,3002,3003,3010,3011 | xargs -r kill -9 2>/dev/null');
     success('已清理所有测试进程');
   } catch {
     info('无需清理');

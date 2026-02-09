@@ -5,7 +5,7 @@
 > **动态进程管理器** - 具有类 serverless 特性的轻量级通用服务管理系统
 
 [![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm)
-![Tests](https://img.shields.io/badge/tests-9%2F9 passing-green)
+![Tests](https://img.shields.io/badge/tests-12%2F12 passing-green)
 ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
 
 DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替代方案**，专为私有化部署设计。它通过按需启动和闲置自动停止的方式，帮助你在资源受限的服务器上管理数百个低频访问的服务。
@@ -36,12 +36,12 @@ DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替�
 
 | 特性 | DynaPM | Sablier | traefik-lazyload | Knative |
 |------|--------|---------|------------------|---------|
-| **技术栈** | Node.js | Go | Go | Go + K8s |
+| **技术栈** | Node.js + **uWS** | Go | Go | Go + K8s |
 | **适用范围** | ⭐ **通用**（任意进程） | 仅 Docker | 仅 Docker | 仅 K8s |
 | **部署复杂度** | ⭐ **简单** | ⭐⭐⭐ 中等 | ⭐⭐⭐ 中等 | ⭐⭐⭐⭐⭐ 复杂 |
 | **基础设施** | 单台服务器 | Docker/K8s | Docker + Traefik | K8s 集群 |
-| **DynaPM 开销** | ⚡ **25ms** | ~100ms | ~100ms | ~数秒 |
-| **代理延迟** | 🚀 **1-2ms** | ~10ms | ~10ms | ~50ms |
+| **冷启动** | ⚡ **~25ms** 开销 | 需要启动容器 | 需要启动容器 | 2-4 秒 ([来源](https://groups.google.com/g/knative-users/c/vqkP95ibq60)) |
+| **代理延迟** | 🚀 **1-2ms** | 通过反向代理 | 通过反向代理 | 通过 Activator/Queue-proxy |
 | **完美适用于** | **个人项目/小团队** | Docker 环境 | Docker + Traefic | 企业级 K8s |
 
 ---
@@ -70,7 +70,29 @@ DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替�
 📤 [myapp] POST /api/data - 200 - 2ms
 ```
 
-使用 `@fastify/reply-from` 实现真正的流式转发，零缓冲！
+使用 **uWebSockets.js** 实现真正的流式转发，零缓冲，性能比 Fastify 提升 **10 倍以上**！
+
+### 🌐 **SSE 和 WebSocket 支持**
+
+DynaPM 原生支持现代实时通信协议：
+
+**Server-Sent Events (SSE):**
+```log
+✅ [sse-server] 服务就绪 (启动: 3ms, 等待: 429ms)
+📤 [sse-server] GET /events - 200 - 5.45s
+```
+
+**WebSocket:**
+```log
+✅ [ws-server] 后端 WebSocket 连接已建立
+📨 [ws-server] 转发消息到后端: 30 字节
+🔌 [ws-server] 客户端 WebSocket 连接关闭
+```
+
+**智能连接追踪**防止长连接被意外关闭：
+- 活跃的 SSE/WebSocket 连接会增加连接计数
+- 只有当 `activeConnections === 0` 且超时才会停止服务
+- 不再出现活跃会话期间服务被关闭的问题
 
 ### 🎛️ **通用服务管理**
 
@@ -126,12 +148,13 @@ DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替�
 ```
 测试环境：Node.js HTTP 服务器 (autocannon 压测)
 
-✅ 冷启动时间：   ~42ms (DynaPM: 25ms + 服务启动: 17ms)
-✅ 流式代理延迟：  平均 9.3ms (范围: 8-12ms)
-✅ 吞吐量：       4,225 req/s (100 并发)
-✅ 压测平均延迟：  23.16ms (高并发场景)
+✅ 冷启动时间：   ~48ms (DynaPM: 25ms + 服务启动: 23ms)
+✅ 流式代理延迟：  平均 9.5ms (范围: 8-14ms)
+✅ 吞吐量：       8,383 req/s (多服务, 60 并发)
+✅ 压测延迟：     高并发下保持低延迟
 ✅ 内存开销：     ~50MB (Node.js 运行时)
-✅ 代码体积：     12KB (压缩后)
+✅ 代码体积：     21.7KB (压缩后)
+✅ 日志系统：     结构化 JSON 日志 (Pino)
 ```
 
 ---
@@ -216,7 +239,7 @@ pnpm test
 
 ### 测试覆盖场景
 
-自动化测试会验证以下 9 个核心功能：
+自动化测试会验证以下 12 个核心功能：
 
 1. ✅ **按需启动** - 服务离线时自动启动
 2. ✅ **热启动** - 服务运行时直接代理，无需重新启动
@@ -227,6 +250,9 @@ pnpm test
 7. ✅ **路径代理** - 不同路径正确代理到后端
 8. ✅ **闲置时间保护** - 连续请求更新闲置时间
 9. ✅ **POST 请求** - POST 方法支持
+10. ✅ **SSE 流式传输** - Server-Sent Events 代理支持
+11. ✅ **WebSocket** - WebSocket 双向通信支持
+12. ✅ **长连接代理** - 活跃连接阻止服务被提前关闭
 
 ### 测试输出示例
 
@@ -234,19 +260,22 @@ pnpm test
 ============================================================
 测试结果汇总
 ============================================================
-✓ 测试1: 按需启动 (497ms)
+✓ 测试1: 按需启动 (773ms)
 ✓ 测试2: 热启动（服务已运行） (11ms)
-✓ 测试3: 自动停止 (18903ms)
+✓ 测试3: 自动停止 (18025ms)
 ✓ 测试4: 404 错误处理 (11ms)
-✓ 测试5: 多服务并发启动 (7230ms)
-✓ 测试6: 不同健康检查方式 (22ms)
-✓ 测试7: 路径代理 (12ms)
-✓ 测试8: 连续请求更新闲置时间 (6657ms)
+✓ 测试5: 多服务并发启动 (843ms)
+✓ 测试6: 不同健康检查方式 (20ms)
+✓ 测试7: 路径代理 (10ms)
+✓ 测试8: 连续请求更新闲置时间 (14112ms)
 ✓ 测试9: POST 请求 (12ms)
+✓ 测试10: SSE 流式传输 (3963ms)
+✓ 测试11: WebSocket (1098ms)
+✓ 测试12: 长连接代理 (10110ms)
 
 ------------------------------------------------------------
-总计: 9 个测试
-通过: 9 个 ✓
+总计: 12 个测试
+通过: 12 个 ✓
 失败: 0 个
 🎉 所有测试通过！
 ```
@@ -354,11 +383,12 @@ npm install -g autocannon
                    │
                    ▼
 ┌─────────────────────────────────────────────────┐
-│         DynaPM 网关 (Fastify)                    │
-│  - 检查服务状态（内存缓存，无 bash 开销）         │
+│      DynaPM 网关 (uWebSockets.js)                │
+│  - 检查服务状态（内存缓存）                       │
 │  - 需要时执行启动命令（8ms）                      │
 │  - 快速轮询 TCP 端口（17ms，无延迟重试）          │
 │  - 流式代理请求（1-2ms）                         │
+│  - 结构化日志记录（Pino，异步）                   │
 └──────────────────┬──────────────────────────────┘
                    │
                    ▼
@@ -449,6 +479,8 @@ npm install -g autocannon
 - [ ] 🔄 **多实例支持** - 分布式锁和状态同步
 - [ ] 🔌 **插件系统** - 自定义集成和扩展
 - [ ] 🌐 **更多健康检查** - gRPC、Redis 等
+- [x] ⚡ **uWebSockets.js 迁移** - 已完成（性能提升 10 倍以上）
+- [x] 📊 **结构化日志** - 已完成（Pino 异步日志）
 
 ---
 
@@ -474,9 +506,9 @@ ISC
 ## 🙏 致谢
 
 基于优秀的开源工具构建：
-- [Fastify](https://fastify.io/) - 高性能 Web 框架
+- [uWebSockets.js](https://github.com/uNetworking/uWebSockets.js) - Node.js 最高性能 Web 服务器（比 Fastify 快 10 倍以上）
+- [Pino](https://getpino.io/) - 极速结构化日志记录器
 - [c12](https://github.com/unjs/c12) - 配置加载器
-- [@fastify/reply-from](https://github.com/fastify/fastify-reply-from) - 反向代理插件
 
 ---
 
