@@ -22,6 +22,26 @@ const GatewayConstants = {
 } as const;
 
 /**
+ * HTTP Agent 连接池（复用连接，提升性能）
+ */
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 256,
+  maxFreeSockets: 256,
+  timeout: 30000,
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 256,
+  maxFreeSockets: 256,
+  timeout: 30000,
+  rejectUnauthorized: false,
+});
+
+/**
  * 快速检查 TCP 端口是否可用
  */
 function checkTcpPort(url: string): Promise<boolean> {
@@ -69,6 +89,10 @@ interface RouteMapping {
   service: ServiceConfig;
   /** 目标后端地址 */
   target: string;
+  /** 缓存的目标 URL 对象（避免重复解析） */
+  targetUrl?: URL;
+  /** 是否为 HTTPS */
+  isHttps?: boolean;
 }
 
 /**
@@ -137,7 +161,14 @@ export class Gateway {
 
       // 遍历路由配置
       for (const route of routes) {
-        const mapping: RouteMapping = { service, target: route.target };
+        // 缓存 URL 解析结果，避免每次请求都创建新对象
+        const targetUrl = new URL(route.target);
+        const mapping: RouteMapping = {
+          service,
+          target: route.target,
+          targetUrl,
+          isHttps: targetUrl.protocol === 'https:',
+        };
         if (route.type === 'host') {
           const hostname = route.value as string;
           this.hostnameRoutes.set(hostname, mapping);
@@ -230,7 +261,7 @@ export class Gateway {
     req: HttpRequest,
     mapping: RouteMapping
   ): void {
-    const { service, target } = mapping;
+    const service = mapping.service;
     const startTime = Date.now();
     const method = req.getMethod();
     const url = req.getUrl();
@@ -253,9 +284,9 @@ export class Gateway {
     const needsStart = service._state!.status === 'offline';
 
     if (needsStart) {
-      this.handleServiceStart(res, service, target, fullUrl, startTime, method, headers);
+      this.handleServiceStart(res, mapping, fullUrl, startTime, method, headers);
     } else {
-      this.handleDirectProxy(res, service, target, fullUrl, startTime, method, headers);
+      this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
     }
   }
 
@@ -293,7 +324,7 @@ export class Gateway {
       return;
     }
 
-    const { service, target } = mapping;
+    const service = mapping.service;
 
     // 更新访问时间（所有请求）
     service._state!.lastAccessTime = Date.now();
@@ -304,12 +335,12 @@ export class Gateway {
     if (needsStart) {
       // 如果服务正在停止，需要等待停止完成
       if (status === 'stopping') {
-        this.handleServiceWithWait(res, service, target, fullUrl, startTime, method, headers);
+        this.handleServiceWithWait(res, mapping, fullUrl, startTime, method, headers);
       } else {
-        this.handleServiceStart(res, service, target, fullUrl, startTime, method, headers);
+        this.handleServiceStart(res, mapping, fullUrl, startTime, method, headers);
       }
     } else {
-      this.handleDirectProxy(res, service, target, fullUrl, startTime, method, headers);
+      this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
     }
   }
 
@@ -318,14 +349,16 @@ export class Gateway {
    */
   private async startServiceAndProxy(
     res: HttpResponse,
-    service: ServiceConfig,
-    target: string,
+    mapping: RouteMapping,
     fullUrl: string,
     startTime: number,
     method: string,
     headers: Record<string, string>,
     body: Buffer
   ): Promise<void> {
+    const service = mapping.service;
+    const target = mapping.target;
+
     this.logger.info({ msg: `🚀 [${service.name}] ${method} ${fullUrl} - 启动服务...` });
     service._state!.status = 'starting';
 
@@ -356,7 +389,7 @@ export class Gateway {
       service._state!.startCount++;
 
       // 发起代理请求
-      await this.forwardProxyRequest(res, target, fullUrl, startTime, method, headers, body, service);
+      await this.forwardProxyRequest(res, mapping, fullUrl, startTime, method, headers, body);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
 
@@ -382,13 +415,13 @@ export class Gateway {
    */
   private handleServiceWithWait(
     res: HttpResponse,
-    service: ServiceConfig,
-    target: string,
+    mapping: RouteMapping,
     fullUrl: string,
     startTime: number,
     method: string,
     headers: Record<string, string>
   ): void {
+    const service = mapping.service;
     this.logger.info({ msg: `⏳ [${service.name}] ${method} ${fullUrl} - 等待服务停止完成...` });
 
     const chunks: Buffer[] = [];
@@ -432,7 +465,7 @@ export class Gateway {
 
           // 服务已停止，现在启动它
           this.logger.info({ msg: `✅ [${service.name}] 服务已停止，开始启动...` });
-          await this.startServiceAndProxy(res, service, target, fullUrl, startTime, method, headers, fullBody);
+          await this.startServiceAndProxy(res, mapping, fullUrl, startTime, method, headers, fullBody);
         })();
       }
     });
@@ -444,13 +477,13 @@ export class Gateway {
    */
   private handleServiceStart(
     res: HttpResponse,
-    service: ServiceConfig,
-    target: string,
+    mapping: RouteMapping,
     fullUrl: string,
     startTime: number,
     method: string,
     headers: Record<string, string>
   ): void {
+    const service = mapping.service;
     // 收集请求体
     const chunks: Buffer[] = [];
     let aborted = false;
@@ -471,7 +504,7 @@ export class Gateway {
         if (aborted) return;
 
         // 调用启动方法
-        this.startServiceAndProxy(res, service, target, fullUrl, startTime, method, headers, fullBody);
+        this.startServiceAndProxy(res, mapping, fullUrl, startTime, method, headers, fullBody);
       }
     });
   }
@@ -481,13 +514,13 @@ export class Gateway {
    */
   private handleDirectProxy(
     res: HttpResponse,
-    service: ServiceConfig,
-    target: string,
+    mapping: RouteMapping,
     fullUrl: string,
     startTime: number,
     method: string,
     headers: Record<string, string>
   ): void {
+    const service = mapping.service;
     // 关键：必须在同步阶段调用 onData
     const chunks: Buffer[] = [];
     let aborted = false;
@@ -508,7 +541,7 @@ export class Gateway {
         if (aborted) return;
 
         // 发起代理请求
-        this.forwardProxyRequest(res, target, fullUrl, startTime, method, headers, fullBody, service).catch((err: Error) => {
+        this.forwardProxyRequest(res, mapping, fullUrl, startTime, method, headers, fullBody).catch((err: Error) => {
           // 区分客户端主动断开和真正的错误
           if (err.message === 'Client aborted') {
             // 客户端主动断开是正常行为，特别是对于 SSE 和 WebSocket
@@ -539,26 +572,28 @@ export class Gateway {
    * 发起代理请求并流式转发响应
    *
    * @param res - uWS HttpResponse 对象
-   * @param target - 目标后端地址
+   * @param mapping - 路由映射信息（包含缓存的目标 URL）
    * @param path - 请求路径（包含查询字符串）
    * @param startTime - 请求开始时间（用于日志）
    * @param method - HTTP 方法
    * @param headers - 请求头
    * @param body - 请求体
-   * @param service - 服务配置（用于日志和状态管理）
    */
   private async forwardProxyRequest(
     res: HttpResponse,
-    target: string,
+    mapping: RouteMapping,
     path: string,
     startTime: number,
     method: string,
     headers: Record<string, string>,
     body: Buffer,
-    service: ServiceConfig
   ): Promise<void> {
-    const targetUrl = new URL(target + path);
-    const isHttps = targetUrl.protocol === 'https:';
+    const service = mapping.service;
+    // 使用缓存的 URL 对象，只需更新路径部分
+    const targetUrl = mapping.targetUrl!;
+    // 构建完整的请求 URL
+    const requestUrl = new URL(path, targetUrl);
+    const isHttps = mapping.isHttps!;
     const httpModule = isHttps ? https : http;
 
     // 过滤并准备转发的请求头
@@ -600,9 +635,11 @@ export class Gateway {
         resolve();
       });
 
-      state.proxyReq = httpModule.request(targetUrl, {
+      state.proxyReq = httpModule.request(requestUrl, {
         method,
         headers: proxyHeaders,
+        // 使用连接池 agent 复用连接
+        agent: isHttps ? httpsAgent : httpAgent,
         rejectUnauthorized: false,
       }, (proxyRes: http.IncomingMessage) => {
         state.proxyRes = proxyRes;

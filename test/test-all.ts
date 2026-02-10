@@ -453,14 +453,14 @@ async function test12_长连接代理() {
 
   // 等待测试 10 启动的 SSE 服务自然关闭
   // 测试 10 (6秒) + 测试 11 (1秒) = 7秒，还需要等待约 4 秒让服务达到 10 秒闲置超时
-  await sleep(5000);
+  await sleep(6000);
 
   try {
     // 启动一个长时间 SSE 连接，验证服务被按需启动
     const startTime = Date.now();
 
     const { stdout, stderr } = await execAsync(
-      `curl --noproxy "*" -s -N -H "Host: sse.test" --max-time 8 "http://127.0.0.1:3000/events" || true`,
+      `curl --noproxy "*" -v -N -H "Host: sse.test" --max-time 8 "http://127.0.0.1:3000/events" 2>&1 || true`,
       { timeout: 15000 }
     );
 
@@ -469,12 +469,16 @@ async function test12_长连接代理() {
     const err = stderr.toString();
 
     // 打印调试信息
+    console.log(`[DEBUG] curl 输出长度: ${output.length}`);
+    if (output.length > 0) {
+      console.log(`[DEBUG] curl 输出前200字符: ${output.substring(0, 200)}`);
+    }
     if (err.length > 0) {
-      console.log(`[DEBUG] stderr: ${err}`);
+      console.log(`[DEBUG] stderr 前200字符: ${err.substring(0, 200)}`);
     }
 
     if (output.length === 0) {
-      throw new Error('curl 没有返回任何输出');
+      throw new Error(`curl 没有返回任何输出。stderr: ${err.substring(0, 100)}`);
     }
 
     // 验证收到多个事件（说明连接保持了一段时间）
