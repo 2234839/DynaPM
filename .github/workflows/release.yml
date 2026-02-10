@@ -55,27 +55,14 @@ jobs:
         # --provenance 标志启用包溯源（npm 推荐的安全实践）
 
       - name: Extract release notes from CHANGELOG
-        run: |
-          # 获取版本号（去掉 v 前缀）
-          VERSION=${{ github.ref_name }}
-          VERSION_NUMBER=${VERSION#v}
-
-          # 从 CHANGELOG.md 提取对应版本的内容
-          # 使用 awk 更可靠地提取内容：跳过标题行，在下一个版本标题前停止
-          awk "
-            /## \[$VERSION_NUMBER\]/ { in_section=1; next }
-            in_section && /^## / { exit }
-            in_section { print }
-          " CHANGELOG.md > RELEASE_NOTES.md
-
-          # 如果文件为空，使用默认消息
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "📦 Release $VERSION" > RELEASE_NOTES.md
-          fi
+        id: changelog
+        uses: mindsers/changelog-reader-action@v2
+        with:
+            path: ./CHANGELOG.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: RELEASE_NOTES.md
+          body: ${{ steps.changelog.outputs.changelog }}
           draft: false
           prerelease: false
