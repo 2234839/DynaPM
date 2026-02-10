@@ -55,35 +55,22 @@ jobs:
         # --provenance 标志启用包溯源（npm 推荐的安全实践）
 
       - name: Extract release notes from CHANGELOG
-        id: changelog
         run: |
           # 获取版本号（去掉 v 前缀）
           VERSION=${{ github.ref_name }}
           VERSION_NUMBER=${VERSION#v}
 
-          # 从 CHANGELOG.md 提取对应版本的内容
-          # 使用 sed 提取两个版本标题之间的内容
-          RELEASE_NOTES=$(sed -n "/## \[$VERSION_NUMBER\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2)
+          # 从 CHANGELOG.md 提取对应版本的内容，保存到临时文件
+          sed -n "/## \[$VERSION_NUMBER\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2 > RELEASE_NOTES.md
 
-          # 如果没有找到对应版本，使用默认消息
-          if [ -z "$RELEASE_NOTES" ]; then
-            RELEASE_NOTES="📦 Release $VERSION"
+          # 如果文件为空，使用默认消息
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "📦 Release $VERSION" > RELEASE_NOTES.md
           fi
 
-          # 输出到 GITHUB_OUTPUT（使用 heredoc 避免转义问题）
-          {
-            echo "RELEASE_NOTES<<EOF"
-            echo "$RELEASE_NOTES"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
-
       - name: Create GitHub Release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          release_name: Release ${{ github.ref_name }}
-          body: ${{ steps.changelog.outputs.RELEASE_NOTES }}
+          body_path: RELEASE_NOTES.md
           draft: false
           prerelease: false
