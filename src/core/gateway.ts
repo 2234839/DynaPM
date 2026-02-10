@@ -10,6 +10,7 @@ import { URL } from 'node:url';
 import WS from 'ws';
 import { AdminApiHandler } from './admin-api.js';
 import { formatTime } from '../utils/format.js';
+import { Client } from 'undici';
 
 /** 网关常量 */
 const GatewayConstants = {
@@ -76,10 +77,6 @@ interface ProxyState {
   aborted: boolean;
   /** 是否已发送响应（防止重复响应） */
   responded: boolean;
-  /** 上游请求对象 */
-  proxyReq?: http.ClientRequest;
-  /** 上游响应对象 */
-  proxyRes?: http.IncomingMessage;
 }
 
 /**
@@ -96,6 +93,10 @@ interface RouteMapping {
   isHttps?: boolean;
   /** 缓存的 HTTP 模块（避免每次请求的三元运算） */
   httpModule?: typeof http | typeof https;
+  /** 缓存的 HTTP Agent（避免每次请求的三元运算） */
+  httpAgent?: http.Agent | https.Agent;
+  /** 缓存的 undici Client（高性能 HTTP 客户端） */
+  undiciClient?: Client;
 }
 
 /**
@@ -170,6 +171,13 @@ export class Gateway {
         // 缓存 URL 解析结果，避免每次请求都创建新对象
         const targetUrl = new URL(route.target);
         const isHttps = targetUrl.protocol === 'https:';
+        // 优化：缓存 Agent，避免每次请求的三元运算
+        const agent = isHttps ? httpsAgent : httpAgent;
+        // 创建 undici Client（高性能 HTTP 客户端）
+        const undiciClient = new Client(route.target, {
+          keepAliveTimeout: 60000, // 60 秒
+          pipelining: 1, // 启用 HTTP pipelining
+        });
         const mapping: RouteMapping = {
           service,
           target: route.target,
@@ -177,6 +185,9 @@ export class Gateway {
           isHttps,
           // 优化：缓存 HTTP 模块，避免每次请求的三元运算
           httpModule: isHttps ? https : http,
+          // 优化：缓存 HTTP Agent，避免每次请求的三元运算
+          httpAgent: agent,
+          undiciClient,
         };
         if (route.type === 'host') {
           const hostname = route.value as string;
@@ -616,13 +627,8 @@ export class Gateway {
     /** 性能分析：请求准备开始 */
     const perfPrepStart = perfLog ? performance.now() : 0;
 
-    // 使用缓存的 URL 对象，只需更新路径部分
+    // 使用缓存的 URL 对象
     const targetUrl = mapping.targetUrl!;
-    // 优化：使用字符串拼接代替 new URL() 构造函数（性能更高）
-    const requestUrlStr = targetUrl.origin + path;
-    // 优化：使用缓存的 HTTP 模块，避免三元运算
-    const httpModule = mapping.httpModule!;
-    const isHttps = mapping.isHttps!;
 
     /** 性能分析：URL 构建耗时 */
     const perfUrlTime = perfLog ? performance.now() - perfPrepStart : 0;
@@ -663,12 +669,6 @@ export class Gateway {
       // 设置 abort 处理
       res.onAborted(() => {
         state.aborted = true;
-        if (state.proxyReq && !state.proxyReq.destroyed) {
-          state.proxyReq.destroy();
-        }
-        if (state.proxyRes && !state.proxyRes.destroyed) {
-          state.proxyRes.destroy();
-        }
         // 客户端断开是正常行为（特别是 SSE 和 WebSocket），使用 resolve 而不是 reject
         // 这样可以避免 "未处理的 Promise rejection" 错误
         cleanup();
@@ -686,28 +686,26 @@ export class Gateway {
       /** 总字节数 */
       let totalBytes = 0;
 
-      state.proxyReq = httpModule.request(requestUrlStr, {
+      // 使用 undici Client（高性能 HTTP 客户端，返回 Promise）
+      const undiciClient = mapping.undiciClient!;
+
+      undiciClient.request({
+        path,
         method,
         headers: proxyHeaders,
-        // 使用优化的连接池（keepAliveMsecs: 60s）以减少 TCP/TLS 握手开销
-        agent: isHttps ? httpsAgent : httpAgent,
-        rejectUnauthorized: false,
-      }, (proxyRes: http.IncomingMessage) => {
-        state.proxyRes = proxyRes;
-
+        body,
+      }).then(({ statusCode, headers, body }) => {
         /** 性能分析：首字节响应时间（TTFB） */
         if (perfLog && perfTtfb === 0) {
           perfTtfb = performance.now() - perfHttpStart;
           perfStreamStart = performance.now();
         }
 
-        // 优化：直接使用 statusCode，减少 || 操作符
-        const statusCode = proxyRes.statusCode!;
-        const statusMessage = proxyRes.statusMessage!;
+        const statusMessage = 'OK';
 
         // 检查连接是否仍然有效
         if (state.aborted) {
-          proxyRes.destroy();
+          body.destroy();
           cleanup();
           resolve();
           return;
@@ -723,14 +721,12 @@ export class Gateway {
             res.writeStatus(`${statusCode} ${statusMessage}`);
 
             // 转发响应头
-            const responseHeaders = proxyRes.headers;
-            for (const [key, value] of Object.entries(responseHeaders)) {
+            for (const key in headers) {
               const keyLower = key.toLowerCase();
-
               if (keyLower === 'connection' || keyLower === 'transfer-encoding' || keyLower === 'keep-alive') {
                 continue;
               }
-
+              const value = headers[key];
               if (Array.isArray(value)) {
                 for (const v of value) {
                   res.writeHeader(key, v);
@@ -757,8 +753,7 @@ export class Gateway {
           res.writeStatus(`${statusCode} ${statusMessage}`);
 
           // 优化：使用 for...in 代替 Object.entries()，避免临时数组创建
-          const responseHeaders = proxyRes.headers;
-          for (const key in responseHeaders) {
+          for (const key in headers) {
             const keyLower = key.toLowerCase();
 
             // 跳过不应转发的头
@@ -766,7 +761,7 @@ export class Gateway {
               continue;
             }
 
-            const value = responseHeaders[key];
+            const value = headers[key];
             // 处理多值头（如 Set-Cookie）
             if (Array.isArray(value)) {
               for (const v of value) {
@@ -779,9 +774,9 @@ export class Gateway {
         });
 
         // 流式转发响应体（关键修复：处理 backpressure）
-        proxyRes.on('data', (chunk: Buffer) => {
+        body.on('data', (chunk: Buffer) => {
           if (state.aborted) {
-            proxyRes.destroy();
+            body.destroy();
             return;
           }
 
@@ -801,23 +796,23 @@ export class Gateway {
           // 处理 backpressure（关键修复）
           if (!writeSuccess) {
             // 暂停上游流
-            proxyRes.pause();
+            body.pause();
 
             // 注册可写回调
             res.onWritable(() => {
               if (state.aborted) {
-                proxyRes.destroy();
+                body.destroy();
                 return false;
               }
 
               // 恢复上游流
-              proxyRes.resume();
+              body.resume();
               return true;
             });
           }
         });
 
-        proxyRes.on('end', () => {
+        body.on('end', () => {
           if (state.aborted) {
             cleanup();
             resolve();
@@ -872,7 +867,7 @@ export class Gateway {
           resolve();
         });
 
-        proxyRes.on('error', (err: Error) => {
+        body.on('error', (err: Error) => {
           if (state.aborted) {
             cleanup();
             resolve();
@@ -899,9 +894,7 @@ export class Gateway {
           cleanup();
           reject(err);
         });
-      });
-
-      state.proxyReq.on('error', (err: Error) => {
+      }).catch((err: Error) => {
         if (state.aborted) {
           cleanup();
           resolve();
@@ -928,10 +921,6 @@ export class Gateway {
         cleanup();
         reject(err);
       });
-
-      // 发送请求体
-      state.proxyReq.write(body);
-      state.proxyReq.end();
     });
   }
 

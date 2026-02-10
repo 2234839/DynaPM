@@ -23,6 +23,9 @@ importers:
       uWebSockets.js:
         specifier: github:uNetworking/uWebSockets.js#v20.57.0
         version: https://codeload.github.com/uNetworking/uWebSockets.js/tar.gz/fcfc622a4286909593b7f390056d89e0ca3b56b9
+      undici:
+        specifier: ^7.21.0
+        version: 7.21.0
     devDependencies:
       '@rslib/core':
         specifier: ^0.4.1
@@ -604,6 +607,10 @@ packages:
   undici-types@6.20.0:
     resolution: {integrity: sha512-Ny6QZ2Nju20vw1SRHe3d9jVu6gJ+4e3+MMpqu7pqE5HT6WsTSlce++GQmK5UXS8mzV8DSYHrQH+Xrf2jVcuKNg==}
 
+  undici@7.21.0:
+    resolution: {integrity: sha512-Hn2tCQpoDt1wv23a68Ctc8Cr/BHpUSfaPYrkajTXOS9IKpxVRx/X5m1K2YkbK2ipgZgxXSgsUinl3x+2YdSSfg==}
+    engines: {node: '>=20.18.1'}
+
   web-streams-polyfill@3.3.3:
     resolution: {integrity: sha512-d2JWLCivmZYTSIoge9MsgFCZrt571BikcWGYkjC1khllbTeDlGqZ2D8vD8E/lJa8WGWbb7Plm8/XJYV7IJHZZw==}
     engines: {node: '>= 8'}
@@ -1116,6 +1123,8 @@ snapshots:
   ufo@1.5.4: {}
 
   undici-types@6.20.0: {}
+
+  undici@7.21.0: {}
 
   web-streams-polyfill@3.3.3: {}
 
