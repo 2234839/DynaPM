@@ -6,7 +6,7 @@ DynaPM 是一个智能网关，通过按需启动和闲置自动停止的方式�
 - ⚡ 极速冷启动（开销仅 25ms）
 - 🚀 流式代理（1-2ms 延迟）
 - 🌐 支持 SSE 和 WebSocket
-- 🎛️ 通用服务管理（PM2、Docker、systemd 等）
+- 🎛️ 通用服务管理（可替代PM2、Docker、systemd 等）
 - 🔄 闲置自动回收
 
 ## 技术栈
