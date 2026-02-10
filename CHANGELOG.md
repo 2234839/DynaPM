@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.8] - 2025-02-10
+
+### 🔧 修复
+- 简化 CI 配置，使用 mindsers/changelog-reader-action 提取 CHANGELOG
+  - 移除手动 awk 脚本，使用专门的 GitHub Action
+  - 更可靠的 CHANGELOG 提取逻辑
+
+### 📚 文档
+- 创建 npm OIDC 发布最佳实践文档
+  - 完整的配置流程说明
+  - 常见问题排查指南
+  - 三种 CHANGELOG 方案对比
+
+---
+
 ## [1.0.7] - 2025-02-10
 
 ### 🔧 修复
