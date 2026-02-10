@@ -5,6 +5,15 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.9] - 2025-02-10
+
+### 🔧 修复
+- 修复 mindsers/changelog-reader-action 配置
+  - 修正输出参数名：changelog → changes
+  - 添加 version 参数以正确提取对应版本内容
+
+---
+
 ## [1.0.8] - 2025-02-10
 
 ### 🔧 修复
