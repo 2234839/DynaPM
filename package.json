@@ -9,8 +9,7 @@
   "scripts": {
     "test": "tsx test/test-all.ts",
     "test:watch": "nodemon --watch src --exec 'pnpm test'",
-    "benchmark": "node test/benchmark.js",
-    "benchmark:multi": "node test/multi-service-benchmark.js",
+    "benchmark": "tsx test/benchmark.ts",
     "build": "rslib build",
     "publish2npm": "pnpm build && pnpm tsx ./script/updateVersion.ts &&  npm publish --registry=https://registry.npmjs.org",
     "runTestServer": "pnpm tsx ./test/server1.ts"

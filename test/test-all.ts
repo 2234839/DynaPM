@@ -405,10 +405,10 @@ async function test11_WebSocket连接() {
 
     ws.on('open', () => {
       connected = true;
-      // 发送测试消息
+      // 发送测试消息（等待后端 WebSocket 连接完全建立）
       setTimeout(() => {
         ws.send(JSON.stringify({ type: 'test', data: 'hello' }));
-      }, 500);
+      }, 1000);
     });
 
     ws.on('message', (data: Buffer) => {

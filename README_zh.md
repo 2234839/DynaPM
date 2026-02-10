@@ -180,6 +180,13 @@ const config: DynaPMConfig = {
   port: 3000,
   host: '127.0.0.1',
 
+  // 日志配置（可选，生产环境建议关闭以提升性能）
+  logging: {
+    enableRequestLog: false,      // 是否启用请求日志（高频，影响性能）
+    enableWebSocketLog: false,    // 是否启用 WebSocket 生命周期日志
+    // 错误日志始终启用，不受此开关控制
+  },
+
   services: {
     'app.example.com': {
       name: 'my-app',

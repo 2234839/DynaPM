@@ -14,7 +14,43 @@ const config: DynaPMConfig = {
   port: 3000,
   host: '127.0.0.1',
 
+  // 管理 API 配置
+  adminApi: {
+    enabled: true,
+    port: 4000,
+  },
+
+  // 日志配置（生产环境建议关闭以提升性能）
+  logging: {
+    // 是否启用请求日志（每个 HTTP 请求响应记录）- 高频，影响性能
+    enableRequestLog: false,
+    // 是否启用 WebSocket 生命周期日志 - 中频，调试时有用
+    enableWebSocketLog: false,
+    // 错误日志始终启用，不受此开关控制
+    // enableErrorLog: true,
+  },
+
   services: {
+    // ==================== DynaPM 管理界面 ====================
+    // 访问地址: http://127.0.0.1:4001
+    'dynapm-admin': {
+      name: 'dynapm-admin',
+      port: 4001,  // 独立端口
+      base: 'http://127.0.0.1:4002',  // 实际运行端口
+      idleTimeout: 10 * 60 * 1000,  // 10分钟
+      startTimeout: 5 * 1000,
+
+      commands: {
+        start: `nohup node ${process.cwd()}/admin/server.js >> ${logDir}/admin.log 2>&1 &`,
+        stop: 'lsof -ti:4002 | xargs -r kill -9',
+        check: 'lsof -ti:4002 >/dev/null 2>&1',
+      },
+
+      healthCheck: {
+        type: 'tcp',
+      },
+    },
+
     // 测试服务1：使用端口检查
     'app1.test': {
       name: 'app1',

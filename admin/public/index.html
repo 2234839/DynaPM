@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DynaPM 管理界面</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🎛️ DynaPM 服务管理</h1>
+      <div class="header-info">
+        <span id="service-count">加载中...</span>
+        <button id="refresh-btn" class="btn-secondary">🔄 刷新</button>
+      </div>
+    </header>
+
+    <main>
+      <div id="services-container">
+        <!-- 服务列表将在这里动态生成 -->
+      </div>
+    </main>
+
+    <footer>
+      <p>DynaPM v1.0.12 - Dynamic Process Manager</p>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

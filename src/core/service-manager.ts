@@ -52,6 +52,13 @@ export class ServiceManager {
 
     lock = (async () => {
       try {
+        // 先检查服务是否已经在运行（避免重复启动）
+        const alreadyRunning = await this.isRunning(service);
+        if (alreadyRunning) {
+          console.log(`[${service.name}] 服务已在运行，跳过启动`);
+          return;
+        }
+
         console.log(`[${service.name}] 正在启动...`);
 
         const result = await this.executor.execute(service.commands.start, {

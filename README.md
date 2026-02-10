@@ -181,6 +181,13 @@ const config: DynaPMConfig = {
   port: 3000,
   host: '127.0.0.1',
 
+  // Logging configuration (optional, disable for better performance in production)
+  logging: {
+    enableRequestLog: false,      // Enable request/response logging (high frequency, affects performance)
+    enableWebSocketLog: false,    // Enable WebSocket lifecycle logging
+    // Error logging is always enabled
+  },
+
   services: {
     'app.example.com': {
       name: 'my-app',

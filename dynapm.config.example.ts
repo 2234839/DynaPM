@@ -5,11 +5,29 @@ import type { DynaPMConfig } from './src/config/types';
  *
  * 此配置文件展示了如何配置不同类型的服务管理方式
  * 包括PM2、Docker、systemd和直接启动等方式
+ *
+ * 启动方式：tsx src/index.ts
+ * 访问管理界面：http://127.0.0.1:4001/
  */
 const config: DynaPMConfig = {
   // 网关监听配置
   port: 3000,
   host: '127.0.0.1',
+
+  // ==================== 管理 API 配置 ====================
+  adminApi: {
+    // 启用管理 API（默认：true）
+    enabled: true,
+
+    // 管理 API 端口（独立监听，提供 REST API）
+    port: 4000,
+
+    // 可选：设置认证令牌（建议在生产环境中设置）
+    // authToken: process.env.DYNAPM_ADMIN_TOKEN,
+
+    // 可选：限制允许访问的 IP（默认：仅本地）
+    // allowedIps: ['127.0.0.1', '::1'],
+  },
 
   // 服务配置映射：hostname -> 服务配置
   services: {
@@ -153,6 +171,76 @@ const config: DynaPMConfig = {
         type: 'http',
         url: 'http://127.0.0.1:8081/ping',
         expectedStatus: 200,
+      },
+    },
+
+    // ==================== DynaPM 管理界面（专属端口） ====================
+    // 访问地址: http://127.0.0.1:4001
+    // 注意：专属端口不需要配置 hostname，直接通过端口访问
+    'dynapm-admin': {
+      name: 'dynapm-admin',
+      port: 4001,  // 专属端口配置（注意与管理 API 端口 4000 分开）
+      base: 'http://127.0.0.1:4002',
+      idleTimeout: 10 * 60 * 1000, // 10分钟无操作后停止
+      startTimeout: 5 * 1000,
+
+      commands: {
+        start: 'node admin/server.js',
+        stop: 'lsof -ti:4002 | xargs -r kill -9',
+        check: 'lsof -ti:4002 >/dev/null 2>&1',
+      },
+
+      healthCheck: {
+        type: 'tcp',
+      },
+    },
+
+    // ==================== 多后端服务（不同路由指向不同端口） ====================
+    // 一个服务同时监听多个端口，通过网关的不同入口访问
+    // 访问方式 1: http://multi.test:3000 -> 转发到后端 8001 端口
+    // 访问方式 2: http://127.0.0.1:5000 -> 转发到后端 8002 端口
+    'multi-backend': {
+      name: 'multi-backend',
+      // base 字段仍然需要（用于健康检查或作为默认值）
+      base: 'http://127.0.0.1:8001',
+      // 使用 routes 配置指定不同的后端地址
+      routes: [
+        { type: 'host', value: 'multi.test', target: 'http://127.0.0.1:8001' },
+        { type: 'port', value: 5000, target: 'http://127.0.0.1:8002' },
+      ],
+      idleTimeout: 5 * 60 * 1000,
+      startTimeout: 10 * 1000,
+
+      commands: {
+        start: 'nohup node /path/to/multi-backend.js > logs/multi.log 2>&1 &',
+        stop: 'pkill -f "node /path/to/multi-backend.js"',
+        check: 'pgrep -f "node /path/to/multi-backend.js"',
+      },
+
+      healthCheck: {
+        type: 'tcp',
+      },
+    },
+
+    // ==================== 通用服务（同时支持 hostname 和专属端口） ====================
+    // 访问方式 1: http://universal.test:3000
+    // 访问方式 2: http://127.0.0.1:5001
+    'universal': {
+      name: 'universal',
+      host: 'universal.test',  // hostname 映射（可选）
+      port: 5001,              // 专属端口（可选）
+      base: 'http://127.0.0.1:5002',
+      idleTimeout: 5 * 60 * 1000,
+      startTimeout: 10 * 1000,
+
+      commands: {
+        start: 'nohup node /path/to/universal.js > logs/universal.log 2>&1 &',
+        stop: 'lsof -ti:5001 | xargs -r kill -9',
+        check: 'lsof -ti:5001 >/dev/null 2>&1',
+      },
+
+      healthCheck: {
+        type: 'tcp',
       },
     },
   },

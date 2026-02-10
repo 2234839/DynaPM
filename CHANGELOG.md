@@ -5,6 +5,28 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.13] - 2026-02-10
+
+### ✨ 新增
+- 添加日志配置开关，支持运行时控制日志输出
+  - `enableRequestLog`: 控制 HTTP 请求响应日志（高频，影响性能）
+  - `enableWebSocketLog`: 控制 WebSocket 生命周期日志
+  - 错误日志始终启用，不受配置影响
+
+### 🔧 修复
+- 修复 uWS.HttpResponse 在已中止后仍被访问的错误
+  - 错误处理中增加 `!state.aborted` 检查
+  - 避免向已失效的 HttpResponse 发送错误响应
+- 修复服务启动前未检查是否已在运行的问题
+  - 启动服务前先检查端口状态
+  - 避免重复启动导致端口冲突
+
+### 📚 文档
+- 更新 README 中英文版，添加日志配置说明
+- 完善配置示例和使用指南
+
+---
+
 ## [1.0.12] - 2026-02-10
 
 ### ✨ 新增

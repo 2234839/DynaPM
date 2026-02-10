@@ -70,6 +70,19 @@ async function main() {
     await gateway.start();
 
     logger.info({ msg: 'DynaPM 网关已启动', port: config.port || 3000 });
+
+    // 注册退出处理
+    const cleanup = async (signal: string) => {
+      logger.info({ msg: `⚠️ 收到 ${signal} 信号，正在清理...` });
+      await gateway.cleanup();
+      process.exit(0);
+    };
+
+    process.on('SIGINT', () => cleanup('SIGINT'));
+    process.on('SIGTERM', () => cleanup('SIGTERM'));
+    process.on('exit', () => {
+      logger.info({ msg: '👋 DynaPM 网关已退出' });
+    });
   } catch (error) {
     logger.error({ msg: '启动失败', error });
     process.exit(1);
