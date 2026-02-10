@@ -522,7 +522,7 @@ git push origin main --tags
 After pushing a tag, GitHub Actions automatically:
 
 1. ✅ **Build project** - Compile TypeScript with rslib
-2. ✅ **Run tests** - Execute 12 automated tests
+2. ✅ **Verify build** - Check output file integrity
 3. ✅ **Publish to npm** - Use OIDC, no tokens needed
 4. ✅ **Create Release** - Generate release notes on GitHub
 
