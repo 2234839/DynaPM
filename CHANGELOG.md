@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.5] - 2025-02-10
+
+### ✨ 新增
+- 添加 CHANGELOG.md 版本更新日志
+- GitHub Release 自动从 CHANGELOG 提取发布说明
+- 优化 CI 发布流程，移除测试步骤
+
+### 📚 文档
+- 在 README 中添加完整的发布流程说明
+- 新增版本号规范说明
+
+---
+
 ## [1.0.4] - 2025-02-10
 
 ### 🔧 修复
