@@ -7,23 +7,23 @@
 
 ## [1.0.13] - 2026-02-10
 
-### ✨ 新增
-- 添加日志配置开关，支持运行时控制日志输出
-  - `enableRequestLog`: 控制 HTTP 请求响应日志（高频，影响性能）
-  - `enableWebSocketLog`: 控制 WebSocket 生命周期日志
-  - 错误日志始终启用，不受配置影响
+### 🚀 性能优化
+- **重大性能提升**：使用 undici 替代原生 http 模块作为 HTTP 客户端
+  - 吞吐量提升 **28.2%**：4345 → 5571 req/s
+  - 延迟保持 11.4ms（无退化）
+  - 使用 `undici.request()` API 实现流式转发
+  - 避免了 `undici.stream()` + Writable stream 的包装开销
 
-### 🔧 修复
-- 修复 uWS.HttpResponse 在已中止后仍被访问的错误
-  - 错误处理中增加 `!state.aborted` 检查
-  - 避免向已失效的 HttpResponse 发送错误响应
-- 修复服务启动前未检查是否已在运行的问题
-  - 启动服务前先检查端口状态
-  - 避免重复启动导致端口冲突
+### 🔧 改进
+- 移除不再使用的 http/https 模块相关代码
+- 清理 RouteMapping 中的冗余字段（isHttps、httpModule、httpAgent）
+- 代码更简洁，维护性更好
 
-### 📚 文档
-- 更新 README 中英文版，添加日志配置说明
-- 完善配置示例和使用指南
+### 📚 技术细节
+- undici 的 `request()` API 比 `stream()` API 更适合代理场景
+- `stream()` 适用于消费响应（写入文件、解析 JSON）
+- `request()` 返回 Readable stream，可以手动控制流式转发
+- 完全保持流式处理，客户端延迟无增加
 
 ---
 
