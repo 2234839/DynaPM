@@ -21,7 +21,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -43,9 +42,6 @@ jobs:
             exit 1
           fi
           echo "✅ 打包输出正常"
-
-      - name: Upgrade npm to latest version
-        run: npm install -g npm@latest
 
       - name: Verify npm version
         run: |
