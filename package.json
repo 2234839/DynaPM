@@ -1,6 +1,6 @@
 {
   "name": "dynapm",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "DynaPM is a dynamic start-stop application management tool with serverless-like features designed for resource-constrained environments. It starts and stops programs on demand, optimizes resource usage, and is suitable for private deployments. ",
   "main": "index.js",
   "bin": {
