@@ -59,10 +59,11 @@ jobs:
         uses: mindsers/changelog-reader-action@v2
         with:
             path: ./CHANGELOG.md
+            version: ${{ github.ref_name }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body: ${{ steps.changelog.outputs.changelog }}
+          body: ${{ steps.changelog.outputs.changes }}
           draft: false
           prerelease: false
