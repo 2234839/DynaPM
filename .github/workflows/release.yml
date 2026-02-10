@@ -54,12 +54,16 @@ jobs:
         # 使用 OIDC，不需要 NPM_TOKEN
         # --provenance 标志启用包溯源（npm 推荐的安全实践）
 
+      - name: Extract version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
       - name: Extract release notes from CHANGELOG
         id: changelog
         uses: mindsers/changelog-reader-action@v2
         with:
             path: ./CHANGELOG.md
-            version: ${{ github.ref_name }}
+            version: ${{ steps.get_version.outputs.version }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
