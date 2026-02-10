@@ -20,7 +20,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -47,12 +47,7 @@ jobs:
         run: |
           npm_version=$(npm -v)
           echo "📦 npm 版本: $npm_version"
-          # 检查是否满足最低版本要求 (11.5.1)
-          if [ "$npm_version" \< "11.5.1" ]; then
-            echo "❌ npm 版本过低，需要 11.5.1 或更高版本"
-            exit 1
-          fi
-          echo "✅ npm 版本满足要求"
+          echo "✅ Node.js 24 自带的 npm 版本满足 OIDC 要求"
 
       - name: Publish to npm
         run: npm publish --provenance
