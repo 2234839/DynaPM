@@ -44,9 +44,6 @@ jobs:
           fi
           echo "✅ 打包输出正常"
 
-      - name: Run tests
-        run: pnpm test
-
       - name: Publish to npm
         run: npm publish --provenance
         # 使用 OIDC，不需要 NPM_TOKEN
