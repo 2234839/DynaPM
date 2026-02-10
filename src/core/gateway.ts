@@ -23,10 +23,11 @@ const GatewayConstants = {
 
 /**
  * HTTP Agent 连接池（复用连接，提升性能）
+ * 优化配置：延长 keepAlive 时间以减少连接重建开销
  */
 const httpAgent = new http.Agent({
   keepAlive: true,
-  keepAliveMsecs: 1000,
+  keepAliveMsecs: 60000, // 60 秒 - 连接保持更长时间，减少重连
   maxSockets: 256,
   maxFreeSockets: 256,
   timeout: 30000,
@@ -34,7 +35,7 @@ const httpAgent = new http.Agent({
 
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  keepAliveMsecs: 1000,
+  keepAliveMsecs: 60000, // 60 秒 - 连接保持更长时间，减少重连
   maxSockets: 256,
   maxFreeSockets: 256,
   timeout: 30000,
@@ -93,6 +94,8 @@ interface RouteMapping {
   targetUrl?: URL;
   /** 是否为 HTTPS */
   isHttps?: boolean;
+  /** 缓存的 HTTP 模块（避免每次请求的三元运算） */
+  httpModule?: typeof http | typeof https;
 }
 
 /**
@@ -166,11 +169,14 @@ export class Gateway {
       for (const route of routes) {
         // 缓存 URL 解析结果，避免每次请求都创建新对象
         const targetUrl = new URL(route.target);
+        const isHttps = targetUrl.protocol === 'https:';
         const mapping: RouteMapping = {
           service,
           target: route.target,
           targetUrl,
-          isHttps: targetUrl.protocol === 'https:',
+          isHttps,
+          // 优化：缓存 HTTP 模块，避免每次请求的三元运算
+          httpModule: isHttps ? https : http,
         };
         if (route.type === 'host') {
           const hostname = route.value as string;
@@ -298,19 +304,31 @@ export class Gateway {
    */
   private handleRequest(res: HttpResponse, req: HttpRequest): void {
     const startTime = Date.now();
-    const hostname = req.getHeader('host')?.split(':')[0] || '';
+    // 优化：手动查找冒号位置，避免 split 创建数组，缓存索引
+    const hostHeader = req.getHeader('host');
+    let hostname = '';
+    if (hostHeader) {
+      const colonIndex = hostHeader.indexOf(':');
+      hostname = colonIndex !== -1 ? hostHeader.substring(0, colonIndex) : hostHeader;
+    }
     const method = req.getMethod();
     const url = req.getUrl();
     const queryString = req.getQuery();
 
-    // 完整 URL
-    const fullUrl = queryString ? `${url}?${queryString}` : url;
+    // 优化：预先计算字符串长度，避免模板字符串的动态分配
+    const fullUrl = queryString ? url + '?' + queryString : url;
 
     // 提前提取所有请求头（req 对象在 await 后会失效）
     const headers: Record<string, string> = {};
     req.forEach((key: string, value: string) => {
-      // 清理 CRLF 注入，防止 HTTP 响应分割攻击
-      const safeValue = value.replace(/[\r\n]/g, '');
+      // 优化：手动检查 CRLF，避免正则表达式开销
+      let safeValue = value;
+      const crIndex = value.indexOf('\r');
+      const lfIndex = value.indexOf('\n');
+      if (crIndex !== -1 || lfIndex !== -1) {
+        // 有 CRLF，需要清理（罕见情况，仅在攻击时发生）
+        safeValue = value.replace(/[\r\n]/g, '');
+      }
       headers[key] = safeValue;
     });
 
@@ -539,7 +557,8 @@ export class Gateway {
       chunks.push(chunk);
 
       if (isLast) {
-        const fullBody = Buffer.concat(chunks);
+        // 优化：对于单个 chunk 的情况，避免 Buffer.concat 开销
+        const fullBody = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
 
         if (aborted) return;
 
@@ -599,19 +618,23 @@ export class Gateway {
 
     // 使用缓存的 URL 对象，只需更新路径部分
     const targetUrl = mapping.targetUrl!;
-    // 构建完整的请求 URL
-    const requestUrl = new URL(path, targetUrl);
+    // 优化：使用字符串拼接代替 new URL() 构造函数（性能更高）
+    const requestUrlStr = targetUrl.origin + path;
+    // 优化：使用缓存的 HTTP 模块，避免三元运算
+    const httpModule = mapping.httpModule!;
     const isHttps = mapping.isHttps!;
-    const httpModule = isHttps ? https : http;
 
     /** 性能分析：URL 构建耗时 */
     const perfUrlTime = perfLog ? performance.now() - perfPrepStart : 0;
 
-    // 过滤并准备转发的请求头
-    const proxyHeaders: Record<string, string> = { ...headers };
-    delete proxyHeaders['connection'];
-    delete proxyHeaders['keep-alive'];
-
+    // 优化：直接构建新对象，避免复制再删除（性能更高）
+    const proxyHeaders: Record<string, string> = {};
+    for (const key in headers) {
+      // 跳过不需要转发的头
+      if (key !== 'connection' && key !== 'keep-alive') {
+        proxyHeaders[key] = headers[key];
+      }
+    }
     // 设置正确的 Host 头
     proxyHeaders['host'] = targetUrl.host;
 
@@ -663,10 +686,10 @@ export class Gateway {
       /** 总字节数 */
       let totalBytes = 0;
 
-      state.proxyReq = httpModule.request(requestUrl, {
+      state.proxyReq = httpModule.request(requestUrlStr, {
         method,
         headers: proxyHeaders,
-        // 使用连接池 agent 复用连接
+        // 使用优化的连接池（keepAliveMsecs: 60s）以减少 TCP/TLS 握手开销
         agent: isHttps ? httpsAgent : httpAgent,
         rejectUnauthorized: false,
       }, (proxyRes: http.IncomingMessage) => {
@@ -678,8 +701,9 @@ export class Gateway {
           perfStreamStart = performance.now();
         }
 
-        const statusCode = proxyRes.statusCode || 200;
-        const statusMessage = proxyRes.statusMessage || 'OK';
+        // 优化：直接使用 statusCode，减少 || 操作符
+        const statusCode = proxyRes.statusCode!;
+        const statusMessage = proxyRes.statusMessage!;
 
         // 检查连接是否仍然有效
         if (state.aborted) {
@@ -732,9 +756,9 @@ export class Gateway {
 
           res.writeStatus(`${statusCode} ${statusMessage}`);
 
-          // 转发响应头
+          // 优化：使用 for...in 代替 Object.entries()，避免临时数组创建
           const responseHeaders = proxyRes.headers;
-          for (const [key, value] of Object.entries(responseHeaders)) {
+          for (const key in responseHeaders) {
             const keyLower = key.toLowerCase();
 
             // 跳过不应转发的头
@@ -742,6 +766,7 @@ export class Gateway {
               continue;
             }
 
+            const value = responseHeaders[key];
             // 处理多值头（如 Set-Cookie）
             if (Array.isArray(value)) {
               for (const v of value) {
@@ -824,32 +849,21 @@ export class Gateway {
               });
             }
 
-            // 记录性能分析日志
+            // 记录性能分析日志（使用 console.error 直接输出，便于调试）
             if (perfLog) {
-              this.logger.info({
-                msg: `⚡ [${service.name}] 性能分析`,
-                service: service.name,
+              console.error(`⚡ [${service.name}] 性能分析:`, {
                 method,
                 path,
                 statusCode,
-                /** 准备阶段耗时（毫秒） */
-                prepTime: perfPrepTime.toFixed(3),
-                /** URL 构建耗时（毫秒） */
-                urlTime: perfUrlTime.toFixed(3),
-                /** 请求头处理耗时（毫秒） */
-                headersTime: perfHeadersTime.toFixed(3),
-                /** HTTP 连接 + 首字节响应耗时（毫秒） */
-                ttfb: perfTtfb.toFixed(3),
-                /** 流式传输耗时（毫秒） */
-                streamTime: perfStreamTime.toFixed(3),
-                /** 总耗时（毫秒） */
-                totalTime: perfTotalTime.toFixed(3),
-                /** 数据块数量 */
+                prepTime: perfPrepTime.toFixed(3) + 'ms',
+                urlTime: perfUrlTime.toFixed(3) + 'ms',
+                headersTime: perfHeadersTime.toFixed(3) + 'ms',
+                ttfb: perfTtfb.toFixed(3) + 'ms',
+                streamTime: perfStreamTime.toFixed(3) + 'ms',
+                totalTime: perfTotalTime.toFixed(3) + 'ms',
                 chunkCount,
-                /** 总字节数 */
                 totalBytes,
-                /** 平均每块大小（字节） */
-                avgChunkSize: chunkCount > 0 ? (totalBytes / chunkCount).toFixed(1) : 0,
+                avgChunkSize: chunkCount > 0 ? (totalBytes / chunkCount).toFixed(1) + 'B' : '0B',
               });
             }
           });
