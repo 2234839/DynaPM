@@ -5,6 +5,17 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.10] - 2025-02-10
+
+### 🔧 修复
+- 修正发布流程顺序，确保 CHANGELOG 在 CI 运行前已更新
+
+### 📝 说明
+- 严格按照：更新 CHANGELOG → 提交 → 更新版本号 → 推送标签 的顺序
+- 确保 CI 运行时能正确提取到新版本的 CHANGELOG 内容
+
+---
+
 ## [1.0.9] - 2025-02-10
 
 ### 🔧 修复
