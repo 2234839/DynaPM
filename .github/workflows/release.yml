@@ -63,14 +63,19 @@ jobs:
 
           # 从 CHANGELOG.md 提取对应版本的内容
           # 使用 sed 提取两个版本标题之间的内容
-          echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
-          sed -n "/## \[$VERSION_NUMBER\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2 >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          RELEASE_NOTES=$(sed -n "/## \[$VERSION_NUMBER\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2)
 
           # 如果没有找到对应版本，使用默认消息
-          if [ ! -s "$RELEASE_NOTES_FILE" ]; then
-            echo "📦 Release $VERSION" >> $GITHUB_OUTPUT
+          if [ -z "$RELEASE_NOTES" ]; then
+            RELEASE_NOTES="📦 Release $VERSION"
           fi
+
+          # 输出到 GITHUB_OUTPUT（使用 heredoc 避免转义问题）
+          {
+            echo "RELEASE_NOTES<<EOF"
+            echo "$RELEASE_NOTES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: actions/create-release@v1
