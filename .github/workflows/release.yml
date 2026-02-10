@@ -60,8 +60,13 @@ jobs:
           VERSION=${{ github.ref_name }}
           VERSION_NUMBER=${VERSION#v}
 
-          # 从 CHANGELOG.md 提取对应版本的内容，保存到临时文件
-          sed -n "/## \[$VERSION_NUMBER\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2 > RELEASE_NOTES.md
+          # 从 CHANGELOG.md 提取对应版本的内容
+          # 使用 awk 更可靠地提取内容：跳过标题行，在下一个版本标题前停止
+          awk "
+            /## \[$VERSION_NUMBER\]/ { in_section=1; next }
+            in_section && /^## / { exit }
+            in_section { print }
+          " CHANGELOG.md > RELEASE_NOTES.md
 
           # 如果文件为空，使用默认消息
           if [ ! -s RELEASE_NOTES.md ]; then
