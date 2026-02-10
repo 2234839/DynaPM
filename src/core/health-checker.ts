@@ -1,6 +1,6 @@
 import fetch from 'node-fetch';
 import { CommandExecutor } from './command-executor.js';
-import type { ServiceConfig } from '../config/types.js';
+import type { ServiceConfig, HealthCheckConfigInternal } from '../config/types.js';
 import net from 'node:net';
 
 /**
@@ -42,7 +42,7 @@ export class HealthChecker {
    * @param config - 健康检查配置
    * @returns 服务是否健康
    */
-  private async check(service: ServiceConfig, config: any): Promise<boolean> {
+  private async check(service: ServiceConfig, config: HealthCheckConfigInternal): Promise<boolean> {
     try {
       switch (config.type) {
         case 'tcp':
@@ -52,6 +52,9 @@ export class HealthChecker {
           return await this.checkHttp(config, service);
 
         case 'command':
+          if (!config.command) {
+            return false;
+          }
           return await this.executor.check(config.command, {
             timeout: config.timeout || 5000,
           });
@@ -101,7 +104,7 @@ export class HealthChecker {
    * @param service - 服务配置
    * @returns HTTP响应是否符合预期
    */
-  private async checkHttp(config: any, service: ServiceConfig): Promise<boolean> {
+  private async checkHttp(config: HealthCheckConfigInternal, service: ServiceConfig): Promise<boolean> {
     try {
       const url = config.url || service.base;
       const timeout = config.timeout || 5000;

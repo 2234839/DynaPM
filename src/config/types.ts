@@ -14,6 +14,11 @@ export interface HealthCheckConfig {
   timeout?: number;
 }
 
+/** 内部健康检查配置（确保类型安全） */
+export interface HealthCheckConfigInternal extends HealthCheckConfig {
+  type: 'tcp' | 'http' | 'command' | 'none';
+}
+
 /** 服务命令配置 */
 export interface ServiceCommands {
   /** 启动命令 */

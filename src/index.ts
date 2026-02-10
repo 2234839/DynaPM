@@ -9,13 +9,9 @@ import pino from 'pino';
  * 使用 pino 异步日志，避免阻塞事件循环
  */
 function createLogger() {
-  // 创建 logs 目录
+  // 创建 logs 目录（recursive: true 时目录已存在不会抛异常）
   const logDir = join(process.cwd(), 'logs');
-  try {
-    mkdirSync(logDir, { recursive: true });
-  } catch (err) {
-    // 目录可能已存在
-  }
+  mkdirSync(logDir, { recursive: true });
 
   const logFile = join(logDir, 'dynapm.log');
 

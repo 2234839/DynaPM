@@ -18,6 +18,16 @@ function formatTime(ms: number): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
+/** 网关常量 */
+const GatewayConstants = {
+  /** 闲置检查间隔（毫秒） */
+  IDLE_CHECK_INTERVAL: 3000,
+  /** TCP 端口检查超时（毫秒） */
+  TCP_CHECK_TIMEOUT: 100,
+  /** 后端就绪检查延迟（毫秒） */
+  BACKEND_READY_CHECK_DELAY: 50,
+} as const;
+
 /**
  * 快速检查 TCP 端口是否可用
  */
@@ -27,7 +37,7 @@ function checkTcpPort(url: string): Promise<boolean> {
   const port = parseInt(parsed.port || (parsed.protocol === 'https:' ? '443' : '80'));
 
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port, timeout: 100 }, () => {
+    const socket = net.createConnection({ host, port, timeout: GatewayConstants.TCP_CHECK_TIMEOUT }, () => {
       socket.destroy();
       resolve(true);
     });
@@ -114,7 +124,7 @@ export class Gateway {
           service._state!.status = 'offline';
         }
       }
-    }, 3000);
+    }, GatewayConstants.IDLE_CHECK_INTERVAL);
   }
 
   /**
@@ -133,7 +143,9 @@ export class Gateway {
     // 提前提取所有请求头（req 对象在 await 后会失效）
     const headers: Record<string, string> = {};
     req.forEach((key: string, value: string) => {
-      headers[key] = value;
+      // 清理 CRLF 注入，防止 HTTP 响应分割攻击
+      const safeValue = value.replace(/[\r\n]/g, '');
+      headers[key] = safeValue;
     });
 
     // 记录请求信息
@@ -202,8 +214,9 @@ export class Gateway {
 
             // 快速等待端口可用
             const waitStartTime = Date.now();
+            let isReady = false;
             while (Date.now() - waitStartTime < service.startTimeout) {
-              const isReady = await checkTcpPort(service.base);
+              isReady = await checkTcpPort(service.base);
               if (isReady) {
                 const waitDuration = Date.now() - waitStartTime;
                 const totalDuration = Date.now() - startStartTime;
@@ -212,6 +225,12 @@ export class Gateway {
                 });
                 break;
               }
+            }
+
+            // 检查端口是否就绪
+            if (!isReady) {
+              service._state!.status = 'offline';
+              throw new Error(`服务启动超时: 端口 ${service.base} 不可用`);
             }
 
             service._state!.status = 'online';
@@ -445,13 +464,14 @@ export class Gateway {
           }
 
           // 尝试写入数据并检查 backpressure
-          const success = res.cork(() => {
-            if (state.aborted) return false;
-            return res.write(chunk);
+          let writeSuccess = false;
+          res.cork(() => {
+            if (state.aborted) return;
+            writeSuccess = res.write(chunk);
           });
 
           // 处理 backpressure（关键修复）
-          if (!success) {
+          if (!writeSuccess) {
             // 暂停上游流
             proxyRes.pause();
 
@@ -641,8 +661,9 @@ export class Gateway {
 
               // 等待端口可用
               const waitStartTime = Date.now();
+              let isReady = false;
               while (Date.now() - waitStartTime < service.startTimeout) {
-                const isReady = await checkTcpPort(service.base);
+                isReady = await checkTcpPort(service.base);
                 if (isReady) {
                   const waitDuration = Date.now() - waitStartTime;
                   this.logger.info({
@@ -650,7 +671,15 @@ export class Gateway {
                   });
                   break;
                 }
-                await new Promise(resolve => setTimeout(resolve, 50));
+                await new Promise(resolve => setTimeout(resolve, GatewayConstants.BACKEND_READY_CHECK_DELAY));
+              }
+
+              // 检查端口是否就绪
+              if (!isReady) {
+                service._state!.status = 'offline';
+                this.logger.error({ msg: `❌ [${service.name}] WebSocket 服务启动超时` });
+                ws.close();
+                return;
               }
 
               service._state!.status = 'online';
@@ -688,12 +717,30 @@ export class Gateway {
             });
 
             // 后端 WebSocket 收到消息，转发给客户端
-            backendWs.on('message', (data: Buffer) => {
+            backendWs.on('message', (data: Buffer, isBinary: boolean) => {
               if (ws !== null) {
-                const success = ws.send(data, true, false);
+                const success = ws.send(data, isBinary, false);
                 if (!success) {
                   // 背压处理：暂停后端流
                   backendWs.pause();
+
+                  // 注册可写回调恢复流
+                  const drainHandler = () => {
+                    if (backendWs.readyState === WS.OPEN) {
+                      // 重试发送
+                      const retrySuccess = ws.send(data, isBinary, false);
+                      if (retrySuccess) {
+                        backendWs.resume();
+                      } else {
+                        // 仍然背压，继续等待
+                        return true; // 继续监听
+                      }
+                    }
+                    return false; // 停止监听
+                  };
+
+                  // 使用 cork 确保同步调用
+                  ws.cork(drainHandler);
                 }
               }
             });

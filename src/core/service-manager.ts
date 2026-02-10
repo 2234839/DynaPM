@@ -29,11 +29,25 @@ export class ServiceManager {
    * @throws 当启动失败时抛出错误
    */
   async start(service: ServiceConfig): Promise<void> {
-    // 防止并发启动（内存锁）
+    // 检查是否有正在进行的启动
     let lock = this.startingLocks.get(service.name);
     if (lock) {
-      await lock;
-      return;
+      try {
+        await lock;
+        // 启动完成后，检查服务是否真的在线
+        const isRunning = await this.isRunning(service);
+        if (!isRunning) {
+          // 启动失败，删除锁允许重试
+          this.startingLocks.delete(service.name);
+          // 递归重新启动
+          return this.start(service);
+        }
+        return;
+      } catch {
+        // 启动失败，删除锁允许重试
+        this.startingLocks.delete(service.name);
+        // 继续执行下面的启动逻辑
+      }
     }
 
     lock = (async () => {
@@ -67,6 +81,7 @@ export class ServiceManager {
   /**
    * 停止服务
    * @param service - 服务配置
+   * @throws 当停止失败时抛出错误
    */
   async stop(service: ServiceConfig): Promise<void> {
     console.log(`[${service.name}] 正在停止...`);
@@ -78,8 +93,12 @@ export class ServiceManager {
 
     if (result.exitCode !== 0) {
       console.error(`[${service.name}] 停止失败:`, result.stderr);
-    } else {
-      console.log(`[${service.name}] 已停止`);
+      // 停止失败，仍然更新状态为 offline（让系统可以重试）
+      service._state!.status = 'offline';
+      throw new Error(`停止失败: ${result.stderr}`);
     }
+
+    console.log(`[${service.name}] 已停止`);
+    service._state!.status = 'offline';
   }
 }
