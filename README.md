@@ -495,6 +495,75 @@ Runtime resource usage:
 
 ---
 
+## 📦 Publishing Releases
+
+DynaPM uses GitHub Actions to automatically publish to npm, requiring no manual tokens or 2FA.
+
+### Release Process
+
+The project uses **npm OIDC (OpenID Connect) Trusted Publishing**, automatically triggered by Git tags:
+
+```bash
+# Method 1: patch version (bug fixes)
+npm version patch
+git push origin main --tags
+
+# Method 2: minor version (new features)
+npm version minor
+git push origin main --tags
+
+# Method 3: major version (breaking changes)
+npm version major
+git push origin main --tags
+```
+
+### Automated Release Workflow
+
+After pushing a tag, GitHub Actions automatically:
+
+1. ✅ **Build project** - Compile TypeScript with rslib
+2. ✅ **Run tests** - Execute 12 automated tests
+3. ✅ **Publish to npm** - Use OIDC, no tokens needed
+4. ✅ **Create Release** - Generate release notes on GitHub
+
+### Monitor Release Status
+
+- **GitHub Actions**: https://github.com/2234839/DynaPM/actions
+- **npm package**: https://www.npmjs.com/package/dynapm
+
+### Verify Release
+
+```bash
+# Check latest version
+npm view dynapm version
+
+# View version history
+npm view dynapm versions --json
+
+# Install and test
+npm install -g dynapm@latest
+```
+
+### Publishing Configuration
+
+This project uses **npm Trusted Publishing**:
+- ✅ No NPM_TOKEN environment variable needed
+- ✅ No two-factor authentication (2FA) required
+- ✅ Automatic verification via GitHub Actions OIDC
+- ✅ More secure (short-lived tokens, auto-expiry)
+
+For detailed setup: [docs/NPM_OIDC_SETUP.md](./docs/NPM_OIDC_SETUP.md)
+
+### Version Numbering
+
+Follows [Semantic Versioning](https://semver.org/):
+
+- **1.0.4** → **1.0.5** (`patch`): Bug fixes
+- **1.0.4** → **1.1.0** (`minor`): New features, backward compatible
+- **1.0.4** → **2.0.0** (`major`): Breaking changes
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Feel free to open issues or submit pull requests.

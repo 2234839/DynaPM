@@ -484,6 +484,75 @@ npm install -g autocannon
 
 ---
 
+## 📦 发布新版本
+
+DynaPM 使用 GitHub Actions 自动发布到 npm，无需手动配置令牌或双因素认证。
+
+### 发布流程
+
+项目采用 **npm OIDC (OpenID Connect) 可信发布**，通过 Git 标签自动触发发布：
+
+```bash
+# 方式一：patch 版本（修复 bug）
+npm version patch
+git push origin main --tags
+
+# 方式二：minor 版本（新功能）
+npm version minor
+git push origin main --tags
+
+# 方式三：major 版本（破坏性变更）
+npm version major
+git push origin main --tags
+```
+
+### 自动化发布流程
+
+推送标签后，GitHub Actions 会自动执行：
+
+1. ✅ **构建项目** - 使用 rslib 编译 TypeScript
+2. ✅ **运行测试** - 执行 12 个自动化测试
+3. ✅ **发布到 npm** - 使用 OIDC 无需令牌
+4. ✅ **创建 Release** - 在 GitHub 生成发布说明
+
+### 查看发布状态
+
+- **GitHub Actions**: https://github.com/2234839/DynaPM/actions
+- **npm 包页面**: https://www.npmjs.com/package/dynapm
+
+### 验证发布
+
+```bash
+# 查看最新版本
+npm view dynapm version
+
+# 查看版本历史
+npm view dynapm versions --json
+
+# 安装测试
+npm install -g dynapm@latest
+```
+
+### 发布配置说明
+
+项目使用 **npm Trusted Publishing**（可信发布）：
+- ✅ 无需 NPM_TOKEN 环境变量
+- ✅ 无需双因素认证（2FA）
+- ✅ 通过 GitHub Actions OIDC 自动验证
+- ✅ 更安全（短期令牌，自动过期）
+
+详细配置说明：[docs/NPM_OIDC_SETUP.md](./docs/NPM_OIDC_SETUP.md)
+
+### 版本号规范
+
+遵循 [语义化版本](https://semver.org/lang/zh-CN/)：
+
+- **1.0.4** → **1.0.5** (`patch`): Bug 修复
+- **1.0.4** → **1.1.0** (`minor`): 新功能，向后兼容
+- **1.0.4** → **2.0.0** (`major`): 破坏性变更
+
+---
+
 ## 🤝 贡献
 
 欢迎贡献！随时提交 issue 或 pull request。
