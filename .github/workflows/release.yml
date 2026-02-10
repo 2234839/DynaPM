@@ -1,0 +1,63 @@
+name: Release to npm
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 触发条件：推送版本标签，如 v1.0.4
+
+permissions:
+  contents: read
+  # 关键配置：允许 GitHub Actions 生成 OIDC 令牌
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build package
+        run: pnpm build
+
+      - name: Verify build output
+        run: |
+          echo "📦 检查打包输出..."
+          ls -la dist/src/
+          if [ ! -f dist/src/index.js ]; then
+            echo "❌ 主入口文件不存在"
+            exit 1
+          fi
+          echo "✅ 打包输出正常"
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Publish to npm
+        run: npm publish --provenance
+        # 使用 OIDC，不需要 NPM_TOKEN
+        # --provenance 标志启用包溯源（npm 推荐的安全实践）
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
