@@ -23,6 +23,6 @@
     "isolatedModules": true, // 确保每个模块可以独立编译
     "noEmitOnError": true // 在编译时遇到错误时不生成输出文件
   },
-  "include": ["src/**/*"], // 仅包含 src 目录下的文件
-  "exclude": ["node_modules", "**/*.spec.ts"] // 排除 node_modules 和测试文件
+  "include": ["src/**/*"], // 仅包含 src 目录
+  "exclude": ["node_modules", "**/*.spec.ts", "test/**/*"] // 排除 node_modules、spec 文件和测试目录
 }

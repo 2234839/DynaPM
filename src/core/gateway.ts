@@ -91,7 +91,8 @@ export class Gateway {
   private initServices(): void {
     for (const [hostname, service] of Object.entries(this.config.services)) {
       service._state = {
-        status: 'offline',
+        // 纯代理模式：服务始终在线，不需要启动
+        status: service.proxyOnly ? 'online' : 'offline',
         lastAccessTime: Date.now(),
         activeConnections: 0, // 初始化活动连接数为 0
       };
@@ -103,14 +104,21 @@ export class Gateway {
    * 初始化闲置检查器
    * 定期检查并停止闲置的服务
    *
-   * 注意：只有当服务没有活动连接且超过闲置时间时才会停止
-   * 这样可以避免 SSE/WebSocket 长连接被意外断开
+   * 注意：
+   * - 纯代理模式（proxyOnly）不会被停止
+   * - 只有当服务没有活动连接且超过闲置时间时才会停止
+   * - 这样可以避免 SSE/WebSocket 长连接被意外断开
    */
   private initIdleChecker(): void {
     setInterval(() => {
       const now = Date.now();
 
       for (const service of this.services.values()) {
+        // 跳过纯代理模式
+        if (service.proxyOnly) {
+          continue;
+        }
+
         // 检查条件：服务在线 + 没有活动连接 + 超过闲置时间
         if (
           service._state!.status === 'online' &&
@@ -252,10 +260,16 @@ export class Gateway {
             // 其他错误才记录为错误
             this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: message });
             if (!aborted) {
-              res.cork(() => {
-                res.writeStatus('503 Service Unavailable');
-                res.end('Service Unavailable');
-              });
+              try {
+                res.cork(() => {
+                  res.writeStatus('503 Service Unavailable');
+                  res.end('Service Unavailable');
+                });
+              } catch (sendErr: unknown) {
+                // 响应已失效，记录错误
+                const sendErrMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+                this.logger.error({ msg: `❌ [${service.name}] 发送错误响应失败`, error: sendErrMsg });
+              }
             }
           }
         })();
@@ -305,10 +319,16 @@ export class Gateway {
           // 其他错误才记录为错误
           this.logger.error({ msg: `❌ [${service.name}] 代理失败`, error: err.message });
           if (!aborted) {
-            res.cork(() => {
-              res.writeStatus('500 Internal Server Error');
-              res.end('Proxy Error');
-            });
+            try {
+              res.cork(() => {
+                res.writeStatus('500 Internal Server Error');
+                res.end('Proxy Error');
+              });
+            } catch (sendErr: unknown) {
+              // 响应已失效，记录错误
+              const sendErrMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+              this.logger.error({ msg: `❌ [${service.name}] 发送错误响应失败`, error: sendErrMsg });
+            }
           }
         });
       }
@@ -537,8 +557,10 @@ export class Gateway {
                   res.end('Bad Gateway');
                 }
               });
-            } catch {
-              // 响应已失效，忽略错误
+            } catch (sendErr: unknown) {
+              // 响应已失效，记录错误
+              const sendErrMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+              this.logger.error({ msg: `❌ [${service.name}] 发送错误响应失败`, error: sendErrMsg });
             }
           }
           cleanup();
@@ -564,8 +586,10 @@ export class Gateway {
                 res.end('Bad Gateway');
               }
             });
-          } catch {
-            // 响应已失效，忽略错误
+          } catch (sendErr: unknown) {
+            // 响应已失效，记录错误
+            const sendErrMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+            this.logger.error({ msg: `❌ [${service.name}] 发送错误响应失败`, error: sendErrMsg });
           }
         }
         cleanup();
@@ -610,11 +634,24 @@ export class Gateway {
         // 更新访问时间
         service._state!.lastAccessTime = Date.now();
 
+        /** 提取并保存客户端的请求头（用于转发到后端 WebSocket） */
+        const clientHeaders: Record<string, string> = {};
+        req.forEach((key: string, value: string) => {
+          // 清理 CRLF 注入
+          const safeValue = value.replace(/[\r\n]/g, '');
+          clientHeaders[key] = safeValue;
+        });
+
+        /** 保存客户端请求的路径（用于连接后端时使用） */
+        const clientPath = req.getUrl() + (req.getQuery() ? `?${req.getQuery()}` : '');
+
         // 完成客户端 WebSocket 握手
         res.upgrade(
           {
             hostname,
             service,
+            clientHeaders,
+            clientPath,
             // 这些数据会在 open/message/close 事件中通过 ws.getUserData() 访问
           },
           req.getHeader('sec-websocket-key'),
@@ -623,7 +660,7 @@ export class Gateway {
           context
         );
 
-        this.logger.info({ msg: `🔌 [${service.name}] WebSocket 升级请求` });
+        this.logger.info({ msg: `🔌 [${service.name}] WebSocket 升级请求: ${clientPath}` });
       },
 
       /**
@@ -687,15 +724,39 @@ export class Gateway {
 
             // 构建后端 WebSocket URL
             const targetUrl = new URL(service.base);
-            const wsUrl = `${targetUrl.protocol === 'https:' ? 'wss:' : 'ws:'}//${targetUrl.host}/`;
+
+            // 获取客户端的原始请求数据（从 upgrade 阶段保存的数据）
+            const userData = ws.getUserData();
+            const clientPath = userData.clientPath as string;
+            const clientHeaders = userData.clientHeaders as Record<string, string>;
+
+            // 使用客户端请求的实际路径，而不是默认的 /
+            const wsUrl = `${targetUrl.protocol === 'https:' ? 'wss:' : 'ws:'}//${targetUrl.host}${clientPath}`;
 
             this.logger.info({ msg: `🔌 [${service.name}] 连接后端 WebSocket: ${wsUrl}` });
 
+            // 准备转发的请求头（转发所有客户端头，除了连接相关的头）
+            const backendHeaders: Record<string, string> = {};
+            const skipHeaders = new Set(['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version']);
+
+            for (const [key, value] of Object.entries(clientHeaders)) {
+              if (!skipHeaders.has(key.toLowerCase())) {
+                backendHeaders[key] = value;
+              }
+            }
+
+            // 设置正确的 Host 头（指向后端服务器）
+            backendHeaders['Host'] = targetUrl.host;
+
+            // 记录转发的请求头（用于调试）
+            this.logger.info({
+              msg: `🔌 [${service.name}] 转发 WebSocket 请求头`,
+              headers: JSON.stringify(backendHeaders, null, 2)
+            });
+
             // 连接后端 WebSocket
             const backendWs = new WS(wsUrl, {
-              headers: {
-                'Host': targetUrl.host,
-              },
+              headers: backendHeaders,
             });
 
             wsState.backendWs = backendWs;
@@ -758,6 +819,9 @@ export class Gateway {
             // 后端 WebSocket 错误
             backendWs.on('error', (err: Error) => {
               this.logger.error({ msg: `❌ [${service.name}] 后端 WebSocket 错误`, error: err.message });
+              // 标记为正在关闭，防止重复操作
+              wsState.closing = true;
+
               if (ws !== null) {
                 ws.close();
               }
@@ -775,7 +839,9 @@ export class Gateway {
           } catch (error: unknown) {
             const message = error instanceof Error ? error.message : String(error);
             this.logger.error({ msg: `❌ [${service.name}] WebSocket 连接失败`, error: message });
-            ws.close();
+            if (ws !== null) {
+              ws.close();
+            }
           }
         })();
       },

@@ -47,6 +47,8 @@ export interface ServiceConfig {
   commands: ServiceCommands;
   /** 健康检查配置 */
   healthCheck?: HealthCheckConfig;
+  /** 纯代理模式：只做反向代理，不启动/停止服务 */
+  proxyOnly?: boolean;
   /** 运行时状态（内部使用） */
   _state?: ServiceState;
 }
