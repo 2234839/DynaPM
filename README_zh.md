@@ -4,9 +4,7 @@
 
 > **动态进程管理器** - 具有类 serverless 特性的轻量级通用服务管理系统
 
-[![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm)
-![Tests](https://img.shields.io/badge/tests-12%2F12 passing-green)
-![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
+[![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm) ![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
 
 DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替代方案**，专为私有化部署设计。它通过按需启动和闲置自动停止的方式，帮助你在资源受限的服务器上管理数百个低频访问的服务。
 
