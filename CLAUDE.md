@@ -67,6 +67,4 @@ pnpm benchmark
 
 ### 发布新版本
 
-**⚠️ 重要：发布前必须更新 CHANGELOG.md！**
-GitHub Actions 自动发布到 npm
-详见：[CONTRIBUTING.md](./CONTRIBUTING.md)
+流程 ： CHANGELOG → commit → npm version （git tag） → push 
