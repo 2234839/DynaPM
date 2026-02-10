@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.6] - 2025-02-10
+
+### 🔧 修复
+- 修复 CI 配置以支持 npm OIDC 发布
+  - 使用 Node.js 24 获得满足 OIDC 要求的 npm 11.x
+  - 移除 setup-node 的 registry-url 配置
+  - 使用 softprops/action-gh-release@v2 替代已废弃的 actions/create-release@v1
+  - 改进 CHANGELOG 提取脚本，使用 body_path 参数读取 Release 说明
+
+### 📚 文档
+- 完善发布流程文档
+
+---
+
 ## [1.0.5] - 2025-02-10
 
 ### ✨ 新增
