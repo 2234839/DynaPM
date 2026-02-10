@@ -9,9 +9,16 @@
 
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lsof } from 'node:process';
 
 const execAsync = promisify(exec);
+
+/** 检查是否禁用颜色（通过环境变量 NO_COLOR 或输出到文件） */
+const noColor = process.env.NO_COLOR === '1' || process.env.NO_COLOR === 'true' || process.stdout.isTTY === false;
+
+// 调试输出
+if (process.env.DEBUG_COLORS) {
+  console.error(`[DEBUG] NO_COLOR=${process.env.NO_COLOR}, isTTY=${process.stdout.isTTY}, noColor=${noColor}`);
+}
 
 /** 颜色输出 */
 const colors = {
@@ -23,14 +30,19 @@ const colors = {
   cyan: '\x1b[36m',
 };
 
+/** 获取颜色（如果禁用颜色则返回空字符串） */
+function getColor(color: string): string {
+  return noColor ? '' : color;
+}
+
 function log(msg: string, color = colors.reset) {
-  console.log(`${color}${msg}${colors.reset}`);
+  console.log(`${getColor(color)}${msg}${getColor(colors.reset)}`);
 }
 
 function section(title: string) {
-  console.log(`\n${colors.blue}${'='.repeat(60)}${colors.reset}`);
-  console.log(`${colors.blue}${title}${colors.reset}`);
-  console.log(`${colors.blue}${'='.repeat(60)}${colors.reset}`);
+  console.log(`\n${getColor(colors.blue)}${'='.repeat(60)}${getColor(colors.reset)}`);
+  console.log(`${getColor(colors.blue)}${title}${getColor(colors.reset)}`);
+  console.log(`${getColor(colors.blue)}${'='.repeat(60)}${getColor(colors.reset)}`);
 }
 
 function success(msg: string) {
@@ -131,60 +143,124 @@ async function testMultiServiceThroughput() {
 
   await sleep(1000);
 
-  // 检查是否安装了 autocannon
+  // 优先使用 wrk（高性能压测工具）
+  let useWrk = false;
   try {
-    await execAsync('which autocannon');
+    await execAsync('which wrk');
+    useWrk = true;
   } catch {
-    log('⚠ autocannon 未安装，跳过多服务吞吐量测试', colors.yellow);
-    log('  安装方法: npm install -g autocannon', colors.yellow);
-    return;
+    // wrk 未安装，尝试使用 autocannon
+  }
+
+  if (!useWrk) {
+    try {
+      await execAsync('which autocannon');
+    } catch {
+      log('⚠ 未安装压测工具，跳过多服务吞吐量测试', colors.yellow);
+      log('  推荐安装 wrk: apt-get install wrk (Linux) 或 brew install wrk (macOS)', colors.yellow);
+      log('  或安装 autocannon: npm install -g autocannon', colors.yellow);
+      return;
+    }
   }
 
   try {
     info(`运行网关压测 (${services.length} 个服务混合流量，${totalConcurrency} 总并发)...`);
-    info(`每个服务 ${concurrencyPerService} 并发，同时压测 ${services.length} 个服务\n`);
+    info(`每个服务 ${concurrencyPerService} 并发，同时压测 ${services.length} 个服务`);
+    info(`使用压测工具: ${useWrk ? 'wrk' : 'autocannon'}\n`);
 
-    // 并发测试所有服务
-    const testPromises = services.map(async (service) => {
-      const { stdout, stderr } = await execAsync(
-        `autocannon -d 5 -c ${concurrencyPerService} -H "Host: ${service}" http://127.0.0.1:3000/`,
-        { timeout: 15000 }
-      );
+    if (useWrk) {
+      // 使用 wrk 测试
+      const testPromises = services.map(async (service) => {
+        const { stdout } = await execAsync(
+          `wrk -t${concurrencyPerService / 10} -c${concurrencyPerService} -d5s -H "Host: ${service}" http://127.0.0.1:3000/`,
+          { timeout: 15000 }
+        );
 
-      const output = stdout || stderr;
-      const lines = output.split('\n');
+        // 解析 wrk 输出
+        const lines = stdout.split('\n');
+        const qpsLine = lines.find((line: string) => line.includes('Req/Sec'));
+        const latencyLine = lines.find((line: string) => line.includes('Latency'));
 
-      // 提取 QPS
-      const reqSecTable = lines.filter((line: string) => line.includes('Req/Sec'));
-      if (reqSecTable.length >= 1) {
-        const reqSecLine = reqSecTable[Math.max(0, reqSecTable.length - 2)];
-        const reqSecMatch = reqSecLine.match(/│\s+([\d,]+\.?\d*)\s+│/);
-        if (reqSecMatch) {
-          const qps = parseFloat(reqSecMatch[1].replace(/,/g, ''));
-          return { service, qps };
+        let qps = 0;
+        let avgLatency = 0;
+
+        if (qpsLine) {
+          const match = qpsLine.match(/([\d,]+\.?\d*)/);
+          if (match) {
+            qps = parseFloat(match[1].replace(/,/g, ''));
+          }
         }
+
+        if (latencyLine) {
+          const match = latencyLine.match(/([\d,]+\.?\d*)\s*([a-z]+)?/);
+          if (match) {
+            avgLatency = parseFloat(match[1].replace(/,/g, ''));
+          }
+        }
+
+        return { service, qps, avgLatency };
+      });
+
+      const results = await Promise.all(testPromises);
+      const totalQps = results.reduce((sum, r) => sum + r.qps, 0);
+      const avgLatency = results.reduce((sum, r) => sum + r.avgLatency, 0) / results.length;
+
+      success(`网关吞吐量测试完成`);
+      log(`\n  网关总 QPS: ${totalQps.toFixed(0)} req/s`, colors.cyan);
+      log(`  平均延迟: ${avgLatency.toFixed(2)} ms`, colors.cyan);
+      log(`  测试服务数: ${services.length}`, colors.cyan);
+      log(`  每服务并发数: ${concurrencyPerService}`, colors.cyan);
+      log(`  总并发数: ${totalConcurrency}`, colors.cyan);
+      log(`  测试时长: 5 秒`, colors.cyan);
+
+      log('\n  各服务 QPS 详情:', colors.cyan);
+      for (const result of results) {
+        log(`    - ${result.service}: ${result.qps.toFixed(1)} req/s (延迟: ${result.avgLatency.toFixed(2)}ms)`, colors.cyan);
       }
-      return { service, qps: 0 };
-    });
 
-    const results = await Promise.all(testPromises);
+      log(`\n  这是网关同时处理 ${services.length} 个不同服务的真实性能`, colors.cyan);
+    } else {
+      // 使用 autocannon 测试
+      const testPromises = services.map(async (service) => {
+        const { stdout, stderr } = await execAsync(
+          `autocannon -d 5 -c ${concurrencyPerService} -H "Host: ${service}" http://127.0.0.1:3000/`,
+          { timeout: 15000 }
+        );
 
-    // 计算总 QPS
-    const totalQps = results.reduce((sum, r) => sum + r.qps, 0);
+        const output = stdout || stderr;
+        const lines = output.split('\n');
 
-    success(`网关吞吐量测试完成`);
-    log(`\n  网关总 QPS: ${totalQps.toFixed(0)} req/s`, colors.cyan);
-    log(`  测试服务数: ${services.length}`, colors.cyan);
-    log(`  每服务并发数: ${concurrencyPerService}`, colors.cyan);
-    log(`  总并发数: ${totalConcurrency}`, colors.cyan);
-    log(`  测试时长: 5 秒`, colors.cyan);
+        // 提取 QPS
+        const reqSecTable = lines.filter((line: string) => line.includes('Req/Sec'));
+        if (reqSecTable.length >= 1) {
+          const reqSecLine = reqSecTable[Math.max(0, reqSecTable.length - 2)];
+          const reqSecMatch = reqSecLine.match(/│\s+([\d,]+\.?\d*)\s+│/);
+          if (reqSecMatch) {
+            const qps = parseFloat(reqSecMatch[1].replace(/,/g, ''));
+            return { service, qps };
+          }
+        }
+        return { service, qps: 0 };
+      });
 
-    log('\n  各服务 QPS 详情:', colors.cyan);
-    for (const result of results) {
-      log(`    - ${result.service}: ${result.qps.toFixed(1)} req/s`, colors.cyan);
+      const results = await Promise.all(testPromises);
+      const totalQps = results.reduce((sum, r) => sum + r.qps, 0);
+
+      success(`网关吞吐量测试完成`);
+      log(`\n  网关总 QPS: ${totalQps.toFixed(0)} req/s`, colors.cyan);
+      log(`  测试服务数: ${services.length}`, colors.cyan);
+      log(`  每服务并发数: ${concurrencyPerService}`, colors.cyan);
+      log(`  总并发数: ${totalConcurrency}`, colors.cyan);
+      log(`  测试时长: 5 秒`, colors.cyan);
+
+      log('\n  各服务 QPS 详情:', colors.cyan);
+      for (const result of results) {
+        log(`    - ${result.service}: ${result.qps.toFixed(1)} req/s`, colors.cyan);
+      }
+
+      log(`\n  这是网关同时处理 ${services.length} 个不同服务的真实性能`, colors.cyan);
+      log(`  提示: 使用 wrk 可以获得更准确的压测结果`, colors.yellow);
     }
-
-    log(`\n  这是网关同时处理 ${services.length} 个不同服务的真实性能`, colors.cyan);
   } catch (err: any) {
     log(`✗ 网关吞吐量测试失败: ${err.message}`, colors.red);
   }
@@ -207,7 +283,7 @@ async function cleanup() {
  * 主函数
  */
 async function main() {
-  console.log(`${colors.blue}\n🚀 DynaPM 性能测试${colors.reset}`);
+  console.log(`${getColor(colors.blue)}\n🚀 DynaPM 性能测试${getColor(colors.reset)}`);
 
   // 检查网关状态
   try {

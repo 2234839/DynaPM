@@ -111,6 +111,8 @@ export interface LoggingConfig {
   enableWebSocketLog?: boolean;
   /** 是否启用错误日志（始终启用，不受此开关控制） */
   enableErrorLog?: boolean;
+  /** 是否启用性能分析日志（用于性能优化调试） */
+  enablePerformanceLog?: boolean;
 }
 
 /** DynaPM全局配置 */
