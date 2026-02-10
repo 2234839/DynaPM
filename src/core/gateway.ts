@@ -113,6 +113,8 @@ export class Gateway {
     enableRequestLog: boolean;
     /** 是否启用 WebSocket 生命周期日志 */
     enableWebSocketLog: boolean;
+    /** 是否启用性能分析日志（用于性能优化调试） */
+    enablePerformanceLog: boolean;
   };
   /** 管理 API 处理器 */
   private adminApi: AdminApiHandler;
@@ -122,6 +124,7 @@ export class Gateway {
     this.logging = {
       enableRequestLog: config.logging?.enableRequestLog ?? false,
       enableWebSocketLog: config.logging?.enableWebSocketLog ?? false,
+      enablePerformanceLog: config.logging?.enablePerformanceLog ?? false,
     };
     this.adminApi = new AdminApiHandler(config, logger, this.hostnameRoutes, this.portRoutes, this.serviceManager);
     this.initServices();
@@ -589,12 +592,20 @@ export class Gateway {
     body: Buffer,
   ): Promise<void> {
     const service = mapping.service;
+    const perfLog = this.logging.enablePerformanceLog;
+
+    /** 性能分析：请求准备开始 */
+    const perfPrepStart = perfLog ? performance.now() : 0;
+
     // 使用缓存的 URL 对象，只需更新路径部分
     const targetUrl = mapping.targetUrl!;
     // 构建完整的请求 URL
     const requestUrl = new URL(path, targetUrl);
     const isHttps = mapping.isHttps!;
     const httpModule = isHttps ? https : http;
+
+    /** 性能分析：URL 构建耗时 */
+    const perfUrlTime = perfLog ? performance.now() - perfPrepStart : 0;
 
     // 过滤并准备转发的请求头
     const proxyHeaders: Record<string, string> = { ...headers };
@@ -604,11 +615,17 @@ export class Gateway {
     // 设置正确的 Host 头
     proxyHeaders['host'] = targetUrl.host;
 
+    /** 性能分析：请求头处理耗时 */
+    const perfHeadersTime = perfLog ? performance.now() - perfPrepStart - perfUrlTime : 0;
+
     // 创建代理状态
     const state: ProxyState = { aborted: false, responded: false };
 
     // 增加活动连接计数（用于防止长连接被闲置检测误杀）
     service._state!.activeConnections++;
+
+    /** 性能分析：准备阶段完成 */
+    const perfPrepTime = perfLog ? performance.now() - perfPrepStart : 0;
 
     return new Promise((resolve, reject) => {
       // 创建清理函数：减少活动连接计数（防止重复调用）
@@ -635,6 +652,17 @@ export class Gateway {
         resolve();
       });
 
+      /** 性能分析：HTTP 请求创建开始 */
+      const perfHttpStart = perfLog ? performance.now() : 0;
+      /** 首字节响应时间 */
+      let perfTtfb = 0;
+      /** 流式传输开始时间 */
+      let perfStreamStart = 0;
+      /** 数据块计数 */
+      let chunkCount = 0;
+      /** 总字节数 */
+      let totalBytes = 0;
+
       state.proxyReq = httpModule.request(requestUrl, {
         method,
         headers: proxyHeaders,
@@ -643,6 +671,12 @@ export class Gateway {
         rejectUnauthorized: false,
       }, (proxyRes: http.IncomingMessage) => {
         state.proxyRes = proxyRes;
+
+        /** 性能分析：首字节响应时间（TTFB） */
+        if (perfLog && perfTtfb === 0) {
+          perfTtfb = performance.now() - perfHttpStart;
+          perfStreamStart = performance.now();
+        }
 
         const statusCode = proxyRes.statusCode || 200;
         const statusMessage = proxyRes.statusMessage || 'OK';
@@ -726,6 +760,12 @@ export class Gateway {
             return;
           }
 
+          /** 性能分析：记录数据块 */
+          if (perfLog) {
+            chunkCount++;
+            totalBytes += chunk.length;
+          }
+
           // 尝试写入数据并检查 backpressure
           let writeSuccess = false;
           res.cork(() => {
@@ -759,6 +799,11 @@ export class Gateway {
             return;
           }
 
+          /** 性能分析：计算流式传输耗时 */
+          const perfStreamTime = perfLog ? performance.now() - perfStreamStart : 0;
+          /** 性能分析：总耗时 */
+          const perfTotalTime = perfLog ? performance.now() - perfPrepStart : 0;
+
           // 结束响应
           res.cork(() => {
             if (state.aborted) return;
@@ -776,6 +821,35 @@ export class Gateway {
                 path,
                 statusCode,
                 responseTime,
+              });
+            }
+
+            // 记录性能分析日志
+            if (perfLog) {
+              this.logger.info({
+                msg: `⚡ [${service.name}] 性能分析`,
+                service: service.name,
+                method,
+                path,
+                statusCode,
+                /** 准备阶段耗时（毫秒） */
+                prepTime: perfPrepTime.toFixed(3),
+                /** URL 构建耗时（毫秒） */
+                urlTime: perfUrlTime.toFixed(3),
+                /** 请求头处理耗时（毫秒） */
+                headersTime: perfHeadersTime.toFixed(3),
+                /** HTTP 连接 + 首字节响应耗时（毫秒） */
+                ttfb: perfTtfb.toFixed(3),
+                /** 流式传输耗时（毫秒） */
+                streamTime: perfStreamTime.toFixed(3),
+                /** 总耗时（毫秒） */
+                totalTime: perfTotalTime.toFixed(3),
+                /** 数据块数量 */
+                chunkCount,
+                /** 总字节数 */
+                totalBytes,
+                /** 平均每块大小（字节） */
+                avgChunkSize: chunkCount > 0 ? (totalBytes / chunkCount).toFixed(1) : 0,
               });
             }
           });

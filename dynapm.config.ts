@@ -26,6 +26,8 @@ const config: DynaPMConfig = {
     enableRequestLog: false,
     // 是否启用 WebSocket 生命周期日志 - 中频，调试时有用
     enableWebSocketLog: false,
+    // 是否启用性能分析日志（用于性能优化调试）- 仅在优化时启用
+    enablePerformanceLog: true,
     // 错误日志始终启用，不受此开关控制
     // enableErrorLog: true,
   },
