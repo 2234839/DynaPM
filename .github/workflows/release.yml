@@ -49,6 +49,24 @@ jobs:
         # 使用 OIDC，不需要 NPM_TOKEN
         # --provenance 标志启用包溯源（npm 推荐的安全实践）
 
+      - name: Extract release notes from CHANGELOG
+        id: changelog
+        run: |
+          # 获取版本号（去掉 v 前缀）
+          VERSION=${{ github.ref_name }}
+          VERSION_NUMBER=${VERSION#v}
+
+          # 从 CHANGELOG.md 提取对应版本的内容
+          # 使用 sed 提取两个版本标题之间的内容
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+          sed -n "/## \[$VERSION_NUMBER\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2 >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # 如果没有找到对应版本，使用默认消息
+          if [ ! -s "$RELEASE_NOTES_FILE" ]; then
+            echo "📦 Release $VERSION" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create GitHub Release
         uses: actions/create-release@v1
         env:
@@ -56,5 +74,6 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           release_name: Release ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.RELEASE_NOTES }}
           draft: false
           prerelease: false

@@ -511,7 +511,7 @@ git push origin main --tags
 推送标签后，GitHub Actions 会自动执行：
 
 1. ✅ **构建项目** - 使用 rslib 编译 TypeScript
-2. ✅ **运行测试** - 执行 12 个自动化测试
+2. ✅ **验证打包** - 检查输出文件完整性
 3. ✅ **发布到 npm** - 使用 OIDC 无需令牌
 4. ✅ **创建 Release** - 在 GitHub 生成发布说明
 
