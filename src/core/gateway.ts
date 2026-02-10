@@ -4,8 +4,6 @@ import type { HttpResponse, HttpRequest, WebSocket } from 'uWebSockets.js';
 import type { Logger } from 'pino';
 import uWS from 'uWebSockets.js';
 import net from 'node:net';
-import http from 'node:http';
-import https from 'node:https';
 import { URL } from 'node:url';
 import WS from 'ws';
 import { AdminApiHandler } from './admin-api.js';
@@ -21,27 +19,6 @@ const GatewayConstants = {
   /** 后端就绪检查延迟（毫秒） */
   BACKEND_READY_CHECK_DELAY: 50,
 } as const;
-
-/**
- * HTTP Agent 连接池（复用连接，提升性能）
- * 优化配置：延长 keepAlive 时间以减少连接重建开销
- */
-const httpAgent = new http.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 60000, // 60 秒 - 连接保持更长时间，减少重连
-  maxSockets: 256,
-  maxFreeSockets: 256,
-  timeout: 30000,
-});
-
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 60000, // 60 秒 - 连接保持更长时间，减少重连
-  maxSockets: 256,
-  maxFreeSockets: 256,
-  timeout: 30000,
-  rejectUnauthorized: false,
-});
 
 /**
  * 快速检查 TCP 端口是否可用
@@ -89,12 +66,6 @@ interface RouteMapping {
   target: string;
   /** 缓存的目标 URL 对象（避免重复解析） */
   targetUrl?: URL;
-  /** 是否为 HTTPS */
-  isHttps?: boolean;
-  /** 缓存的 HTTP 模块（避免每次请求的三元运算） */
-  httpModule?: typeof http | typeof https;
-  /** 缓存的 HTTP Agent（避免每次请求的三元运算） */
-  httpAgent?: http.Agent | https.Agent;
   /** 缓存的 undici Client（高性能 HTTP 客户端） */
   undiciClient?: Client;
 }
@@ -170,9 +141,6 @@ export class Gateway {
       for (const route of routes) {
         // 缓存 URL 解析结果，避免每次请求都创建新对象
         const targetUrl = new URL(route.target);
-        const isHttps = targetUrl.protocol === 'https:';
-        // 优化：缓存 Agent，避免每次请求的三元运算
-        const agent = isHttps ? httpsAgent : httpAgent;
         // 创建 undici Client（高性能 HTTP 客户端）
         const undiciClient = new Client(route.target, {
           keepAliveTimeout: 60000, // 60 秒
@@ -182,11 +150,6 @@ export class Gateway {
           service,
           target: route.target,
           targetUrl,
-          isHttps,
-          // 优化：缓存 HTTP 模块，避免每次请求的三元运算
-          httpModule: isHttps ? https : http,
-          // 优化：缓存 HTTP Agent，避免每次请求的三元运算
-          httpAgent: agent,
           undiciClient,
         };
         if (route.type === 'host') {
