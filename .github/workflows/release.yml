@@ -6,7 +6,7 @@ on:
       - 'v*.*.*'  # 触发条件：推送版本标签，如 v1.0.4
 
 permissions:
-  contents: read
+  contents: write
   # 关键配置：允许 GitHub Actions 生成 OIDC 令牌
   id-token: write
 
