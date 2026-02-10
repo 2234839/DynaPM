@@ -4,9 +4,7 @@
 
 > **Dynamic Process Manager** - A lightweight, universal service management system with serverless-like features.
 
-[![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm)
-![Tests](https://img.shields.io/badge/tests-12%2F12 passing-green)
-![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
+[![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm) ![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
 
 DynaPM is a **lightweight alternative** to complex container orchestration platforms (like Knative, Sablier) for private deployments. It helps you manage hundreds of low-frequency services on resource-constrained servers by starting them on-demand and stopping them when idle.
 
