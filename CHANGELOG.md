@@ -5,6 +5,15 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.7] - 2025-02-10
+
+### 🔧 修复
+- 修复 GitHub Actions 权限配置
+  - 添加 contents: write 权限以创建 GitHub Release
+  - 解决 403 "Resource not accessible by integration" 错误
+
+---
+
 ## [1.0.6] - 2025-02-10
 
 ### 🔧 修复
