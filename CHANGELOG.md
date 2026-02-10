@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.12] - 2026-02-10
+
+### ✨ 新增
+- 添加 `proxyOnly` 配置项，支持纯反向代理模式
+  - 不管理服务生命周期（启动/停止）
+  - 仅做请求转发，适合已运行的服务
+
+### 🔧 改进
+- WebSocket 代理正确转发客户端请求路径
+- WebSocket 代理完整转发客户端请求头（Cookie、Authorization 等）
+- 改进 WebSocket 错误处理，避免连接重试循环
+- 添加 TypeScript 测试配置支持
+
+---
+
 ## [1.0.11] - 2025-02-10
 
 ### 🔧 修复
