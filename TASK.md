@@ -35,25 +35,25 @@
 - **activeConnections 双重递减修复**: handleDirectProxy 和 forwardProxyRequest 中 cleanup() 添加 `cleaned` 守卫，防止 onAborted/proxyReq error/proxyRes end 多次触发导致 activeConnections 变为负数，进而导致闲置超时永远不触发
 - **代理请求超时处理**: proxyReq 添加 `timeout` 事件监听，超时后调用 `destroy()` 触发 error 事件正确返回 502。之前 timeout 事件未被处理，导致后端慢响应时客户端无限等待
 
-#### 测试覆盖（103 个测试全部通过）
+#### 测试覆盖（93 个测试全部通过）
 - **test-proxy-comprehensive.ts**: 23 个综合代理测试
+- **test-advanced-proxy.ts**: 12 个高级代理场景测试（PUT/PATCH/DELETE 请求体转发、HEAD 无响应体、OPTIONS CORS、空 POST、根路径、查询参数特殊字符、30 个自定义头、Host 头覆盖、流式响应、快速连续请求、活跃服务闲置测试、WS+HTTP 并发）
 - **test-edge-cases.ts**: 15 个极端场景测试
 - **test-gateway-robustness.ts**: 13 个健壮性测试
-- **test-port-route-start.ts**: 9 个端口路由按需启动测试
 - **test-admin-api-lifecycle.ts**: 12 个管理 API 生命周期测试
+- **test-port-route-start.ts**: 9 个端口路由按需启动测试
 - **test-security-stability.ts**: 9 个安全与稳定性深度测试
 - **test-concurrent-post-body.ts**: 10 个并发与竞争条件测试
-- **test-post-body-fix.ts**: 12 个 POST 请求体完整性测试
-  - 并发 POST 同时触发按需启动（10个）
-  - 混合 GET/POST/PUT 并发按需启动
-  - 快速连续 POST（间隔 50ms）
-  - starting 状态 50 个并发请求
-  - stopping 状态请求等待后重启
-  - 100 个并发 POST 压力测试
-  - 端口路由 20 并发 POST
-  - 按需启动 body 大小梯度（10B~100KB）
-  - 管理 API 启动 + 并发请求竞争
-  - 闲置超时后再次按需启动 POST
+- **test-post-body-fix.ts**: 12 个 POST 请求体完整性测试（已整合到 test-concurrent-post-body.ts）
+
+#### echo-server 修复
+- **HEAD 请求不返回 body**: 包装 res.end 使 HEAD 请求忽略 data 参数，修复 node:http 客户端 HTTP 解析错误
+
+#### 性能评估结论
+- 网关纯代理开销 P50=0.275ms（hostname 路由）、P50=0.240ms（端口路由 proxyOnly）
+- 基准测试：冷启动 255ms、单请求延迟 9.9ms、3 服务×50 并发吞吐量 5,260 req/s
+- **无数量级优化空间**: 当前性能已接近理论极限（localhost 环境下 node:http 双重 HTTP 协议解析开销约 9ms，网关本身仅占 0.27ms）
+- undici 与 uWS 流式模型不兼容，不可用作替代方案
 
 #### Serverless Host 演示
 - test/services/serverless-host.ts: 轻量级 TypeScript Serverless 运行时
