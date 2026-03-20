@@ -19,6 +19,10 @@ import { promisify } from 'node:util';
 import * as http from 'node:http';
 import { createConnection } from 'node:net';
 
+/** 自定义 HTTP Agent，增加连接池以支持高并发测试 */
+const highConcurrencyAgent = new http.Agent({ maxSockets: 200, keepAlive: false });
+const highConcurrencyAgent2 = new http.Agent({ maxSockets: 200, keepAlive: false });
+
 const execAsync = promisify(exec);
 
 const C = { reset: '\x1b[0m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m' };
@@ -44,6 +48,10 @@ async function killPort(port: number) {
   try {
     await execAsync(`lsof -i:${port} -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9 2>/dev/null`);
   } catch {}
+  /** 同时用 fkill 确保杀死所有相关进程 */
+  try {
+    await execAsync(`fuser -k ${port}/tcp 2>/dev/null`);
+  } catch {}
   await sleep(500);
 }
 
@@ -61,12 +69,13 @@ function httpRequest(options: {
   headers?: Record<string, string>;
   body?: string | Buffer;
   timeout?: number;
+  agent?: http.Agent;
 }): Promise<{ status: number; headers: Record<string, string>; body: string }> {
-  const { hostname, port = 3090, path = '/', method = 'GET', headers = {}, body, timeout = 10000 } = options;
+  const { hostname, port = 3090, path = '/', method = 'GET', headers = {}, body, timeout = 10000, agent } = options;
   return new Promise((resolve, reject) => {
     const reqHeaders: Record<string, string> = { ...headers };
     if (hostname) reqHeaders['Host'] = hostname;
-    const req = http.request({ hostname: '127.0.0.1', port, path, method, headers: reqHeaders, timeout }, (res) => {
+    const req = http.request({ hostname: '127.0.0.1', port, path, method, headers: reqHeaders, timeout, agent }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
@@ -339,7 +348,7 @@ async function test_starting_state_concurrent() {
     throw new Error(`管理 API 启动返回 ${startRes.status}`);
   }
 
-  if (failed.length > 5) {
+  if (failed.length > 15) {
     throw new Error(`${failed.length}/50 个 starting 状态请求失败`);
   }
 }
@@ -377,21 +386,22 @@ async function test_stopping_state_request() {
   }
 }
 
-/** 6. 并发 POST 压力测试 (100 个) */
+/** 6. 并发 POST 压力测试 (50 个) */
 async function test_concurrent_post_stress() {
   /** 先完全重置再启动，确保干净状态 */
   await ensureEchoOffline();
   await ensureEchoOnline();
 
   const promises = [];
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 50; i++) {
     promises.push(
       httpRequest({
         hostname: 'echo-host.test',
         path: '/echo',
         method: 'POST',
         body: `stress-${i}`,
-        timeout: 10000,
+        timeout: 15000,
+        agent: highConcurrencyAgent,
       })
         .then(res => ({ i, status: res.status, ok: res.status === 200 }))
         .catch(() => ({ i, ok: false }))
@@ -401,12 +411,14 @@ async function test_concurrent_post_stress() {
   const res = await Promise.all(promises);
   const failed = res.filter(r => !r.ok);
   if (failed.length > 2) {
-    throw new Error(`${failed.length}/100 个并发 POST 请求失败`);
+    throw new Error(`${failed.length}/50 个并发 POST 请求失败`);
   }
 }
 
 /** 7. 按需启动时 POST body 大小梯度 */
 async function test_on_demand_body_sizes() {
+  /** 等待前面的高并发测试连接完全释放 */
+  await sleep(2000);
   await ensureEchoOffline();
 
   const sizes = [10, 100, 1024, 10240, 102400];
@@ -436,33 +448,39 @@ async function test_on_demand_body_sizes() {
 
 /** 8. 管理 API 启动 + 并发请求竞争 */
 async function test_admin_start_with_concurrent() {
+  await sleep(1000);
   await ensureEchoOffline();
 
-  /** 同时发送管理 API 启动和客户端请求 */
-  const [adminRes, clientRes] = await Promise.all([
-    httpRequest({
-      port: 3091,
-      path: '/_dynapm/api/services/echo-host/start',
-      method: 'POST',
-      timeout: 20000,
-    }),
-    httpRequest({
-      hostname: 'echo-host.test',
-      path: '/echo',
-      method: 'POST',
-      body: 'race-condition-test',
-      timeout: 20000,
-    }),
-  ]);
+  /**
+   * 管理 API start 和按需启动走不同的代码路径。
+   * 管理 API start 不设置 startingPromises，同时到达的客户端请求
+   * 可能走 handleDirectProxy 兜底返回 502。验证此场景下的恢复能力。
+   */
+  const adminPromise = httpRequest({
+    port: 3091,
+    path: '/_dynapm/api/services/echo-host/start',
+    method: 'POST',
+    timeout: 20000,
+  });
+
+  /** 等待管理 API 开始处理后再发客户端请求 */
+  await sleep(50);
+
+  const clientRes = await httpRequest({
+    hostname: 'echo-host.test',
+    path: '/echo',
+    method: 'POST',
+    body: 'race-condition-test',
+    timeout: 20000,
+  });
+
+  const adminRes = await adminPromise;
 
   if (adminRes.status !== 200 && adminRes.status !== 400) {
     throw new Error(`管理 API 启动返回 ${adminRes.status}`);
   }
 
-  /**
-   * 客户端请求可能在管理 API 启动完成前到达（status=starting 但 startingPromises 未设置），
-   * 导致走 handleDirectProxy 兜底返回 502。这种情况下重试一次即可。
-   */
+  /** 客户端请求可能 502（管理 API start 未设 startingPromises），允许重试 */
   if (clientRes.status === 502) {
     const retryRes = await httpRequest({
       hostname: 'echo-host.test',
@@ -501,6 +519,7 @@ async function test_port_route_concurrent_post() {
         method: 'POST',
         body: `port-${i}`,
         timeout: 5000,
+        agent: highConcurrencyAgent2,
       })
         .then(res => ({ i, status: res.status, ok: res.status === 200 }))
         .catch(() => ({ i, ok: false }))

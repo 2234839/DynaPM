@@ -379,11 +379,14 @@ async function test_mixed_concurrent() {
   }
 }
 
-/** 16. 延迟响应超时测试 */
+/** 16. 延迟响应超时测试（使用 hostname 路由避免 proxyOnly 的闲置停止问题） */
 async function test_delayed_2s() {
+  /** 先刷新闲置时间，确保 echo 不会在测试期间被停止 */
+  await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 5000 });
+
   const start = Date.now();
   const res = await httpRequest({
-    port: 3092,
+    hostname: 'echo-host.test',
     path: '/delay?delay=2000',
     timeout: 5000,
   });

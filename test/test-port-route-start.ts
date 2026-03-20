@@ -135,10 +135,18 @@ async function test_port_concurrent_on_demand() {
 
 /** 2. 端口路由闲置后重新按需启动 */
 async function test_port_idle_restart() {
-  if (!await checkPort(3098)) throw new Error('前置条件：后端应该在线');
+  /** 确保后端在线（前面的测试可能已闲置停止） */
+  if (!await checkPort(3098)) {
+    const warmup = await httpRequest({ path: '/echo', timeout: 20000 });
+    if (warmup.status !== 200) throw new Error(`前置条件：后端应该在线，但返回 ${warmup.status}`);
+  }
 
-  log('    等待闲置超时（15秒）...', C.yellow);
-  await sleep(15000);
+  /**
+   * idleTimeout=10s，IDLE_CHECK_INTERVAL=3s
+   * 等待 20s 确保至少经过一次闲置检查（留足余量）
+   */
+  log('    等待闲置超时（20秒）...', C.yellow);
+  await sleep(20000);
 
   if (await checkPort(3098)) throw new Error('后端应该在闲置后自动停止');
 

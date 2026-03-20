@@ -36,6 +36,7 @@ app.any('/*', (res, req) => {
 });
 
 function handleRequest(res: uWS.HttpResponse, method: string, url: string, query: string, headers: Record<string, string>, body: string) {
+  const isHead = method === 'head';
   /** 解析查询参数 */
   const params: Record<string, string> = {};
   if (query) {
@@ -45,6 +46,12 @@ function handleRequest(res: uWS.HttpResponse, method: string, url: string, query
         params[decodeURIComponent(key)] = decodeURIComponent(value || '');
       }
     }
+  }
+
+  /** HEAD 请求不应返回响应体，包装 res.end 使其忽略 data 参数 */
+  const origEnd = res.end.bind(res);
+  if (isHead) {
+    res.end = (() => origEnd('')) as typeof res.end;
   }
 
   /** 根据路径路由 */

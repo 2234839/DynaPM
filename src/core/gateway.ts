@@ -94,7 +94,9 @@ const GatewayConstants = {
   /** 预编译 CRLF 清理正则（热路径中使用） */
   CRLF_REGEX: /[\r\n]/g,
   /** 不应转发的请求头（小写） */
-  SKIP_REQUEST_HEADERS: new Set(['connection', 'keep-alive', 'content-length']),
+  SKIP_REQUEST_HEADERS: new Set(['connection', 'keep-alive', 'content-length', 'transfer-encoding']),
+  /** WebSocket 升级时不应转发的请求头（小写） */
+  WS_SKIP_HEADERS: new Set(['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version']),
   /** 请求体最大大小（10MB），防止 DoS 攻击 */
   MAX_REQUEST_BODY_SIZE: 10 * 1024 * 1024,
   /** WebSocket 消息队列最大长度（1000 条），防止内存泄漏 */
@@ -147,6 +149,8 @@ interface RouteMapping {
   target: string;
   /** 缓存的目标 URL 对象（避免重复解析） */
   targetUrl?: URL;
+  /** 预计算的目标端口（避免每次请求 parseInt） */
+  targetPort: number;
 }
 
 /**
@@ -225,6 +229,7 @@ export class Gateway {
           service,
           target: route.target,
           targetUrl,
+          targetPort: parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80')),
         };
         if (route.type === 'host') {
           const hostname = route.value as string;
@@ -626,7 +631,7 @@ export class Gateway {
     // 立即发起代理请求，不等请求体收集完
     const proxyReq = http.request({
       hostname: targetUrl.hostname,
-      port: parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80')),
+      port: mapping.targetPort,
       path: fullUrl,
       method: method.toUpperCase(),
       headers: proxyHeaders,
@@ -758,6 +763,12 @@ export class Gateway {
       cleanup();
     });
 
+    /** 代理请求超时处理：销毁连接并返回 504 */
+    proxyReq.on('timeout', () => {
+      this.logger.error({ msg: `⏱️ [${service.name}] 代理请求超时` });
+      proxyReq.destroy();
+    });
+
     // 边收请求体边写入代理请求（真正的双向流式）
     res.onData((ab: ArrayBuffer, isLast: boolean) => {
       if (state.aborted) {
@@ -765,7 +776,9 @@ export class Gateway {
         return;
       }
 
-      const chunk = Buffer.from(ab);
+      /** uWS 的 ArrayBuffer 是借用语义，必须复制数据 */
+      const chunk = Buffer.alloc(ab.byteLength);
+      Buffer.from(ab).copy(chunk);
 
       if (isLast) {
         proxyReq.end(chunk);
@@ -799,8 +812,7 @@ export class Gateway {
     // 构建代理请求头
     const proxyHeaders: Record<string, string> = {};
     for (const key in headers) {
-      const keyLower = key.toLowerCase();
-      if (keyLower === 'connection' || keyLower === 'keep-alive' || keyLower === 'content-length' || keyLower === 'transfer-encoding') {
+      if (GatewayConstants.SKIP_REQUEST_HEADERS.has(key.toLowerCase())) {
         continue;
       }
       proxyHeaders[key] = headers[key];
@@ -841,7 +853,7 @@ export class Gateway {
       try {
         proxyReq = http.request({
           hostname: targetUrl.hostname,
-          port: parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80')),
+          port: mapping.targetPort,
           path,
           method: method.toUpperCase(),
           headers: proxyHeaders,
@@ -1017,6 +1029,12 @@ export class Gateway {
           reject(err);
         });
 
+        /** 代理请求超时处理：销毁连接触发 error → 502 */
+        proxyReq.on('timeout', () => {
+          this.logger.error({ msg: `⏱️ [${service.name}] 代理请求超时` });
+          proxyReq.destroy();
+        });
+
         // 发送请求体（空 body 也会调用 end 来触发请求）
         if (body.length > 0) {
           proxyReq.end(body);
@@ -1158,7 +1176,7 @@ export class Gateway {
             }
 
             const backendHeaders: Record<string, string> = {};
-            const skipHeaders = new Set(['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version']);
+            const skipHeaders = GatewayConstants.WS_SKIP_HEADERS;
 
             for (const [key, value] of Object.entries(clientHeaders)) {
               if (!skipHeaders.has(key.toLowerCase())) {
@@ -1453,7 +1471,7 @@ export class Gateway {
             }
 
             const backendHeaders: Record<string, string> = {};
-            const skipHeaders = new Set(['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version']);
+            const skipHeaders = GatewayConstants.WS_SKIP_HEADERS;
 
             for (const [key, value] of Object.entries(clientHeaders)) {
               if (!skipHeaders.has(key.toLowerCase())) {

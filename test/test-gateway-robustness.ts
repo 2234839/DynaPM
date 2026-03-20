@@ -242,8 +242,11 @@ async function test_gateway_direct_access() {
 
 /** 10. 闲置后重新按需启动 - 服务闲置停止后再次启动 */
 async function test_idle_then_restart() {
-  // echo 应该在线（前面的测试已启动）
-  if (!await checkPort(3099)) throw new Error('前置条件：echo 应该在线');
+  // echo 应该在线（前面的测试已启动），确保 echo 在线
+  if (!await checkPort(3099)) {
+    const warmup = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
+    if (warmup.status !== 200) throw new Error(`前置条件：echo 应该在线，但返回 ${warmup.status}`);
+  }
 
   log('    等待闲置超时（15秒）...', C.yellow);
   await sleep(15000);

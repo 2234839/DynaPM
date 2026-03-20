@@ -1,9 +1,10 @@
 具有类 serverless 特性的轻量级通用服务管理系统:dynapm
 ## dynapm 开发
 
-/loop 先检查 TASK.md 中是否有未完成的任务请逐项完成并在充分test验证再继续下一项，如果没有则请请完善当前项目：测试更多代理场景，确保网关程序没有问题，监测并优化程序性能,修改完毕后需要使用 pilot 进行实际运行测试，请自我完善，不要询问我任何事情，也不要切换其他模式（例如 plan mode）
+/loop 先检查 TASK.md 中是否有未完成的任务请逐项完成并在充分test验证再继续下一项，如果没有则请请完善当前项目：测试更多代理场景，确保网关程序没有问题，监测并优化程序性能,修改完毕后需要进行实际运行测试，请自我完善，不要询问我任何事情，也不要切换其他模式（例如 plan mode）
 作为网关的测试一定要非常严谨，测试各种可能的情况以及极端情况。
 所有文件使用 ts，需要临时运行的使用 node --experimental-strip-types -e xxx.ts 来执行
+这一次主要考虑性能，要在不破坏所有功能的前提下优化性能，但是不要为了优化而优化，必须经过仔细的评估，有数量级的性能提升的修改才去采纳，否则可读性更强
 
 ## TASKS
 
@@ -28,23 +29,31 @@
 #### 性能优化
 - **预编译 CRLF 正则**: `GatewayConstants.CRLF_REGEX` 避免热路径中重复创建正则对象
 - **Set 替代内联条件**: `GatewayConstants.SKIP_REQUEST_HEADERS` 使用 Set.has() 替代重复 toLowerCase + 条件判断
+- **预计算 targetPort**: RouteMapping 中缓存目标端口，避免热路径中 parseInt 解析
 
-#### 测试覆盖（81 个测试全部通过）
+#### 网关稳定性修复
+- **activeConnections 双重递减修复**: handleDirectProxy 和 forwardProxyRequest 中 cleanup() 添加 `cleaned` 守卫，防止 onAborted/proxyReq error/proxyRes end 多次触发导致 activeConnections 变为负数，进而导致闲置超时永远不触发
+- **代理请求超时处理**: proxyReq 添加 `timeout` 事件监听，超时后调用 `destroy()` 触发 error 事件正确返回 502。之前 timeout 事件未被处理，导致后端慢响应时客户端无限等待
+
+#### 测试覆盖（103 个测试全部通过）
 - **test-proxy-comprehensive.ts**: 23 个综合代理测试
 - **test-edge-cases.ts**: 15 个极端场景测试
 - **test-gateway-robustness.ts**: 13 个健壮性测试
 - **test-port-route-start.ts**: 9 个端口路由按需启动测试
 - **test-admin-api-lifecycle.ts**: 12 个管理 API 生命周期测试
 - **test-security-stability.ts**: 9 个安全与稳定性深度测试
-  - 端口路由并发按需启动（10个同时请求）
-  - 端口路由多种 HTTP 方法（GET/POST/PUT/DELETE/OPTIONS/PATCH）
-  - 端口路由查询参数转发（含中文编码）
-  - 端口路由大请求体转发（100KB）
-  - 端口路由流式响应（20 chunks）
-  - 端口路由状态码透传（200/201/400/404/500）
-  - 端口路由 CRLF 注入防护
-  - 端口路由后端崩溃恢复
-  - 端口路由闲置后重新按需启动
+- **test-concurrent-post-body.ts**: 10 个并发与竞争条件测试
+- **test-post-body-fix.ts**: 12 个 POST 请求体完整性测试
+  - 并发 POST 同时触发按需启动（10个）
+  - 混合 GET/POST/PUT 并发按需启动
+  - 快速连续 POST（间隔 50ms）
+  - starting 状态 50 个并发请求
+  - stopping 状态请求等待后重启
+  - 100 个并发 POST 压力测试
+  - 端口路由 20 并发 POST
+  - 按需启动 body 大小梯度（10B~100KB）
+  - 管理 API 启动 + 并发请求竞争
+  - 闲置超时后再次按需启动 POST
 
 #### Serverless Host 演示
 - test/services/serverless-host.ts: 轻量级 TypeScript Serverless 运行时

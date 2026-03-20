@@ -233,15 +233,24 @@ async function test_rapid_start_stop_cycle() {
 
 /** 7. 请求超时处理（后端延迟超过代理超时） */
 async function test_proxy_timeout() {
-  if (!await checkPort(3099)) {
-    const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
-    if (res.status !== 200) throw new Error('echo 启动失败');
-  }
+  /** 确保 echo 在线且正常工作 */
+  const warmup = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
+  if (warmup.status !== 200) throw new Error('echo 启动失败');
 
+  /** 确认 echo 的 /delay 端点正常工作（500ms 测试） */
+  const delayStart = Date.now();
+  const delayCheck = await httpRequest({ hostname: 'echo-host.test', path: '/delay?delay=500', timeout: 5000 });
+  if (delayCheck.status !== 200) throw new Error('delay 端点不可用');
+  if (Date.now() - delayStart < 400) throw new Error('delay 端点未正确延迟');
+
+  /**
+   * 网关代理请求 timeout 为 30s，后端延迟 35s 确保超过网关 timeout。
+   * 客户端 timeout 设 45s 确保能收到网关返回的 502 响应。
+   */
   const res = await httpRequest({
     hostname: 'echo-host.test',
-    path: '/delay?delay=60000',
-    timeout: 35000,
+    path: '/delay?delay=35000',
+    timeout: 45000,
   });
 
   if (res.status !== 502 && res.status !== 504) {
@@ -251,10 +260,9 @@ async function test_proxy_timeout() {
 
 /** 8. 网关稳定性（500 个串行请求） */
 async function test_stability_500_requests() {
-  if (!await checkPort(3099)) {
-    const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
-    if (res.status !== 200) throw new Error('echo 启动失败');
-  }
+  /** 确保 echo 在线（前面的超时测试可能导致状态异常） */
+  const warmup = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
+  if (warmup.status !== 200) throw new Error(`echo 启动失败: ${warmup.status}`);
 
   let failCount = 0;
   for (let i = 0; i < 500; i++) {
@@ -273,10 +281,8 @@ async function test_stability_500_requests() {
 
 /** 9. GET 请求带查询参数特殊字符 */
 async function test_query_params_special_chars() {
-  if (!await checkPort(3099)) {
-    const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
-    if (res.status !== 200) throw new Error('echo 启动失败');
-  }
+  const warmup = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
+  if (warmup.status !== 200) throw new Error(`echo 启动失败: ${warmup.status}`);
 
   const res = await httpRequest({
     hostname: 'echo-host.test',
@@ -291,10 +297,8 @@ async function test_query_params_special_chars() {
 
 /** 10. 多 hostname 404 不影响正常路由 */
 async function test_multiple_404_then_normal() {
-  if (!await checkPort(3099)) {
-    const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
-    if (res.status !== 200) throw new Error('echo 启动失败');
-  }
+  const warmup = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
+  if (warmup.status !== 200) throw new Error(`echo 启动失败: ${warmup.status}`);
 
   for (let i = 0; i < 10; i++) {
     const res = await httpRequest({ hostname: `unknown-${i}.test`, path: '/test', timeout: 3000 });
