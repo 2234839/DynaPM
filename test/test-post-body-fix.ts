@@ -124,7 +124,7 @@ async function ensureEchoOnline(): Promise<void> {
 
 /** 确保后端离线（包括网关状态同步） */
 async function ensureEchoOffline(): Promise<void> {
-  /** 先通过管理 API 查询状态，如果在 online/starting 则先停止 */
+  /** 第一步：通过管理 API 停止服务（如果在线） */
   try {
     const statusRes = await httpRequest({
       port: 3091,
@@ -134,50 +134,48 @@ async function ensureEchoOffline(): Promise<void> {
     if (statusRes.status === 200) {
       const data = JSON.parse(statusRes.body);
       if (data.status === 'online' || data.status === 'starting') {
-        /** 通过管理 API 停止服务，这会正确设置状态为 offline */
         await httpRequest({
           port: 3091,
           path: '/_dynapm/api/services/echo-host/stop',
           method: 'POST',
           timeout: 10000,
         });
-      }
-    }
-  } catch {
-    /** 管理 API 不可用，使用直接 kill 方式 */
-  }
-
-  /** 确保进程完全退出 */
-  for (let i = 0; i < 3; i++) {
-    await killPort(3099);
-    if (!await checkPort(3099)) break;
-  }
-  if (await checkPort(3099)) {
-    throw new Error('echo 进程未能停止');
-  }
-
-  /**
-   * 如果管理 API 停止失败或网关状态仍为 online，
-   * 发请求触发 handleDirectProxy → 502 → 自动重置为 offline
-   */
-  try {
-    const statusRes = await httpRequest({
-      port: 3091,
-      path: '/_dynapm/api/services/echo-host',
-      timeout: 3000,
-    });
-    if (statusRes.status === 200) {
-      const data = JSON.parse(statusRes.body);
-      if (data.status === 'online') {
-        try {
-          await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 5000 });
-        } catch {}
-        await sleep(300);
+        await sleep(500);
       }
     }
   } catch {}
 
-  await sleep(300);
+  /** 第二步：确保进程完全退出（强制 kill） */
+  for (let i = 0; i < 5; i++) {
+    await killPort(3099);
+    await sleep(200);
+    if (!await checkPort(3099)) break;
+  }
+
+  /** 第三步：轮询管理 API 直到状态为 offline */
+  for (let retry = 0; retry < 10; retry++) {
+    try {
+      const statusRes = await httpRequest({
+        port: 3091,
+        path: '/_dynapm/api/services/echo-host',
+        timeout: 2000,
+      });
+      if (statusRes.status === 200) {
+        const data = JSON.parse(statusRes.body);
+        if (data.status === 'offline') return;
+        if (data.status === 'online') {
+          try { await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 3000 }); } catch {}
+          await sleep(500);
+          continue;
+        }
+      }
+    } catch {}
+    await sleep(500);
+  }
+
+  if (await checkPort(3099)) {
+    throw new Error('echo 进程未能停止');
+  }
 }
 
 // ==================== 测试场景 ====================

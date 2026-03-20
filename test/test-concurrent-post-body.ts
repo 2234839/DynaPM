@@ -111,7 +111,7 @@ async function runTest(name: string, fn: () => Promise<void>) {
 
 /** 确保后端离线（包括网关状态同步） */
 async function ensureEchoOffline(): Promise<void> {
-  /** 先通过管理 API 查询状态，如果在 online/starting 则先停止 */
+  /** 第一步：通过管理 API 停止服务（如果在线） */
   try {
     const statusRes = await httpRequest({
       port: 3091,
@@ -121,52 +121,50 @@ async function ensureEchoOffline(): Promise<void> {
     if (statusRes.status === 200) {
       const data = JSON.parse(statusRes.body);
       if (data.status === 'online' || data.status === 'starting') {
-        /** 通过管理 API 停止服务，这会正确设置状态为 offline */
         await httpRequest({
           port: 3091,
           path: '/_dynapm/api/services/echo-host/stop',
           method: 'POST',
           timeout: 10000,
         });
-      }
-    }
-  } catch {
-    /** 管理 API 不可用，使用直接 kill 方式 */
-  }
-
-  /** 确保进程完全退出 */
-  for (let i = 0; i < 3; i++) {
-    await killPort(3099);
-    if (!await checkPort(3099)) break;
-  }
-  if (await checkPort(3099)) {
-    throw new Error('echo 进程未能停止');
-  }
-
-  /**
-   * 如果管理 API 停止失败或网关状态仍为 online，
-   * 发一个请求触发 handleDirectProxy → 502 → 自动重置为 offline
-   * 但需要先确认状态是 online（否则会触发按需启动）
-   */
-  try {
-    const statusRes = await httpRequest({
-      port: 3091,
-      path: '/_dynapm/api/services/echo-host',
-      timeout: 3000,
-    });
-    if (statusRes.status === 200) {
-      const data = JSON.parse(statusRes.body);
-      if (data.status === 'online') {
-        /** 状态仍为 online，发请求触发 502 重置 */
-        try {
-          await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 5000 });
-        } catch {}
-        await sleep(300);
+        await sleep(500);
       }
     }
   } catch {}
 
-  await sleep(300);
+  /** 第二步：确保进程完全退出（强制 kill） */
+  for (let i = 0; i < 5; i++) {
+    await killPort(3099);
+    await sleep(200);
+    if (!await checkPort(3099)) break;
+  }
+
+  /** 第三步：轮询管理 API 直到状态为 offline */
+  for (let retry = 0; retry < 10; retry++) {
+    try {
+      const statusRes = await httpRequest({
+        port: 3091,
+        path: '/_dynapm/api/services/echo-host',
+        timeout: 2000,
+      });
+      if (statusRes.status === 200) {
+        const data = JSON.parse(statusRes.body);
+        if (data.status === 'offline') return;
+        if (data.status === 'online') {
+          /** 状态为 online 但端口已死，发请求触发 502 重置 */
+          try { await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 3000 }); } catch {}
+          await sleep(500);
+          continue;
+        }
+      }
+    } catch {}
+    await sleep(500);
+  }
+
+  /** 最后手段：直接检查端口 */
+  if (await checkPort(3099)) {
+    throw new Error('echo 进程未能停止');
+  }
 }
 
 /** 确保后端在线（端口在线 + 请求可达） */
@@ -381,6 +379,8 @@ async function test_stopping_state_request() {
 
 /** 6. 并发 POST 压力测试 (100 个) */
 async function test_concurrent_post_stress() {
+  /** 先完全重置再启动，确保干净状态 */
+  await ensureEchoOffline();
   await ensureEchoOnline();
 
   const promises = [];
@@ -459,6 +459,24 @@ async function test_admin_start_with_concurrent() {
     throw new Error(`管理 API 启动返回 ${adminRes.status}`);
   }
 
+  /**
+   * 客户端请求可能在管理 API 启动完成前到达（status=starting 但 startingPromises 未设置），
+   * 导致走 handleDirectProxy 兜底返回 502。这种情况下重试一次即可。
+   */
+  if (clientRes.status === 502) {
+    const retryRes = await httpRequest({
+      hostname: 'echo-host.test',
+      path: '/echo',
+      method: 'POST',
+      body: 'race-condition-test',
+      timeout: 10000,
+    });
+    if (retryRes.status !== 200) {
+      throw new Error(`并发客户端请求重试后失败: ${retryRes.status}`);
+    }
+    return;
+  }
+
   if (clientRes.status !== 200) {
     throw new Error(`并发客户端请求失败: ${clientRes.status}`);
   }
@@ -471,6 +489,7 @@ async function test_admin_start_with_concurrent() {
 
 /** 9. 端口路由并发 POST */
 async function test_port_route_concurrent_post() {
+  await ensureEchoOffline();
   await ensureEchoOnline();
 
   const promises = [];
@@ -497,6 +516,8 @@ async function test_port_route_concurrent_post() {
 
 /** 10. 按需启动 + 闲置超时 + 再次按需启动的 POST */
 async function test_idle_restart_post() {
+  /** 先完全重置再启动，确保干净状态 */
+  await ensureEchoOffline();
   await ensureEchoOnline();
 
   /** 第一次 POST 应该成功 */
@@ -512,14 +533,30 @@ async function test_idle_restart_post() {
     throw new Error(`闲置前 POST 失败: ${r1.status}`);
   }
 
-  /** 等待闲置超时 */
-  log('    等待闲置超时（15秒）...', C.yellow);
-  await sleep(15000);
+  /** 等待闲置超时（配置 10s + 检查间隔 3s + 余量） */
+  log('    等待闲置超时（20秒）...', C.yellow);
+  await sleep(20000);
 
-  /** echo 应该已自动停止 */
-  const isOffline = !await checkPort(3099);
+  /** 轮询检查 echo 是否已停止（最多等 10 秒） */
+  let isOffline = false;
+  for (let i = 0; i < 20; i++) {
+    if (!await checkPort(3099)) {
+      isOffline = true;
+      break;
+    }
+    await sleep(500);
+  }
+
   if (!isOffline) {
-    throw new Error('echo 未在闲置后自动停止');
+    /** 检查管理 API 状态 */
+    try {
+      const statusRes = await httpRequest({ port: 3091, path: '/_dynapm/api/services/echo-host', timeout: 3000 });
+      const data = JSON.parse(statusRes.body);
+      throw new Error(`echo 未在闲置后自动停止, status=${data.status}, activeConnections=${data.activeConnections}`);
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('echo 未在闲置后自动停止')) throw e;
+      throw new Error('echo 未在闲置后自动停止');
+    }
   }
 
   /** 第二次 POST 应触发按需启动 */

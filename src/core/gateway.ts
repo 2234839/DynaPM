@@ -611,7 +611,10 @@ export class Gateway {
     const state: ProxyState = { aborted: false, responded: false };
     service._state!.activeConnections++;
 
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       service._state!.activeConnections--;
     };
 
@@ -814,7 +817,10 @@ export class Gateway {
     const state: ProxyState = { aborted: false, responded: false };
     service._state!.activeConnections++;
 
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       service._state!.activeConnections--;
     };
 
