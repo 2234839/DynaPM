@@ -48,7 +48,7 @@ function checkPort(port: number): Promise<boolean> {
 }
 
 async function killPort(port: number) {
-  try { await execAsync(`lsof -ti:${port} | xargs -r kill -9 2>/dev/null`); } catch {}
+  try { await execAsync(`lsof -i:${port} -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9 2>/dev/null`); } catch {}
 }
 
 async function waitForPort(port: number, timeout = 5000): Promise<boolean> {

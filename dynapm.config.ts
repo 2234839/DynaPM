@@ -44,8 +44,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node ${process.cwd()}/admin/server.js >> ${logDir}/admin.log 2>&1 &`,
-        stop: 'lsof -ti:4002 | xargs -r kill -9',
-        check: 'lsof -ti:4002 >/dev/null 2>&1',
+        stop: 'lsof -i:4002 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:4002 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {
@@ -64,10 +64,10 @@ const config: DynaPMConfig = {
       commands: {
         // 使用 nohup 后台启动，统一输出到 services.log
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/app1.ts >> ${logDir}/services.log 2>&1 &`,
-        // 使用端口查找并杀死进程（更可靠）
-        stop: `lsof -ti:3001 | xargs -r kill -9`,
+        // 使用端口查找并杀死 LISTEN 状态的进程（避免误杀网关）
+        stop: `lsof -i:3001 -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9`,
         // 使用 lsof 检查端口是否被监听
-        check: `lsof -ti:3001 >/dev/null 2>&1`,
+        check: `lsof -i:3001 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1`,
       },
 
       healthCheck: {
@@ -85,8 +85,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/app2.ts >> ${logDir}/services.log 2>&1 &`,
-        stop: `lsof -ti:3002 | xargs -r kill -9`,
-        check: `lsof -ti:3002 >/dev/null 2>&1`,
+        stop: `lsof -i:3002 -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9`,
+        check: `lsof -i:3002 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1`,
       },
 
       healthCheck: {
@@ -106,8 +106,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/app3.ts >> ${logDir}/services.log 2>&1 &`,
-        stop: `lsof -ti:3003 | xargs -r kill -9`,
-        check: `lsof -ti:3003 >/dev/null 2>&1`,
+        stop: `lsof -i:3003 -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9`,
+        check: `lsof -i:3003 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1`,
       },
 
       healthCheck: {
@@ -125,8 +125,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-sse.ts >> ${logDir}/services.log 2>&1 &`,
-        stop: `lsof -ti:3010 | xargs -r kill -9`,
-        check: `lsof -ti:3010 >/dev/null 2>&1`,
+        stop: `lsof -i:3010 -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9`,
+        check: `lsof -i:3010 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1`,
       },
 
       healthCheck: {
@@ -144,8 +144,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-ws.ts >> ${logDir}/services.log 2>&1 &`,
-        stop: `lsof -ti:3011 | xargs -r kill -9`,
-        check: `lsof -ti:3011 >/dev/null 2>&1`,
+        stop: `lsof -i:3011 -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9`,
+        check: `lsof -i:3011 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1`,
       },
 
       healthCheck: {
@@ -180,8 +180,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/serverless-host.ts 4000 >> ${logDir}/serverless.log 2>&1 &`,
-        stop: 'lsof -ti:4000 | xargs -r kill -9',
-        check: 'lsof -ti:4000 >/dev/null 2>&1',
+        stop: 'lsof -i:4000 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:4000 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {

@@ -4,7 +4,7 @@
 
 > **Dynamic Process Manager** - A lightweight, universal service management system with serverless-like features.
 
-[![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm) ![Tests](https://img.shields.io/badge/tests-12%2F12%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
+[![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm) ![Tests](https://img.shields.io/badge/tests-81%2F81%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
 
 DynaPM is a **lightweight alternative** to complex container orchestration platforms (like Knative, Sablier) for private deployments. It helps you manage hundreds of low-frequency services on resource-constrained servers by starting them on-demand and stopping them when idle.
 
@@ -57,7 +57,7 @@ You have many side projects or internal tools that:
 
 - **DynaPM overhead**: Only **25ms** (startup command: 8ms + port wait: 17ms)
 - **Instant retry**: Zero-delay polling, forward immediately when port is ready
-- **Total cold start**: ~500ms (including service boot time, e.g., ~475ms for Node.js apps)
+- **Total cold start**: ~185ms (including service boot time, e.g., ~160ms for Node.js apps)
 
 ### 🚀 **Stream Proxying**
 
@@ -147,9 +147,9 @@ Configure ANY service using bash commands - no limits:
 ```
 Test Environment: Node.js HTTP Server (autocannon benchmark)
 
-✅ Cold start:       ~48ms (DynaPM: 25ms + service boot: 23ms)
-✅ Stream proxy:     Avg 9.5ms (range: 8-14ms)
-✅ Throughput:       8,383 req/s (multi-service, 60 concurrent)
+✅ Cold start:       ~185ms (DynaPM: 25ms + service boot: 160ms)
+✅ Stream proxy:     Avg 10.3ms (range: 9-12ms)
+✅ Throughput:       5,942 req/s (multi-service, 150 concurrent)
 ✅ Load test:        Low latency even under high concurrency
 ✅ Memory overhead:  ~50MB (Node.js runtime)
 ✅ Bundle size:      21.7KB (minified)
@@ -245,7 +245,7 @@ pnpm test
 
 ### Test Coverage
 
-The automated tests validate 12 core functionalities:
+The automated tests validate 81 test cases across 6 test suites:
 
 1. ✅ **On-demand start** - Services auto-start when offline
 2. ✅ **Hot start** - Direct proxy when service is running
@@ -259,6 +259,9 @@ The automated tests validate 12 core functionalities:
 10. ✅ **SSE streaming** - Server-Sent Events proxy support
 11. ✅ **WebSocket** - WebSocket bidirectional communication support
 12. ✅ **Long connections** - Active connections prevent premature shutdown
+13. ✅ **Concurrent startup** - Multiple requests to offline service
+14. ✅ **Security hardening** - Body size limits, CRLF injection protection
+15. ✅ **Port routing** - Direct port-based proxy and on-demand start
 
 ### Test Output Example
 
@@ -426,8 +429,8 @@ Test: Total time from offline to first accessible request
 
 Results:
 ├─ DynaPM overhead:   25ms (startup command: 8ms + TCP port wait: 17ms)
-├─ Service boot:      17ms (Node.js application)
-└─ Total cold start:  42ms
+├─ Service boot:      160ms (Node.js application)
+└─ Total cold start:  185ms
 ```
 
 ### Stream Proxy Performance
@@ -436,30 +439,23 @@ Results:
 Test: Single request latency when service is running
 
 Results:
-├─ Average latency:  9.3ms
-├─ Min latency:      8ms
+├─ Average latency:  10.3ms
+├─ Min latency:      9ms
 ├─ Max latency:      12ms
-└─ Latency range:    8-12ms
+└─ Latency range:    9-12ms
 ```
 
 ### Throughput Performance
 
 ```
-Test: Multi-service benchmark (3 services × 20 concurrent, 5 seconds)
+Test: Multi-service benchmark (3 services × 50 concurrent, 5 seconds)
 
 Results:
-├─ Total requests:      42,000 requests
-├─ Average throughput:  8,383 req/s
-├─ Per-service:         2,794 req/s
+├─ Total requests:      29,710 requests
+├─ Average throughput:  5,942 req/s
+├─ Per-service:         ~1,980 req/s
 ├─ Errors:              0
 └─ Test duration:       5 seconds
-
-Test: Single service benchmark (50 concurrent, 5 seconds)
-
-Results:
-├─ Requests/sec:     4,225+ req/s
-├─ Average latency:  ~23ms
-└─ Total requests:   21k requests
 ```
 
 ### Resource Usage

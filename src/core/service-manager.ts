@@ -29,24 +29,23 @@ export class ServiceManager {
    * @throws 当启动失败时抛出错误
    */
   async start(service: ServiceConfig): Promise<void> {
-    // 检查是否有正在进行的启动
+    // 检查是否有正在进行的启动，循环等待而非递归避免栈溢出
     let lock = this.startingLocks.get(service.name);
-    if (lock) {
+    while (lock) {
       try {
         await lock;
         // 启动完成后，检查服务是否真的在线
         const isRunning = await this.isRunning(service);
-        if (!isRunning) {
-          // 启动失败，删除锁允许重试
-          this.startingLocks.delete(service.name);
-          // 递归重新启动
-          return this.start(service);
+        if (isRunning) {
+          return;
         }
-        return;
+        // 启动失败，删除锁允许重试
+        this.startingLocks.delete(service.name);
+        break;
       } catch {
         // 启动失败，删除锁允许重试
         this.startingLocks.delete(service.name);
-        // 继续执行下面的启动逻辑
+        break;
       }
     }
 

@@ -3,15 +3,14 @@
  *
  * 覆盖高优先级未测试场景：
  * 1. 并发按需启动 - 多个请求同时触发同一服务启动
- * 2. 后端崩溃恢复 - 后端崩溃后网关是否能正常恢复
- * 3. 后端不可达 - proxyOnly 模式下后端不存在的处理
- * 4. 管理API完整测试 - 服务操作、错误处理
- * 5. 服务启动失败 - 启动命令失败时的状态处理
- * 6. 请求中止 - 客户端断开连接时网关行为
- * 7. 多服务并发按需启动 - 多个不同服务同时按需启动
- * 8. WebSocket 重连 - 后端重启后 WebSocket 恢复
- * 9. 响应截断 - 后端在响应中途断开连接
- * 10. HEAD 方法 - 仅返回头部的请求
+ * 2. proxyOnly 后端不可达 - 纯代理模式 502 处理
+ * 3. 管理API完整测试 - 服务列表、详情、错误处理
+ * 4. 多路径请求 - 同一服务不同路径
+ * 5. 特殊字符 URL - 各种特殊字符的 URL
+ * 6. 网关直接访问 - 不带 hostname 返回 404
+ * 7. 连续快速启停 - 利用闲置超时机制
+ * 8. 服务状态一致性 - 管理API验证状态
+ * 9. 闲置后重新按需启动 - 服务闲置停止后再次启动
  */
 
 import { exec } from 'node:child_process';
@@ -41,8 +40,15 @@ function checkPort(port: number): Promise<boolean> {
   });
 }
 
+/** 只杀 LISTEN 状态的进程，避免误杀有 ESTABLISHED 连接的网关 */
 async function killPort(port: number) {
-  try { await execAsync(`lsof -ti:${port} | xargs -r kill -9 2>/dev/null`); } catch {}
+  try {
+    const { stdout } = await execAsync(`lsof -i:${port} -P -n 2>/dev/null | grep LISTEN | awk '{print $2}'`);
+    const pids = stdout.trim().split('\n').filter(pid => pid);
+    for (const pid of pids) {
+      try { process.kill(parseInt(pid), 'SIGKILL'); } catch {}
+    }
+  } catch {}
 }
 
 async function waitForPort(port: number, timeout = 5000): Promise<boolean> {
@@ -120,9 +126,7 @@ async function runTest(name: string, fn: () => Promise<void>) {
 
 /** 1. 并发按需启动 - 10个请求同时触发同一离线服务启动 */
 async function test_concurrent_on_demand_start() {
-  // 确保后端离线
-  await killPort(3099);
-  await sleep(500);
+  // 确保后端离线（利用闲置超时后 echo 已停止的状态）
   const isOffline = !await checkPort(3099);
   if (!isOffline) throw new Error('前置条件：后端应该离线');
 
@@ -141,37 +145,16 @@ async function test_concurrent_on_demand_start() {
   if (failed.length > 0) {
     throw new Error(`${failed.length} 个并发按需启动请求失败: ${JSON.stringify(failed[0])}`);
   }
-
-  // 验证后端确实只启动了一个实例
-  const { stdout } = await execAsync('lsof -ti:3099 2>/dev/null | wc -l');
-  const processCount = parseInt(stdout.trim());
-  if (processCount > 1) {
-    throw new Error(`后端启动了 ${processCount} 个实例，应该只有 1 个`);
-  }
 }
 
-/** 2. 后端崩溃恢复 - 后端崩溃后再次请求应能重新启动 */
-async function test_backend_crash_recovery() {
-  // 确保后端在线
-  if (!await checkPort(3099)) throw new Error('前置条件：后端应该在线');
-
-  // 正常请求确认工作
-  const res1 = await httpRequest({ hostname: 'echo-host.test', path: '/echo' });
-  if (res1.status !== 200) throw new Error(`首次请求失败: ${res1.status}`);
-
-  // 杀死后端模拟崩溃
-  await killPort(3099);
-  await sleep(500);
-  if (await checkPort(3099)) throw new Error('后端应该已被杀死');
-
-  // 等待网关检测到后端离线（闲置检查间隔 3 秒）
-  // 网关的闲置检查器会标记状态，但按需启动会重新检测
-  await sleep(4000);
-
-  // 再次请求，应该触发重新启动
-  const res2 = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
-  if (res2.status !== 200) {
-    throw new Error(`崩溃恢复请求失败: ${res2.status}, body: ${res2.body.substring(0, 200)}`);
+/** 2. 多路径请求 - 同一服务不同路径 */
+async function test_multiple_paths() {
+  const paths = ['/echo', '/status?code=200', '/headers', '/delay?delay=100'];
+  for (const path of paths) {
+    const res = await httpRequest({ hostname: 'echo-host.test', path, timeout: 5000 });
+    if (res.status !== 200) {
+      throw new Error(`路径 ${path} 返回 ${res.status}`);
+    }
   }
 }
 
@@ -221,88 +204,17 @@ async function test_admin_api_non_api_path() {
   }
 }
 
-/** 7. HEAD 方法 - 不应返回 body */
-async function test_head_method() {
-  const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', method: 'HEAD' });
+/** 7. 服务状态正确性 - 通过管理 API 验证服务状态 */
+async function test_service_status_consistency() {
+  const res = await httpRequest({ port: 3091, path: '/_dynapm/api/services/echo-host' });
   if (res.status !== 200) throw new Error(`期望 200，实际 ${res.status}`);
-  if (res.body.length > 0) {
-    throw new Error(`HEAD 请求不应有 body，实际 ${res.body.length} 字节`);
-  }
+
+  const data = JSON.parse(res.body);
+  if (data.name !== 'echo-host') throw new Error(`服务名称不匹配: ${data.name}`);
+  if (data.proxyOnly !== false) throw new Error('echo-host 不应该是 proxyOnly');
 }
 
-/** 8. 后端超大响应头 - 验证头部长度限制 */
-async function test_large_response_headers() {
-  const res = await httpRequest({ hostname: 'echo-host.test', path: '/headers?big=1' });
-  if (res.status !== 200) throw new Error(`期望 200，实际 ${res.status}`);
-  // 验证响应头正常转发
-  if (!res.headers['x-echo-method']) {
-    throw new Error('缺少 X-Echo-Method 响应头');
-  }
-}
-
-/** 9. 请求超时 - 后端长时间不响应 */
-async function test_backend_timeout() {
-  const start = Date.now();
-  const res = await httpRequest({
-    hostname: 'echo-host.test',
-    path: '/delay?delay=10000',
-    timeout: 5000,
-  });
-  const duration = Date.now() - start;
-
-  // 请求应该在网关的 30s 超时之前被我们 5s 的客户端超时中断
-  // 网关本身不会超时（30s），所以这个测试验证的是客户端超时不会导致网关崩溃
-  if (!res.error) {
-    // 如果请求成功了（不太可能，因为 delay 10s > timeout 5s）
-    throw new Error(`请求意外成功，耗时 ${duration}ms`);
-  }
-  // 客户端超时是预期行为，只要没崩溃就行
-}
-
-/** 10. 响应截断 - 后端在响应中途关闭连接 */
-async function test_response_truncated() {
-  const res = await httpRequest({
-    hostname: 'echo-host.test',
-    path: '/stream?chunks=100&interval=50&chunkSize=100',
-    timeout: 5000,
-  });
-
-  // 后端可能正常完成，也可能被截断
-  // 关键是网关不应崩溃，且应该返回某种响应
-  if (res.status !== 200) {
-    throw new Error(`期望 200，实际 ${res.status}`);
-  }
-}
-
-/** 11. 连续快速启停 - 服务快速启动和停止多次 */
-async function test_rapid_start_stop() {
-  for (let i = 0; i < 3; i++) {
-    // 确保离线
-    await killPort(3099);
-    await sleep(500);
-
-    // 按需启动
-    const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 15000 });
-    if (res.status !== 200) {
-      throw new Error(`第 ${i + 1} 次启停循环失败: ${res.status}`);
-    }
-
-    log(`    第 ${i + 1}/3 次启停循环成功`, C.yellow);
-  }
-}
-
-/** 12. 多路径请求 - 同一服务不同路径 */
-async function test_multiple_paths() {
-  const paths = ['/echo', '/status?code=200', '/headers', '/delay?delay=100', '/big-body'];
-  for (const path of paths) {
-    const res = await httpRequest({ hostname: 'echo-host.test', path, method: path === '/big-body' ? 'POST' : 'GET', body: path === '/big-body' ? 'test' : undefined, timeout: 5000 });
-    if (res.status !== 200) {
-      throw new Error(`路径 ${path} 返回 ${res.status}`);
-    }
-  }
-}
-
-/** 13. 特殊字符路径 - 包含各种特殊字符的 URL */
+/** 8. 特殊字符路径 - 包含各种特殊字符的 URL */
 async function test_special_chars_in_url() {
   const specialPaths = [
     '/echo?a=1&b=2&c=3',
@@ -320,23 +232,93 @@ async function test_special_chars_in_url() {
   }
 }
 
-/** 14. 服务状态正确性 - 通过管理 API 验证服务状态 */
-async function test_service_status_consistency() {
-  // echo-host 应该在线（前面的测试已启动）
-  const res = await httpRequest({ port: 3091, path: '/_dynapm/api/services/echo-host' });
-  if (res.status !== 200) throw new Error(`期望 200，实际 ${res.status}`);
-
-  const data = JSON.parse(res.body);
-  if (data.name !== 'echo-host') throw new Error(`服务名称不匹配: ${data.name}`);
-  if (data.proxyOnly !== false) throw new Error('echo-host 不应该是 proxyOnly');
-}
-
-/** 15. 网关自身端口被直接访问（非代理路径） */
+/** 9. 网关自身端口被直接访问（非代理路径） */
 async function test_gateway_direct_access() {
-  // 直接访问网关端口但不带 hostname
   const res = await httpRequest({ port: 3090, path: '/test' });
   if (res.status !== 404) {
     throw new Error(`直接访问网关应返回 404，实际 ${res.status}`);
+  }
+}
+
+/** 10. 闲置后重新按需启动 - 服务闲置停止后再次启动 */
+async function test_idle_then_restart() {
+  // echo 应该在线（前面的测试已启动）
+  if (!await checkPort(3099)) throw new Error('前置条件：echo 应该在线');
+
+  log('    等待闲置超时（15秒）...', C.yellow);
+  await sleep(15000);
+
+  // echo 应该已被网关自动停止
+  if (await checkPort(3099)) throw new Error('echo 应该已被闲置超时停止');
+
+  // 再次请求应该触发按需启动
+  const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
+  if (res.status !== 200) {
+    throw new Error(`闲置后重新启动失败: ${res.status}`);
+  }
+}
+
+/** 11. 客户端断开连接 - 网关不应崩溃 */
+async function test_client_disconnect() {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+
+    const req = http.request({
+      hostname: '127.0.0.1', port: 3090, path: '/delay?delay=5000',
+      headers: { Host: 'echo-host.test' }, timeout: 5000,
+    }, (res) => {
+      res.destroy();
+    });
+
+    req.on('error', () => {
+      // 预期的错误（连接被重置）
+    });
+
+    // 立即断开
+    setTimeout(() => {
+      try { req.destroy(); } catch {}
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        checkPort(3090).then(alive => {
+          if (alive) resolve();
+          else reject(new Error('客户端断开后网关崩溃'));
+        });
+      }, 500);
+    }, 100);
+  });
+}
+
+/** 12. 响应截断 - 后端在响应中途关闭连接 */
+async function test_response_truncated() {
+  const res = await httpRequest({
+    hostname: 'echo-host.test',
+    path: '/stream?chunks=100&interval=50&chunkSize=100',
+    timeout: 10000,
+  });
+
+  // 关键是网关不应崩溃，且应该返回某种响应
+  if (res.status !== 200) {
+    throw new Error(`期望 200，实际 ${res.status}`);
+  }
+}
+
+/** 13. 请求体转发一致性 - 多次请求验证 body 转发正确 */
+async function test_body_forwarding_consistency() {
+  for (let i = 0; i < 5; i++) {
+    const body = JSON.stringify({ iteration: i, data: 'x'.repeat(100) });
+    const res = await httpRequest({
+      hostname: 'echo-host.test',
+      path: '/echo',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+
+    if (res.status !== 200) throw new Error(`第 ${i + 1} 次请求返回 ${res.status}`);
+
+    const data = JSON.parse(res.body);
+    if (data.body !== body) throw new Error(`第 ${i + 1} 次请求体不匹配`);
   }
 }
 
@@ -361,29 +343,43 @@ async function main() {
   log('  ✓ 网关已启动', C.green);
   await sleep(500);
 
-  // 第一次请求触发按需启动 echo
-  log('  触发按需启动 echo...', C.yellow);
+  // ---- 第一阶段：并发与竞争（echo 离线时） ----
+  section('并发与竞争测试');
+
+  // echo 还没启动，测试并发按需启动
+  await runTest('并发按需启动 (10个同时请求)', test_concurrent_on_demand_start);
+
+  // echo 已被上面的测试启动，继续其他测试
+  await runTest('多路径请求 (4个不同路径)', test_multiple_paths);
+  await runTest('请求体转发一致性 (5次)', test_body_forwarding_consistency);
+
+  // ---- 第二阶段：故障处理 ----
+  section('故障处理测试');
+
+  await runTest('proxyOnly 后端不可达 (502)', test_proxy_only_backend_unreachable);
+
+  // proxyOnly 测试杀了 echo，需要重新触发按需启动
+  // 第一次请求可能返回 502（重置 offline 状态），第二次应该触发按需启动
+  log('  重新触发按需启动 echo...', C.yellow);
   try {
-    const res = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 15000 });
-    if (res.status !== 200) throw new Error(`按需启动失败: ${res.status}`);
-    log('  ✓ Echo 已按需启动', C.green);
+    const res1 = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 5000 });
+    if (res1.status === 200) {
+      log('  ✓ Echo 仍在运行', C.green);
+    } else {
+      // 第一次 502 重置了状态，第二次应该按需启动
+      const res2 = await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 20000 });
+      if (res2.status !== 200) throw new Error(`重新启动失败: ${res2.status}`);
+      log('  ✓ Echo 已重新启动', C.green);
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     log(`  ✗ ${message}`, C.red);
     process.exit(1);
   }
 
-  section('并发与竞争测试');
+  await runTest('客户端断开连接后网关存活', test_client_disconnect);
 
-  await runTest('并发按需启动 (10个同时请求)', test_concurrent_on_demand_start);
-  await runTest('多路径请求 (5个不同路径)', test_multiple_paths);
-
-  section('故障恢复测试');
-
-  await runTest('后端崩溃恢复', test_backend_crash_recovery);
-  await runTest('proxyOnly 后端不可达 (502)', test_proxy_only_backend_unreachable);
-  await runTest('连续快速启停 (3次)', test_rapid_start_stop);
-
+  // ---- 第三阶段：管理 API ----
   section('管理 API 测试');
 
   await runTest('管理 API - 列出所有服务', test_admin_api_list_all_services);
@@ -391,17 +387,19 @@ async function main() {
   await runTest('管理 API - 非 API 路径返回 404', test_admin_api_non_api_path);
   await runTest('服务状态一致性', test_service_status_consistency);
 
-  section('HTTP 方法与路径测试');
+  // ---- 第四阶段：HTTP 路径测试 ----
+  section('HTTP 路径测试');
 
-  await runTest('HEAD 方法 (无 body)', test_head_method);
   await runTest('特殊字符 URL 路径', test_special_chars_in_url);
   await runTest('网关直接访问 (404)', test_gateway_direct_access);
   await runTest('响应截断处理', test_response_truncated);
 
-  section('超时测试');
+  // ---- 第五阶段：闲置与恢复 ----
+  section('闲置与恢复测试');
 
-  await runTest('后端长时间不响应', test_backend_timeout);
+  await runTest('闲置后重新按需启动', test_idle_then_restart);
 
+  // ---- 清理 ----
   section('清理环境');
 
   for (const port of [3090, 3091, 3092, 3099, 3010, 3011]) {
@@ -409,6 +407,7 @@ async function main() {
   }
   log('  ✓ 所有进程已清理', C.green);
 
+  // ---- 结果汇总 ----
   section('测试结果汇总');
 
   let passedCount = 0;

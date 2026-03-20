@@ -5,7 +5,7 @@
 
 import uWS from 'uWebSockets.js';
 
-const PORT = 3099;
+const PORT = parseInt(process.argv[2] || '3099');
 
 const app = uWS.App({});
 

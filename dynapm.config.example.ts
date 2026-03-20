@@ -196,8 +196,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: 'node admin/server.js',
-        stop: 'lsof -ti:4002 | xargs -r kill -9',
-        check: 'lsof -ti:4002 >/dev/null 2>&1',
+        stop: 'lsof -i:4002 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:4002 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {
@@ -245,8 +245,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: 'nohup node /path/to/universal.js > logs/universal.log 2>&1 &',
-        stop: 'lsof -ti:5001 | xargs -r kill -9',
-        check: 'lsof -ti:5001 >/dev/null 2>&1',
+        stop: 'lsof -i:5001 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\'' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:5001 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {

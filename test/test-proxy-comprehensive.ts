@@ -161,10 +161,10 @@ function checkPort(port: number): Promise<boolean> {
   });
 }
 
-/** 杀死占用端口的进程 */
+/** 杀死占用端口的进程（仅 LISTEN 状态） */
 async function killPort(port: number) {
   try {
-    await execAsync(`lsof -ti:${port} | xargs -r kill -9 2>/dev/null`);
+    await execAsync(`lsof -i:${port} -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9 2>/dev/null`);
   } catch {
     // 进程可能不存在
   }
@@ -414,13 +414,13 @@ async function test_streaming_response() {
 
 /** 10. 延迟响应 */
 async function test_delayed_response() {
-  const start = Date.now();
+  const start = process.hrtime.bigint();
   const res = await httpRequest({
     hostname: CFG.echoHost,
     path: '/delay?delay=500',
     timeout: 5000,
   });
-  const duration = Date.now() - start;
+  const duration = Number(process.hrtime.bigint() - start) / 1e6;
 
   if (res.status !== 200) {
     throw new Error(`期望状态码 200，实际 ${res.status}`);
@@ -432,7 +432,7 @@ async function test_delayed_response() {
   }
 
   if (duration < 400) {
-    throw new Error(`延迟响应时间过短: ${duration}ms`);
+    throw new Error(`延迟响应时间过短: ${Math.round(duration)}ms`);
   }
 }
 
@@ -787,9 +787,13 @@ async function test_content_type_body() {
 
 /** 23. 闲置超时 */
 async function test_idle_timeout() {
-  // 确保 echo-host 服务在线（前面的测试已经启动）
+  // echo 可能因前面的 WebSocket 测试闲置超时被停止，先确保在线
   if (!await checkPort(CFG.echoServerPort)) {
-    throw new Error('前置条件：echo 服务应该在线');
+    log('    echo 离线，重新触发按需启动...', C.yellow);
+    const res = await httpRequest({ hostname: CFG.echoHost, path: '/echo', timeout: 20000 });
+    if (res.status !== 200) {
+      throw new Error(`重新启动 echo 失败: ${res.status}`);
+    }
   }
 
   // 等待闲置超时（配置为 10 秒，加上 3 秒检查间隔的余量）

@@ -30,7 +30,8 @@ export class HealthChecker {
         return;
       }
 
-      // TCP检查失败立即重试，不等待（快速失败快速重试）
+      /** TCP 检查间隔 50ms，避免无延迟轮询导致 CPU 空转 */
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
 
     throw new Error(`服务启动超时 (${timeout}ms)`);

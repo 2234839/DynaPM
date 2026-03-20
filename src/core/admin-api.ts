@@ -2,6 +2,8 @@ import type { ServiceConfig } from '../config/types.js';
 import type { HttpResponse, HttpRequest } from 'uWebSockets.js';
 import type { Logger } from 'pino';
 import type { ServiceManager } from './service-manager.js';
+import net from 'node:net';
+import { URL } from 'node:url';
 
 /**
  * 路由映射信息
@@ -64,11 +66,13 @@ export class AdminApiHandler {
    * 在所有路由表中查找服务
    */
   private findServiceMapping(serviceName: string): RouteMapping | undefined {
-    let mapping = Array.from(this.hostnameRoutes.values()).find(m => m.service.name === serviceName);
-    if (!mapping) {
-      mapping = Array.from(this.portRoutes.values()).find(m => m.service.name === serviceName);
+    for (const mapping of this.hostnameRoutes.values()) {
+      if (mapping.service.name === serviceName) return mapping;
     }
-    return mapping;
+    for (const mapping of this.portRoutes.values()) {
+      if (mapping.service.name === serviceName) return mapping;
+    }
+    return undefined;
   }
 
   /**
@@ -207,31 +211,36 @@ export class AdminApiHandler {
    * 停止服务
    */
   async stopService(res: HttpResponse, serviceName: string): Promise<void> {
+    let aborted = false;
+    res.onAborted(() => { aborted = true; });
+
     const mapping = this.findServiceMapping(serviceName);
 
     if (!mapping) {
-      res.cork(() => {
-        res.writeStatus('404 Not Found');
-        res.end(JSON.stringify({ error: 'Service not found' }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeStatus('404 Not Found');
+          res.end(JSON.stringify({ error: 'Service not found' }));
+        });
+      }
       return;
     }
 
     const service = mapping.service;
 
     if (service._state!.status !== 'online') {
-      res.cork(() => {
-        res.writeStatus('400 Bad Request');
-        res.end(JSON.stringify({ error: 'Service is not online' }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeStatus('400 Bad Request');
+          res.end(JSON.stringify({ error: 'Service is not online' }));
+        });
+      }
       return;
     }
 
     try {
-      // 设置为 stopping 状态
       service._state!.status = 'stopping';
 
-      // 更新累计运行时长
       if (service._state!.startTime) {
         service._state!.totalUptime += Date.now() - service._state!.startTime;
         service._state!.startTime = undefined;
@@ -239,24 +248,26 @@ export class AdminApiHandler {
 
       await this.serviceManager.stop(service);
 
-      // 停止完成后设置为 offline
       service._state!.status = 'offline';
 
-      res.cork(() => {
-        res.writeHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({
-          success: true,
-          message: `服务 ${service.name} 已停止`,
-        }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({
+            success: true,
+            message: `服务 ${service.name} 已停止`,
+          }));
+        });
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      // 失败时重置状态
       service._state!.status = 'online';
-      res.cork(() => {
-        res.writeStatus('500 Internal Server Error');
-        res.end(JSON.stringify({ error: message }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeStatus('500 Internal Server Error');
+          res.end(JSON.stringify({ error: message }));
+        });
+      }
     }
   }
 
@@ -264,36 +275,41 @@ export class AdminApiHandler {
    * 启动服务
    */
   async startService(res: HttpResponse, serviceName: string): Promise<void> {
+    let aborted = false;
+    res.onAborted(() => { aborted = true; });
+
     const mapping = this.findServiceMapping(serviceName);
 
     if (!mapping) {
-      res.cork(() => {
-        res.writeStatus('404 Not Found');
-        res.end(JSON.stringify({ error: 'Service not found' }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeStatus('404 Not Found');
+          res.end(JSON.stringify({ error: 'Service not found' }));
+        });
+      }
       return;
     }
 
     const service = mapping.service;
 
     if (service._state!.status === 'online' || service._state!.status === 'starting') {
-      res.cork(() => {
-        res.writeStatus('400 Bad Request');
-        res.end(JSON.stringify({ error: 'Service is already running or starting' }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeStatus('400 Bad Request');
+          res.end(JSON.stringify({ error: 'Service is already running or starting' }));
+        });
+      }
       return;
     }
 
     try {
       service._state!.status = 'starting';
 
-      // 异步启动服务
       this.serviceManager.start(service).catch((err: Error) => {
         this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: err.message });
         service._state!.status = 'offline';
       });
 
-      // 等待端口可用
       const waitStartTime = Date.now();
       let isReady = false;
       while (Date.now() - waitStartTime < service.startTimeout) {
@@ -306,10 +322,12 @@ export class AdminApiHandler {
 
       if (!isReady) {
         service._state!.status = 'offline';
-        res.cork(() => {
-          res.writeStatus('503 Service Unavailable');
-          res.end(JSON.stringify({ error: 'Service start timeout' }));
-        });
+        if (!aborted) {
+          res.cork(() => {
+            res.writeStatus('503 Service Unavailable');
+            res.end(JSON.stringify({ error: 'Service start timeout' }));
+          });
+        }
         return;
       }
 
@@ -317,20 +335,24 @@ export class AdminApiHandler {
       service._state!.startTime = Date.now();
       service._state!.startCount++;
 
-      res.cork(() => {
-        res.writeHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({
-          success: true,
-          message: `服务 ${service.name} 已启动`,
-        }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({
+            success: true,
+            message: `服务 ${service.name} 已启动`,
+          }));
+        });
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       service._state!.status = 'offline';
-      res.cork(() => {
-        res.writeStatus('500 Internal Server Error');
-        res.end(JSON.stringify({ error: message }));
-      });
+      if (!aborted) {
+        res.cork(() => {
+          res.writeStatus('500 Internal Server Error');
+          res.end(JSON.stringify({ error: message }));
+        });
+      }
     }
   }
 
@@ -357,9 +379,6 @@ export class AdminApiHandler {
  * 快速检查 TCP 端口是否可用
  */
 function checkTcpPort(url: string): Promise<boolean> {
-  const { URL } = require('node:url');
-  const net = require('node:net');
-
   const parsed = new URL(url);
   const host = parsed.hostname;
   const port = parseInt(parsed.port || (parsed.protocol === 'https:' ? '443' : '80'));

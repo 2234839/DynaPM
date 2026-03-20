@@ -5,25 +5,44 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.14] - 2026-03-20
+
+### 🔴 Bug 修复
+- **按需启动 POST 请求体丢失（严重）**: uWS 的 onData 回调中 ArrayBuffer 是借用语义，`Buffer.from(ab)` 底层数据被后续回调覆盖。改用 `Buffer.alloc + copy` 确保数据复制
+- **并发按需启动返回 502**: 多个请求同时到达离线服务时，只有第一个触发启动，其他请求等待启动完成后再代理
+- **transfer-encoding 头冲突**: forwardProxyRequest 中过滤 transfer-encoding 头，避免与 content-length 冲突导致后端 400
+- **后端崩溃自动恢复**: 检测到后端不可达（ECONNREFUSED）时，自动将非 proxyOnly 服务状态重置为 offline
+- **端口路由并发启动**: handlePortBindingRequest 补全 starting/stopping 状态处理，与 hostname 路由保持一致
+
+### 🔒 安全加固
+- 请求体大小限制 10MB，防止 DoS 攻击
+- WebSocket 消息队列限制 1000 条，防止内存泄漏
+- CRLF 注入防护：请求头值中的 `\r\n` 被清理
+- 端口路由 WebSocket close handler 补充后端连接清理
+
+### 🚀 性能优化
+- **去除 undici，恢复原生 http 模块**: 吞吐量从 4,523 提升至 **5,942 req/s（+31%）**，延迟从 10.6ms 降至 **10.3ms**
+- 预编译 CRLF 正则，避免热路径重复创建
+- Set 替代内联条件判断，优化请求头跳过逻辑
+
+### 🧪 测试（81 个用例全部通过）
+- test-proxy-comprehensive.ts: 23 个综合代理测试
+- test-edge-cases.ts: 15 个极端场景测试
+- test-gateway-robustness.ts: 13 个健壮性测试
+- test-admin-api-lifecycle.ts: 12 个管理 API 生命周期测试
+- test-port-route-start.ts: 9 个端口路由按需启动测试
+- test-security-stability.ts: 9 个安全与稳定性深度测试
+
+---
+
 ## [1.0.13] - 2026-02-10
 
 ### 🚀 性能优化
-- **重大性能提升**：使用 undici 替代原生 http 模块作为 HTTP 客户端
-  - 吞吐量提升 **28.2%**：4345 → 5571 req/s
-  - 延迟保持 11.4ms（无退化）
-  - 使用 `undici.request()` API 实现流式转发
-  - 避免了 `undici.stream()` + Writable stream 的包装开销
+- 使用 undici 替代原生 http 模块（已在 v1.0.14 回退，原生 http 性能更优）
 
 ### 🔧 改进
-- 移除不再使用的 http/https 模块相关代码
-- 清理 RouteMapping 中的冗余字段（isHttps、httpModule、httpAgent）
+- 清理 RouteMapping 中的冗余字段
 - 代码更简洁，维护性更好
-
-### 📚 技术细节
-- undici 的 `request()` API 比 `stream()` API 更适合代理场景
-- `stream()` 适用于消费响应（写入文件、解析 JSON）
-- `request()` 返回 Readable stream，可以手动控制流式转发
-- 完全保持流式处理，客户端延迟无增加
 
 ---
 

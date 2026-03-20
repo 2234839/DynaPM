@@ -13,19 +13,45 @@ import { formatTime } from '../utils/format.js';
 /**
  * 收集 uWS 请求体为 Buffer
  * 在 onData 的 isLast 回调中完成收集
+ * 超过 MAX_REQUEST_BODY_SIZE 时截断并返回已收集的数据
+ */
+/**
+ * 收集 uWS 请求体为 Buffer
+ * 在 onData 的 isLast 回调中完成收集
+ * 超过 MAX_REQUEST_BODY_SIZE 时截断并返回已收集的数据
+ *
+ * 重要：uWS 的 onData 回调中的 ArrayBuffer 是借用的，
+ * 回调返回后会被回收，必须在回调内复制数据。
  */
 function collectRequestBody(res: HttpResponse): Promise<Buffer> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
+    let totalSize = 0;
+    let resolved = false;
 
     res.onData((ab: ArrayBuffer, isLast: boolean) => {
-      chunks.push(Buffer.from(ab));
+      if (resolved) return;
+
+      const chunk = Buffer.alloc(ab.byteLength);
+      Buffer.from(ab).copy(chunk);
+      totalSize += chunk.length;
+
+      if (totalSize > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
+        resolved = true;
+        resolve(Buffer.concat(chunks));
+        return;
+      }
+
+      chunks.push(chunk);
       if (isLast) {
+        resolved = true;
         resolve(Buffer.concat(chunks));
       }
     });
 
     res.onAborted(() => {
+      if (resolved) return;
+      resolved = true;
       resolve(Buffer.concat(chunks));
     });
   });
@@ -65,6 +91,14 @@ const GatewayConstants = {
   BACKEND_READY_CHECK_DELAY: 50,
   /** 不应转发的响应头（小写） */
   SKIP_RESPONSE_HEADERS: new Set(['connection', 'transfer-encoding', 'keep-alive', 'content-length']),
+  /** 预编译 CRLF 清理正则（热路径中使用） */
+  CRLF_REGEX: /[\r\n]/g,
+  /** 不应转发的请求头（小写） */
+  SKIP_REQUEST_HEADERS: new Set(['connection', 'keep-alive', 'content-length']),
+  /** 请求体最大大小（10MB），防止 DoS 攻击 */
+  MAX_REQUEST_BODY_SIZE: 10 * 1024 * 1024,
+  /** WebSocket 消息队列最大长度（1000 条），防止内存泄漏 */
+  MAX_WS_MESSAGE_QUEUE_SIZE: 1000,
 } as const;
 
 /**
@@ -138,6 +172,8 @@ export class Gateway {
   };
   /** 管理 API 处理器 */
   private adminApi: AdminApiHandler;
+  /** 服务启动 Promise 追踪：serviceName -> 启动完成 Promise */
+  private startingPromises = new Map<string, Promise<void>>();
 
   constructor(private config: DynaPMConfig, logger: Logger) {
     this.logger = logger;
@@ -276,16 +312,32 @@ export class Gateway {
 
     const headers: Record<string, string> = {};
     req.forEach((key: string, value: string) => {
-      const safeValue = value.replace(/[\r\n]/g, '');
+      const safeValue = value.replace(GatewayConstants.CRLF_REGEX, '');
       headers[key] = safeValue;
     });
 
     service._state!.lastAccessTime = Date.now();
 
-    const needsStart = service._state!.status === 'offline';
+    const status = service._state!.status;
+
+    if (status === 'starting') {
+      const startPromise = this.startingPromises.get(service.name);
+      if (startPromise) {
+        this.handleServiceWithStartPromise(res, mapping, fullUrl, startTime, method, headers, startPromise);
+      } else {
+        this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
+      }
+      return;
+    }
+
+    const needsStart = status === 'offline' || status === 'stopping';
 
     if (needsStart) {
-      this.handleServiceStart(res, mapping, fullUrl, startTime, method, headers);
+      if (status === 'stopping') {
+        this.handleServiceWithWait(res, mapping, fullUrl, startTime, method, headers);
+      } else {
+        this.handleServiceStart(res, mapping, fullUrl, startTime, method, headers);
+      }
     } else {
       this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
     }
@@ -309,13 +361,7 @@ export class Gateway {
 
     const headers: Record<string, string> = {};
     req.forEach((key: string, value: string) => {
-      let safeValue = value;
-      const crIndex = value.indexOf('\r');
-      const lfIndex = value.indexOf('\n');
-      if (crIndex !== -1 || lfIndex !== -1) {
-        safeValue = value.replace(/[\r\n]/g, '');
-      }
-      headers[key] = safeValue;
+      headers[key] = value.replace(GatewayConstants.CRLF_REGEX, '');
     });
 
     const mapping = this.hostnameRoutes.get(hostname);
@@ -333,6 +379,19 @@ export class Gateway {
     service._state!.lastAccessTime = Date.now();
 
     const status = service._state!.status;
+
+    if (status === 'starting') {
+      /** 服务正在启动中，等待启动完成后再代理 */
+      const startPromise = this.startingPromises.get(service.name);
+      if (startPromise) {
+        this.handleServiceWithStartPromise(res, mapping, fullUrl, startTime, method, headers, startPromise);
+      } else {
+        /** 理论上不应该走到这里，但作为兜底处理 */
+        this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
+      }
+      return;
+    }
+
     const needsStart = status === 'offline' || status === 'stopping';
 
     if (needsStart) {
@@ -364,6 +423,15 @@ export class Gateway {
     this.logger.info({ msg: `🚀 [${service.name}] ${method} ${fullUrl} - 启动服务...` });
     service._state!.status = 'starting';
 
+    /** 创建启动 Promise 供后续并发请求等待 */
+    let resolveStartPromise: () => void;
+    let rejectStartPromise: (err: Error) => void;
+    const startPromise = new Promise<void>((resolve, reject) => {
+      resolveStartPromise = resolve;
+      rejectStartPromise = reject;
+    });
+    this.startingPromises.set(service.name, startPromise);
+
     try {
       await this.serviceManager.start(service);
 
@@ -389,13 +457,20 @@ export class Gateway {
       service._state!.startTime = Date.now();
       service._state!.startCount++;
 
+      resolveStartPromise!();
+      this.startingPromises.delete(service.name);
+
       await this.forwardProxyRequest(res, mapping, fullUrl, startTime, method, headers, body);
     } catch (error: unknown) {
+      this.startingPromises.delete(service.name);
       const message = error instanceof Error ? error.message : String(error);
 
       if (message === 'Client aborted') {
+        resolveStartPromise!();
         return;
       }
+
+      rejectStartPromise!(error instanceof Error ? error : new Error(message));
 
       this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: message });
       try {
@@ -454,6 +529,42 @@ export class Gateway {
   }
 
   /**
+   * 处理服务正在启动中的场景
+   * 等待启动 Promise 完成后，如果成功则直接代理，如果失败则返回 503
+   */
+  private handleServiceWithStartPromise(
+    res: HttpResponse,
+    mapping: RouteMapping,
+    fullUrl: string,
+    startTime: number,
+    method: string,
+    headers: Record<string, string>,
+    startPromise: Promise<void>,
+  ): void {
+    const bodyPromise = collectRequestBody(res);
+
+    (async () => {
+      try {
+        await startPromise;
+      } catch {
+        await bodyPromise;
+        try {
+          res.cork(() => {
+            res.writeStatus('503 Service Unavailable');
+            res.end('Service start failed');
+          });
+        } catch {
+          // 忽略发送失败
+        }
+        return;
+      }
+
+      const body = await bodyPromise;
+      await this.forwardProxyRequest(res, mapping, fullUrl, startTime, method, headers, body);
+    })();
+  }
+
+  /**
    * 处理需要启动服务的场景
    */
   private handleServiceStart(
@@ -464,7 +575,6 @@ export class Gateway {
     method: string,
     headers: Record<string, string>
   ): void {
-    // 边收集请求体边启动服务
     const bodyPromise = collectRequestBody(res);
 
     (async () => {
@@ -491,8 +601,7 @@ export class Gateway {
     // 构建代理请求头
     const proxyHeaders: Record<string, string> = {};
     for (const key in headers) {
-      const keyLower = key.toLowerCase();
-      if (keyLower === 'connection' || keyLower === 'keep-alive' || keyLower === 'content-length') {
+      if (GatewayConstants.SKIP_REQUEST_HEADERS.has(key.toLowerCase())) {
         continue;
       }
       proxyHeaders[key] = headers[key];
@@ -638,6 +747,11 @@ export class Gateway {
           res.end('Bad Gateway');
         });
       }
+      /** 后端不可达时，将非 proxyOnly 服务状态重置为 offline，允许后续按需启动 */
+      if (!service.proxyOnly && service._state!.status === 'online') {
+        this.logger.info({ msg: `🔄 [${service.name}] 后端不可达，重置状态为 offline` });
+        service._state!.status = 'offline';
+      }
       cleanup();
     });
 
@@ -683,7 +797,7 @@ export class Gateway {
     const proxyHeaders: Record<string, string> = {};
     for (const key in headers) {
       const keyLower = key.toLowerCase();
-      if (keyLower === 'connection' || keyLower === 'keep-alive' || keyLower === 'content-length') {
+      if (keyLower === 'connection' || keyLower === 'keep-alive' || keyLower === 'content-length' || keyLower === 'transfer-encoding') {
         continue;
       }
       proxyHeaders[key] = headers[key];
@@ -947,7 +1061,7 @@ export class Gateway {
 
         const clientHeaders: Record<string, string> = {};
         req.forEach((key: string, value: string) => {
-          const safeValue = value.replace(/[\r\n]/g, '');
+          const safeValue = value.replace(GatewayConstants.CRLF_REGEX, '');
           clientHeaders[key] = safeValue;
         });
 
@@ -1162,7 +1276,9 @@ export class Gateway {
           if (this.logging.enableWebSocketLog) {
             this.logger.info({ msg: `📦 [${service.name}] 消息加入队列` });
           }
-          wsState.messageQueue.push(Buffer.from(message));
+          if (wsState.messageQueue.length < GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE) {
+            wsState.messageQueue.push(Buffer.from(message));
+          }
         }
       },
 
@@ -1242,7 +1358,7 @@ export class Gateway {
 
         const clientHeaders: Record<string, string> = {};
         req.forEach((key: string, value: string) => {
-          const safeValue = value.replace(/[\r\n]/g, '');
+          const safeValue = value.replace(GatewayConstants.CRLF_REGEX, '');
           clientHeaders[key] = safeValue;
         });
 
@@ -1401,7 +1517,9 @@ export class Gateway {
           wsState.backendWs.send(Buffer.from(message));
           svc._state!.lastAccessTime = Date.now();
         } else {
-          wsState.messageQueue.push(Buffer.from(message));
+          if (wsState.messageQueue.length < GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE) {
+            wsState.messageQueue.push(Buffer.from(message));
+          }
         }
       },
 
@@ -1409,6 +1527,16 @@ export class Gateway {
         const userData = ws.getUserData();
         const svc = userData.service as ServiceConfig;
         svc._state!.activeConnections--;
+
+        const wsState = (ws as unknown as Record<string, unknown>).wsState as {
+          backendWs?: WS;
+          closing?: boolean;
+        } | undefined;
+
+        if (wsState?.backendWs && wsState.backendWs.readyState === WS.OPEN) {
+          wsState.closing = true;
+          wsState.backendWs.close();
+        }
       },
     });
 

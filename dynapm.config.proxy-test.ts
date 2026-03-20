@@ -36,8 +36,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/echo-server.ts >> ${logDir}/echo-test.log 2>&1 &`,
-        stop: 'lsof -ti:3099 | xargs -r kill -9',
-        check: 'lsof -ti:3099 >/dev/null 2>&1',
+        stop: 'lsof -i:3099 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:3099 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {
@@ -71,8 +71,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-sse.ts >> ${logDir}/sse-test.log 2>&1 &`,
-        stop: 'lsof -ti:3010 | xargs -r kill -9',
-        check: 'lsof -ti:3010 >/dev/null 2>&1',
+        stop: 'lsof -i:3010 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:3010 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {
@@ -90,8 +90,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-ws.ts >> ${logDir}/ws-test.log 2>&1 &`,
-        stop: 'lsof -ti:3011 | xargs -r kill -9',
-        check: 'lsof -ti:3011 >/dev/null 2>&1',
+        stop: 'lsof -i:3011 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:3011 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {

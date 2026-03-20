@@ -19,8 +19,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: `node -e "require('http').createServer((req, res) => res.end('App1 on port 3001')).listen(3001)" &`,
-        stop: 'lsof -ti:3001 | xargs -r kill -9',
-        check: 'lsof -ti:3001 >/dev/null 2>&1',
+        stop: 'lsof -i:3001 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:3001 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {
@@ -38,8 +38,8 @@ const config: DynaPMConfig = {
 
       commands: {
         start: 'node admin/server.js',
-        stop: 'lsof -ti:4001 | xargs -r kill -9',
-        check: 'lsof -ti:4001 >/dev/null 2>&1',
+        stop: 'lsof -i:4001 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:4001 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {
