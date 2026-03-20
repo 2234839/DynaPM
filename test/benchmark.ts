@@ -178,8 +178,9 @@ async function testMultiServiceThroughput() {
 
         // 解析 wrk 输出
         const lines = stdout.split('\n');
-        const qpsLine = lines.find((line: string) => line.includes('Req/Sec'));
-        const latencyLine = lines.find((line: string) => line.includes('Latency'));
+        /** 取汇总行的 Requests/sec，而非线程统计的 Req/Sec */
+        const qpsLine = lines.find((line: string) => line.startsWith('Requests/sec:'));
+        const latencyLine = lines.find((line: string) => line.trim().startsWith('Latency'));
 
         let qps = 0;
         let avgLatency = 0;
@@ -192,7 +193,7 @@ async function testMultiServiceThroughput() {
         }
 
         if (latencyLine) {
-          const match = latencyLine.match(/([\d,]+\.?\d*)\s*([a-z]+)?/);
+          const match = latencyLine.match(/([\d,]+\.?\d*)\s*([a-z]+)/);
           if (match) {
             avgLatency = parseFloat(match[1].replace(/,/g, ''));
           }
