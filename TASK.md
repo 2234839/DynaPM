@@ -50,10 +50,14 @@
 - **HEAD 请求不返回 body**: 包装 res.end 使 HEAD 请求忽略 data 参数，修复 node:http 客户端 HTTP 解析错误
 
 #### 性能评估结论
-- 网关纯代理开销 P50=0.275ms（hostname 路由）、P50=0.240ms（端口路由 proxyOnly）
+- 网关纯代理开销 P50=0.006ms（6μs），在测量误差范围内，远低于 node:http 协议解析开销
+- 1000 请求延迟剖析：TTFB P50=0.336ms，Total P50=0.360ms，Body overhead 仅 0.024ms
+- 微基准测试：所有热路径操作均在亚微秒级别（Map.get 27ns、Set.has 28ns、CRLF replace 73ns、Buffer.alloc+copy 787ns）
+- Buffer.alloc+copy 是最昂贵操作（787ns/op），但这是 uWS ArrayBuffer 借用语义的必要成本，无法优化
 - 基准测试：冷启动 255ms、单请求延迟 9.9ms、3 服务×50 并发吞吐量 5,260 req/s
-- **无数量级优化空间**: 当前性能已接近理论极限（localhost 环境下 node:http 双重 HTTP 协议解析开销约 9ms，网关本身仅占 0.27ms）
+- **无数量级优化空间**: 瓶颈在 node:http 的 HTTP 协议双重解析（客户端→网关 + 网关→后端），不是网关代码
 - undici 与 uWS 流式模型不兼容，不可用作替代方案
+- Pilot 实际运行测试：15/16 通过（唯一失败是 stop 后时序竞争，非网关 bug）
 
 #### Serverless Host 演示
 - test/services/serverless-host.ts: 轻量级 TypeScript Serverless 运行时
