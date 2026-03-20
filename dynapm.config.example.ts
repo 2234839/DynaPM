@@ -29,11 +29,12 @@ const config: DynaPMConfig = {
     // allowedIps: ['127.0.0.1', '::1'],
   },
 
-  // 服务配置映射：hostname -> 服务配置
+  // 服务配置映射：服务标识 -> 服务配置
   services: {
     // ==================== PM2 管理的 Node.js 应用 ====================
-    'node-app.example.com': {
+    'my-node-app': {
       name: 'my-node-app',
+      host: 'node-app.example.com',
       base: 'http://127.0.0.1:3001',
       idleTimeout: 5 * 60 * 1000, // 5分钟无访问后停止
       startTimeout: 10 * 1000, // 最多等待10秒启动
@@ -59,8 +60,9 @@ const config: DynaPMConfig = {
     },
 
     // ==================== Docker 容器应用 ====================
-    'python-api.example.com': {
+    'python-api': {
       name: 'python-api',
+      host: 'python-api.example.com',
       base: 'http://127.0.0.1:8000',
       idleTimeout: 10 * 60 * 1000, // 10分钟
       startTimeout: 30 * 1000, // Docker启动较慢，给30秒
@@ -84,10 +86,12 @@ const config: DynaPMConfig = {
     },
 
     // ==================== systemd 服务 ====================
-    'golang-service.example.com': {
+    'my-go-service': {
       name: 'my-go-service',
+      host: 'golang-service.example.com',
       base: 'http://127.0.0.1:8080',
       idleTimeout: 15 * 60 * 1000, // 15分钟
+      startTimeout: 10 * 1000,
 
       commands: {
         // systemd启动命令
@@ -107,10 +111,12 @@ const config: DynaPMConfig = {
     },
 
     // ==================== 直接启动的 Node.js 应用 ====================
-    'direct-node.example.com': {
+    'simple-server': {
       name: 'simple-server',
+      host: 'direct-node.example.com',
       base: 'http://127.0.0.1:3002',
       idleTimeout: 3 * 60 * 1000, // 3分钟
+      startTimeout: 10 * 1000,
 
       commands: {
         // 直接启动（使用nohup和重定向）
@@ -129,10 +135,12 @@ const config: DynaPMConfig = {
     },
 
     // ==================== 带环境变量的服务 ====================
-    'env-service.example.com': {
+    'env-aware-service': {
       name: 'env-aware-service',
+      host: 'env-service.example.com',
       base: 'http://127.0.0.1:4000',
       idleTimeout: 5 * 60 * 1000,
+      startTimeout: 10 * 1000,
 
       commands: {
         start: 'pm2 start /path/to/app.js --name env-service',
@@ -156,10 +164,12 @@ const config: DynaPMConfig = {
     },
 
     // ==================== Go 应用（Docker） ====================
-    'go-app.example.com': {
+    'go-web-app': {
       name: 'go-web-app',
+      host: 'go-app.example.com',
       base: 'http://127.0.0.1:8081',
       idleTimeout: 8 * 60 * 1000,
+      startTimeout: 10 * 1000,
 
       commands: {
         start: 'docker run -d --name go-web-app -p 8081:8080 my-go-app:latest',

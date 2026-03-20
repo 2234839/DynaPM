@@ -9,16 +9,18 @@ const config: DynaPMConfig = {
   },
 
   services: {
-    'test-app.local': {
-      name: 'test-app',
-      base: 'http://127.0.0.1:5000',
+    // 只有 hostname 映射的服务
+    'app1': {
+      name: 'app1',
+      host: 'app1.test',
+      base: 'http://127.0.0.1:3001',
       idleTimeout: 60 * 1000,
       startTimeout: 10 * 1000,
 
       commands: {
-        start: 'node -e "require(\"http\").createServer((req, res) => res.end(\"Hello from test app\")).listen(5000)" &',
-        stop: 'lsof -ti:5000 | xargs -r kill -9',
-        check: 'lsof -ti:5000 >/dev/null 2>&1',
+        start: `node -e "require('http').createServer((req, res) => res.end('App1 on port 3001')).listen(3001)" &`,
+        stop: 'lsof -ti:3001 | xargs -r kill -9',
+        check: 'lsof -ti:3001 >/dev/null 2>&1',
       },
 
       healthCheck: {
@@ -26,16 +28,18 @@ const config: DynaPMConfig = {
       },
     },
 
-    'admin.dynapm.local': {
+    // 有专属端口的管理界面
+    'dynapm-admin': {
       name: 'dynapm-admin',
-      base: 'http://127.0.0.1:4000',
+      port: 4000,
+      base: 'http://127.0.0.1:4001',
       idleTimeout: 10 * 60 * 1000,
       startTimeout: 5 * 1000,
 
       commands: {
         start: 'node admin/server.js',
-        stop: 'lsof -ti:4000 | xargs -r kill -9',
-        check: 'lsof -ti:4000 >/dev/null 2>&1',
+        stop: 'lsof -ti:4001 | xargs -r kill -9',
+        check: 'lsof -ti:4001 >/dev/null 2>&1',
       },
 
       healthCheck: {

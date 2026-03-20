@@ -11,3 +11,6 @@ auto-*.d.ts
 .githooks
 
 /logs
+
+src/**/CLAUDE.md
+.claude/scheduled_tasks.lock

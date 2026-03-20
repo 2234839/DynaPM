@@ -7,8 +7,12 @@ import type { DynaPMConfig } from './types.js';
  * @throws 当配置文件中至少需要一个服务时抛出错误
  */
 export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
+  /** 支持通过环境变量 DYNAPM_CONFIG 指定配置文件路径 */
+  const configFile = process.env.DYNAPM_CONFIG || undefined;
+
   const { config } = await loadConfig<DynaPMConfig>({
     name: 'dynapm',
+    configFile,
     defaultConfig: {
       port: 3000,
       host: '127.0.0.1',

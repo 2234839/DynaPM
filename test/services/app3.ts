@@ -3,14 +3,13 @@
  * 确保后端不会成为性能瓶颈
  */
 
-const uWS = require('uWebSockets.js');
+import uWS from 'uWebSockets.js';
 
 const PORT = 3003;
 
 const app = uWS.App();
 
-app.any('/*', (res, req) => {
-  // 立即返回简单响应，无任何处理
+app.any('/*', (res) => {
   res.cork(() => {
     res.writeStatus('200 OK');
     res.writeHeader('Content-Type', 'text/plain');

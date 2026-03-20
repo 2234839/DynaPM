@@ -54,15 +54,16 @@ const config: DynaPMConfig = {
     },
 
     // 测试服务1：使用端口检查
-    'app1.test': {
+    'app1': {
       name: 'app1',
+      host: 'app1.test',
       base: 'http://127.0.0.1:3001',
       idleTimeout: 10 * 1000,
       startTimeout: 10 * 1000,
 
       commands: {
         // 使用 nohup 后台启动，统一输出到 services.log
-        start: `nohup node ${process.cwd()}/test/services/app1.js >> ${logDir}/services.log 2>&1 &`,
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/app1.ts >> ${logDir}/services.log 2>&1 &`,
         // 使用端口查找并杀死进程（更可靠）
         stop: `lsof -ti:3001 | xargs -r kill -9`,
         // 使用 lsof 检查端口是否被监听
@@ -75,14 +76,15 @@ const config: DynaPMConfig = {
     },
 
     // 测试服务2：HTTP检查
-    'app2.test': {
+    'app2': {
       name: 'app2',
+      host: 'app2.test',
       base: 'http://127.0.0.1:3002',
       idleTimeout: 10 * 1000,
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup node ${process.cwd()}/test/services/app2.js >> ${logDir}/services.log 2>&1 &`,
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/app2.ts >> ${logDir}/services.log 2>&1 &`,
         stop: `lsof -ti:3002 | xargs -r kill -9`,
         check: `lsof -ti:3002 >/dev/null 2>&1`,
       },
@@ -95,14 +97,15 @@ const config: DynaPMConfig = {
     },
 
     // 测试服务3：TCP检查
-    'app3.test': {
+    'app3': {
       name: 'app3',
+      host: 'app3.test',
       base: 'http://127.0.0.1:3003',
       idleTimeout: 15 * 1000,
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup node ${process.cwd()}/test/services/app3.js >> ${logDir}/services.log 2>&1 &`,
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/app3.ts >> ${logDir}/services.log 2>&1 &`,
         stop: `lsof -ti:3003 | xargs -r kill -9`,
         check: `lsof -ti:3003 >/dev/null 2>&1`,
       },
@@ -113,14 +116,15 @@ const config: DynaPMConfig = {
     },
 
     // SSE 测试服务
-    'sse.test': {
+    'sse-server': {
       name: 'sse-server',
+      host: 'sse.test',
       base: 'http://127.0.0.1:3010',
       idleTimeout: 10 * 1000,
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup npx tsx ${process.cwd()}/test/server-sse.ts >> ${logDir}/services.log 2>&1 &`,
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-sse.ts >> ${logDir}/services.log 2>&1 &`,
         stop: `lsof -ti:3010 | xargs -r kill -9`,
         check: `lsof -ti:3010 >/dev/null 2>&1`,
       },
@@ -131,16 +135,53 @@ const config: DynaPMConfig = {
     },
 
     // WebSocket 测试服务
-    'ws.test': {
+    'ws-server': {
       name: 'ws-server',
+      host: 'ws.test',
       base: 'http://127.0.0.1:3011',
       idleTimeout: 10 * 1000,
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup npx tsx ${process.cwd()}/test/server-ws.ts >> ${logDir}/services.log 2>&1 &`,
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-ws.ts >> ${logDir}/services.log 2>&1 &`,
         stop: `lsof -ti:3011 | xargs -r kill -9`,
         check: `lsof -ti:3011 >/dev/null 2>&1`,
+      },
+
+      healthCheck: {
+        type: 'tcp',
+      },
+    },
+
+    // 流式转发测试服务（纯代理模式，用于测试双向流式转发）
+    // 网关在端口 3998 监听，代理到后端的 3999
+    'stream-test': {
+      name: 'stream-test',
+      port: 3998,  // 网关监听端口
+      base: 'http://127.0.0.1:3999',  // 后端服务器端口
+      proxyOnly: true,  // 纯代理模式，不管理服务生命周期
+      idleTimeout: 10 * 1000,
+      startTimeout: 5 * 1000,
+      commands: {
+        start: 'echo "proxy only - no start command"',
+        stop: 'echo "proxy only - no stop command"',
+        check: 'echo "proxy only - no check command"',
+      },
+    },
+
+    // Serverless Host 演示服务
+    // 访问地址: http://127.0.0.1:4001 （Web 管理界面）
+    'serverless-host': {
+      name: 'serverless-host',
+      host: 'serverless.test',
+      base: 'http://127.0.0.1:4000',
+      idleTimeout: 10 * 60 * 1000,
+      startTimeout: 10 * 1000,
+
+      commands: {
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/serverless-host.ts 4000 >> ${logDir}/serverless.log 2>&1 &`,
+        stop: 'lsof -ti:4000 | xargs -r kill -9',
+        check: 'lsof -ti:4000 >/dev/null 2>&1',
       },
 
       healthCheck: {

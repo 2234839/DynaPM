@@ -1,21 +1,20 @@
 # DynaPM - Claude Code 项目配置
 
-DynaPM 是一个智能网关，通过按需启动和闲置自动停止的方式，帮助用户在资源受限的服务器上管理数百个低频访问的服务。
+DynaPM 是一个智能网关(类似nginx)/进程管理工具(类似pm2)，通过按需启动(请求到达时通过查找配置判断请求属于哪个程序，然后网关转发请求，当程序还未启动会执行启动命令等待就绪后再实际转发)和闲置自动停止的方式，帮助用户在资源受限的服务器上运行成千上万个低频访问+少量高频访问的服务。
 
 **核心特性：**
-- ⚡ 极速冷启动（开销仅 25ms）
-- 🚀 流式代理（1-2ms 延迟）
+- ⚡ 极速冷启动
+- 🚀 双向流式转发代理实现极低的请求延迟：将请求体流式给代理服务，将代理服务的响应流式给请求者 所以不需要缓冲请求或者响应，唯一的需要缓冲的时机就是请求到达网关，但是需要被网关唤起的程序还没有启动成功的时候
 - 🌐 支持 SSE 和 WebSocket
-- 🎛️ 通用服务管理（可替代PM2、Docker、systemd 等）
-- 🔄 闲置自动回收
+- 🎛️ 基于bash的通用服务管理（可用于管理PM2、Docker、systemd 等任意服务）
+- 🔄 闲置自动回收资源
 
 ## 技术栈
 
 - **运行时**: Node.js 22+
-- **Web 框架**: uWebSockets.js（性能比 Fastify 快 10 倍以上）
-- **日志**: Pino（异步结构化日志）
+- **Web 框架**: uWebSockets.js（最佳性能）
+- **日志**: Pino
 - **配置**: c12（支持 TypeScript）
-- **构建**: rslib
 - **包管理**: pnpm
 - **测试**: tsx + 自定义测试套件
 
@@ -37,8 +36,6 @@ DynaPM/
 │   ├── test-all.ts              # 完整测试套件（12个测试）
 │   ├── server-*.ts              # 测试服务器
 │   └── benchmark.js             # 性能测试
-├── docs/
-│   └── NPM_OIDC_SETUP.md        # npm OIDC 发布配置指南
 ├── .github/workflows/
 │   └── release.yml              # 自动发布到 npm
 ├── CHANGELOG.md                  # 版本更新日志
@@ -49,12 +46,7 @@ DynaPM/
 
 ## 开发指南
 
-### 快速开始
-
 ```bash
-# 安装依赖
-pnpm install
-
 # 运行测试
 pnpm test
 
@@ -67,4 +59,4 @@ pnpm benchmark
 
 ### 发布新版本
 
-流程 ： CHANGELOG → commit → npm version （git tag） → push 
+流程 ： CHANGELOG → commit →更新 npm version （git add tag） →git push （github actions 会通过 oicd 发包 npm ）

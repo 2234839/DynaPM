@@ -61,6 +61,17 @@ export class AdminApiHandler {
   }
 
   /**
+   * 在所有路由表中查找服务
+   */
+  private findServiceMapping(serviceName: string): RouteMapping | undefined {
+    let mapping = Array.from(this.hostnameRoutes.values()).find(m => m.service.name === serviceName);
+    if (!mapping) {
+      mapping = Array.from(this.portRoutes.values()).find(m => m.service.name === serviceName);
+    }
+    return mapping;
+  }
+
+  /**
    * 处理管理 API 请求
    */
   handleAdminApi(res: HttpResponse, req: HttpRequest): void {
@@ -157,7 +168,7 @@ export class AdminApiHandler {
    * 获取服务详情
    */
   private getServiceDetail(res: HttpResponse, serviceName: string): void {
-    const mapping = Array.from(this.hostnameRoutes.values()).find(m => m.service.name === serviceName);
+    const mapping = this.findServiceMapping(serviceName);
 
     this.logger.info({ msg: `🔍 [Admin API] 查找服务: ${serviceName}, 找到: ${mapping?.service.name || 'null'}` });
 
@@ -196,7 +207,7 @@ export class AdminApiHandler {
    * 停止服务
    */
   async stopService(res: HttpResponse, serviceName: string): Promise<void> {
-    const mapping = Array.from(this.hostnameRoutes.values()).find(m => m.service.name === serviceName);
+    const mapping = this.findServiceMapping(serviceName);
 
     if (!mapping) {
       res.cork(() => {
@@ -253,7 +264,7 @@ export class AdminApiHandler {
    * 启动服务
    */
   async startService(res: HttpResponse, serviceName: string): Promise<void> {
-    const mapping = Array.from(this.hostnameRoutes.values()).find(m => m.service.name === serviceName);
+    const mapping = this.findServiceMapping(serviceName);
 
     if (!mapping) {
       res.cork(() => {
