@@ -35,19 +35,90 @@
 - **activeConnections 双重递减修复**: handleDirectProxy 和 forwardProxyRequest 中 cleanup() 添加 `cleaned` 守卫，防止 onAborted/proxyReq error/proxyRes end 多次触发导致 activeConnections 变为负数，进而导致闲置超时永远不触发
 - **代理请求超时处理**: proxyReq 添加 `timeout` 事件监听，超时后调用 `destroy()` 触发 error 事件正确返回 502。之前 timeout 事件未被处理，导致后端慢响应时客户端无限等待
 
-#### 测试覆盖（93 个测试全部通过）
+#### 测试覆盖（170 个测试全部通过）
 - **test-proxy-comprehensive.ts**: 23 个综合代理测试
 - **test-advanced-proxy.ts**: 12 个高级代理场景测试（PUT/PATCH/DELETE 请求体转发、HEAD 无响应体、OPTIONS CORS、空 POST、根路径、查询参数特殊字符、30 个自定义头、Host 头覆盖、流式响应、快速连续请求、活跃服务闲置测试、WS+HTTP 并发）
 - **test-edge-cases.ts**: 15 个极端场景测试
 - **test-gateway-robustness.ts**: 13 个健壮性测试
 - **test-admin-api-lifecycle.ts**: 12 个管理 API 生命周期测试
+- **test-admin-api-deep.ts**: 10 个管理 API 深度与网关边界测试（新增）
+  - 管理 API 事件流 (SSE)
+  - 管理 API 路由边界（PUT/DELETE 404、路径遍历、不存在 API）
+  - 请求体超过 10MB 截断（按需启动路径）
+  - 3xx 重定向 Location 头透传
+  - 50 个并发请求同时断开
+  - 服务按需启动超时行为
+  - 非 JSON Content-Type POST
+  - 管理 API 并发请求 (40个)
+  - OPTIONS 预检请求
+  - 网关直接访问返回 404
+- **test-gateway-boundary.ts**: 10 个网关边界与安全深度测试（新增）
+  - CRLF 注入防护验证
+  - 并发按需启动竞争 (20个)
+  - 大响应体流式转发 (1MB)
+  - URL 特殊字符透传（中文、编码）
+  - 超长请求头值 (16KB)
+  - 响应头大小写兼容
+  - 重复请求头处理
+  - 快速连续请求到不同路径
+  - 连接超时后网关稳定性
+  - 多服务并发代理 (20个)
+- **test-proxy-deep.ts**: 10 个代理深度与资源管理测试（新增）
+  - 慢响应时客户端断开 activeConnections 准确性（含闲置超时验证）
+  - stopping 状态下收到请求（等待停止完成后启动）
+  - WebSocket 消息队列溢出 (1200条)
+  - PATCH/PUT 请求体转发完整性
+  - 分块传输响应体转发
+  - 带查询参数的 POST 请求
+  - 多次快速启停状态一致性 (5轮)
+  - 长连接 keep-alive 稳定性 (100个)
+  - 后端 500 错误网关不崩溃
+  - 50 个错误请求后网关稳定性
+- **test-proxy-edge-paths.ts**: 10 个代理边缘路径与错误恢复测试（新增）
+  - 后端响应超时处理
+  - 服务启动失败后重试
+  - 后端立即关闭连接
+  - 大量 502 后网关恢复 (30个)
+  - 服务正在启动时收到请求 (5个)
+  - 二进制请求体传输
+  - 根路径请求
+  - 特殊编码 URL 路径
+  - 服务详情字段完整性
+  - 网关端口扫描防护 (100个)
+- **test-concurrent-post-body.ts**: 10 个并发与竞争条件测试
 - **test-port-route-start.ts**: 9 个端口路由按需启动测试
 - **test-security-stability.ts**: 9 个安全与稳定性深度测试
-- **test-concurrent-post-body.ts**: 10 个并发与竞争条件测试
+- **test-startup-recovery.ts**: 7 个服务启动失败恢复测试
+- **test-proxy-supplementary.ts**: 10 个代理场景补充测试
+  - Set-Cookie 响应头转发
+  - 自定义响应头透传（X-Custom-Response、X-Rate-Limit、Cache-Control）
+  - 204 No Content 响应
+  - 分块传输响应
+  - GET 请求不应有 body
+  - Content-Type 多样性（json/plain/octet-stream）
+  - 并发连接后网关不崩溃
+  - 非 ASCII 响应体
+  - 快速连续启停后代理正常
+- **test-pilot.ts**: 16 个 Pilot 实际运行测试（使用 dynapm.config.ts 生产配置）
+- **test-ws-concurrent.ts**: 10 个 WebSocket 并发与稳定性测试（新增）
+  - 20 个并发 WebSocket 连接
+  - 10 个并发 WebSocket ping/pong
+  - WebSocket 较大消息传输 (10KB)
+  - WebSocket 二进制消息传输
+  - 多连接消息顺序保证 (10条)
+  - 快速连接/断开循环 (30次)
+  - 服务停止后连接清理
+  - WebSocket + HTTP 混合并发
+  - WebSocket 活跃连接阻止闲置停止
+  - WebSocket 按需启动
 - **test-post-body-fix.ts**: 12 个 POST 请求体完整性测试（已整合到 test-concurrent-post-body.ts）
 
 #### echo-server 修复
 - **HEAD 请求不返回 body**: 包装 res.end 使 HEAD 请求忽略 data 参数，修复 node:http 客户端 HTTP 解析错误
+- **3xx 重定向 Location 头**: handleStatus 端点在 3xx 状态码时返回 Location 头
+
+#### server-ws.ts 修复
+- **WebSocket isBinary 参数错误**: `ws.send(JSON.stringify(...), true, false)` 中 `isBinary=true` 传入 string 导致连接状态异常。移除多余的 `true, false` 参数，使用 uWS 默认值
 
 #### 性能评估结论
 - 网关纯代理开销 P50=0.006ms（6μs），在测量误差范围内，远低于 node:http 协议解析开销
@@ -56,11 +127,19 @@
 - Buffer.alloc+copy 是最昂贵操作（787ns/op），但这是 uWS ArrayBuffer 借用语义的必要成本，无法优化
 - 基准测试：冷启动 255ms、单请求延迟 9.9ms、3 服务×50 并发吞吐量 5,260 req/s
 - **无数量级优化空间**: 瓶颈在 node:http 的 HTTP 协议双重解析（客户端→网关 + 网关→后端），不是网关代码
+- node:http keep-alive 出站 0.097ms/req，新建连接 0.252ms/req，网关已利用 keep-alive
+- **net.Socket 替代方案不可行**: 测试显示 net.Socket 0.508ms/req（无 keep-alive），反而更慢；uWS 未暴露 `us_socket_context_connect`
 - undici 与 uWS 流式模型不兼容，不可用作替代方案
-- Pilot 实际运行测试：15/16 通过（唯一失败是 stop 后时序竞争，非网关 bug）
+- Pilot 实际运行测试：16/16 全部通过（使用 dynapm.config.ts 生产配置）
+- WebSocket 并发测试：10/10 全部通过（20 并发连接、混合 WS+HTTP、按需启动、闲置保护）
 
 #### Serverless Host 演示
 - test/services/serverless-host.ts: 轻量级 TypeScript Serverless 运行时
   - Web 管理界面编写/上传/执行/删除函数
   - 使用 Node --experimental-strip-types 直接加载 TS 函数
   - 已添加到 dynapm.config.ts 作为 serverless-host 服务
+
+#### echo-server 新增端点
+- `/cookie` — 返回 Set-Cookie 响应头
+- `/custom-response` — 返回自定义响应头（X-Custom-Response、X-Rate-Limit、Cache-Control）和二进制响应体
+- `/no-content` — 返回 204 No Content

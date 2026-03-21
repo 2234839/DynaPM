@@ -69,6 +69,12 @@ function handleRequest(res: uWS.HttpResponse, method: string, url: string, query
     handleChunked(res, params);
   } else if (url === '/big-body') {
     handleBigBody(res, method, body);
+  } else if (url === '/cookie') {
+    handleCookie(res, params);
+  } else if (url === '/custom-response') {
+    handleCustomResponse(res, params);
+  } else if (url === '/no-content') {
+    handleNoContent(res);
   } else {
     handleDefault(res, method, url);
   }
@@ -165,6 +171,11 @@ function handleStatus(res: uWS.HttpResponse, params: Record<string, string>) {
   res.cork(() => {
     res.writeStatus(`${code} ${message}`);
     res.writeHeader('Content-Type', 'application/json');
+    /** 3xx 重定向返回 Location 头 */
+    if (code >= 300 && code < 400) {
+      const redirectUrl = params.url || 'https://example.com/redirect';
+      res.writeHeader('Location', redirectUrl);
+    }
     res.end(JSON.stringify({ status: code, message }));
   });
 }
@@ -238,6 +249,38 @@ function handleDefault(res: uWS.HttpResponse, method: string, url: string) {
     res.writeStatus('200 OK');
     res.writeHeader('Content-Type', 'text/plain');
     res.end(`Default response from echo server: ${method} ${url}`);
+  });
+}
+
+/** Cookie 端点 — 返回 set-cookie 头 */
+function handleCookie(res: uWS.HttpResponse, params: Record<string, string>) {
+  res.cork(() => {
+    res.writeStatus('200 OK');
+    res.writeHeader('Content-Type', 'application/json');
+    res.writeHeader('Set-Cookie', 'session=abc123; Path=/; HttpOnly');
+    res.writeHeader('Set-Cookie', 'theme=dark; Path=/');
+    res.end(JSON.stringify({ cookies: ['session=abc123', 'theme=dark'] }));
+  });
+}
+
+/** 自定义响应头端点 — 返回各种非标准头 */
+function handleCustomResponse(res: uWS.HttpResponse, params: Record<string, string>) {
+  res.cork(() => {
+    res.writeStatus('200 OK');
+    res.writeHeader('Content-Type', 'application/octet-stream');
+    res.writeHeader('X-Custom-Response', 'custom-value');
+    res.writeHeader('X-Rate-Limit', '100');
+    res.writeHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.writeHeader('X-Request-Id', 'req-' + Date.now());
+    res.end(Buffer.alloc(parseInt(params.size || '100'), 0xAB));
+  });
+}
+
+/** 204 No Content 端点 */
+function handleNoContent(res: uWS.HttpResponse) {
+  res.cork(() => {
+    res.writeStatus('204 No Content');
+    res.end();
   });
 }
 

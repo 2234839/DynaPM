@@ -14,11 +14,6 @@ import { formatTime } from '../utils/format.js';
  * 收集 uWS 请求体为 Buffer
  * 在 onData 的 isLast 回调中完成收集
  * 超过 MAX_REQUEST_BODY_SIZE 时截断并返回已收集的数据
- */
-/**
- * 收集 uWS 请求体为 Buffer
- * 在 onData 的 isLast 回调中完成收集
- * 超过 MAX_REQUEST_BODY_SIZE 时截断并返回已收集的数据
  *
  * 重要：uWS 的 onData 回调中的 ArrayBuffer 是借用的，
  * 回调返回后会被回收，必须在回调内复制数据。

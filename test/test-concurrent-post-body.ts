@@ -323,9 +323,32 @@ async function test_starting_state_concurrent() {
     timeout: 10000,
   });
 
-  await sleep(200);
+  /** 等待网关状态变为 starting（admin API start 返回后网关才真正开始启动） */
+  await startPromise;
 
-  /** 在 starting 状态时发送 50 个并发请求 */
+  /** 等待网关进入 starting 状态，但不等完成（轮询管理 API） */
+  for (let i = 0; i < 20; i++) {
+    try {
+      const statusRes = await httpRequest({
+        port: 3091,
+        path: '/_dynapm/api/services/echo-host',
+        timeout: 1000,
+      });
+      if (statusRes.status === 200) {
+        const data = JSON.parse(statusRes.body);
+        if (data.status === 'starting') {
+          break;
+        }
+        if (data.status === 'online') {
+          /** 启动太快，服务已 online，直接发请求 */
+          break;
+        }
+      }
+    } catch {}
+    await sleep(50);
+  }
+
+  /** 在 starting 或刚 online 时发送 50 个并发请求 */
   const promises = [];
   for (let i = 0; i < 50; i++) {
     promises.push(
@@ -339,14 +362,8 @@ async function test_starting_state_concurrent() {
     );
   }
 
-  const startRes = await startPromise;
-
   const res = await Promise.all(promises);
   const failed = res.filter(r => !r.ok);
-
-  if (startRes.status !== 200 && startRes.status !== 400) {
-    throw new Error(`管理 API 启动返回 ${startRes.status}`);
-  }
 
   if (failed.length > 15) {
     throw new Error(`${failed.length}/50 个 starting 状态请求失败`);

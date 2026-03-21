@@ -33,7 +33,7 @@ app.ws('/*', {
     console.log('[WS] WebSocket 连接已建立');
 
     // 发送连接确认消息
-    ws.send(JSON.stringify({ type: 'connected', message: 'WebSocket 连接成功' }), true, false);
+    ws.send(JSON.stringify({ type: 'connected', message: 'WebSocket 连接成功' }));
   },
 
   /**
@@ -48,13 +48,13 @@ app.ws('/*', {
 
       if (msg.type === 'ping') {
         // 响应 ping
-        ws.send(JSON.stringify({ type: 'pong' }), true, false);
+        ws.send(JSON.stringify({ type: 'pong' }));
       } else if (msg.type === 'test') {
         // 回显测试消息
-        ws.send(JSON.stringify({ type: 'echo', data: msg.data || 'hello' }), true, false);
+        ws.send(JSON.stringify({ type: 'echo', data: msg.data || 'hello' }));
       } else {
         // 回显所有其他消息
-        ws.send(JSON.stringify({ type: 'echo', original: msg }), true, false);
+        ws.send(JSON.stringify({ type: 'echo', original: msg }));
       }
     } catch (err) {
       console.error('[WS] 解析消息失败:', err);
