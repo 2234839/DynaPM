@@ -647,7 +647,7 @@ export class Gateway {
           if (state.aborted) return;
           res.writeStatus(`${statusCode} ${statusMessage}`);
           for (const [key, value] of Object.entries(proxyRes.headers)) {
-            if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) continue;
+            if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
             if (value) res.writeHeader(key, Array.isArray(value) ? value.join(', ') : value);
           }
           res.end();
@@ -657,12 +657,12 @@ export class Gateway {
         return;
       }
 
-      // 设置响应头
+      // 设置响应头（proxyRes.headers 的 key 已经是小写的，无需 toLowerCase）
       res.cork(() => {
         if (state.aborted) return;
         res.writeStatus(`${statusCode} ${statusMessage}`);
         for (const [key, value] of Object.entries(proxyRes.headers)) {
-          if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) continue;
+          if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
           if (value) res.writeHeader(key, Array.isArray(value) ? value.join(', ') : value);
         }
       });
@@ -876,7 +876,7 @@ export class Gateway {
               res.writeStatus(`${statusCode} ${statusMessage}`);
 
               for (const [key, value] of Object.entries(proxyRes.headers)) {
-                if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) {
+                if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) {
                   continue;
                 }
                 if (value) {
@@ -892,13 +892,13 @@ export class Gateway {
             return;
           }
 
-          // 设置响应头
+          // 设置响应头（proxyRes.headers 的 key 已经是小写的，无需 toLowerCase）
           res.cork(() => {
             if (state.aborted) return;
             res.writeStatus(`${statusCode} ${statusMessage}`);
 
             for (const [key, value] of Object.entries(proxyRes.headers)) {
-              if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) {
+              if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) {
                 continue;
               }
               if (value) {
