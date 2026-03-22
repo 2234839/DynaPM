@@ -20,6 +20,11 @@ interface RouteMapping {
  * 处理所有管理 API 请求
  */
 export class AdminApiHandler {
+  /** 按服务名称索引的服务配置（懒初始化，因为构造时路由表可能尚未填充） */
+  private _serviceMap: Map<string, ServiceConfig> | undefined;
+  /** 按服务名称索引的路由映射（懒初始化） */
+  private _routeMap: Map<string, RouteMapping> | undefined;
+
   constructor(
     private config: DynaPMConfig,
     private logger: Logger,
@@ -27,6 +32,42 @@ export class AdminApiHandler {
     private portRoutes: Map<number, RouteMapping>,
     private serviceManager: ServiceManager
   ) {}
+
+  /** 获取（或首次构建）服务名称索引 */
+  private getServiceMap(): Map<string, ServiceConfig> {
+    if (!this._serviceMap) {
+      const map = new Map<string, ServiceConfig>();
+      for (const mapping of this.hostnameRoutes.values()) {
+        map.set(mapping.service.name, mapping.service);
+      }
+      for (const mapping of this.portRoutes.values()) {
+        if (!map.has(mapping.service.name)) {
+          map.set(mapping.service.name, mapping.service);
+        }
+      }
+      this._serviceMap = map;
+    }
+    return this._serviceMap;
+  }
+
+  /** 获取（或首次构建）路由映射索引 */
+  private getRouteMap(): Map<string, RouteMapping> {
+    if (!this._routeMap) {
+      const map = new Map<string, RouteMapping>();
+      for (const mapping of this.hostnameRoutes.values()) {
+        if (!map.has(mapping.service.name)) {
+          map.set(mapping.service.name, mapping);
+        }
+      }
+      for (const mapping of this.portRoutes.values()) {
+        if (!map.has(mapping.service.name)) {
+          map.set(mapping.service.name, mapping);
+        }
+      }
+      this._routeMap = map;
+    }
+    return this._routeMap;
+  }
 
   /**
    * 检查客户端 IP 是否在允许列表中
@@ -66,13 +107,7 @@ export class AdminApiHandler {
    * 在所有路由表中查找服务
    */
   private findServiceMapping(serviceName: string): RouteMapping | undefined {
-    for (const mapping of this.hostnameRoutes.values()) {
-      if (mapping.service.name === serviceName) return mapping;
-    }
-    for (const mapping of this.portRoutes.values()) {
-      if (mapping.service.name === serviceName) return mapping;
-    }
-    return undefined;
+    return this.getRouteMap().get(serviceName);
   }
 
   /**
@@ -107,21 +142,21 @@ export class AdminApiHandler {
     const url = req.getUrl();
     const method = req.getMethod();
 
-    // 路由分发
-    if (url === '/_dynapm/api/services' && method.toLowerCase() === 'get') {
+    // 路由分发（uWS getMethod() 返回小写方法名，无需 toLowerCase）
+    if (url === '/_dynapm/api/services' && method === 'get') {
       this.getServicesList(res);
-    } else if (url.startsWith('/_dynapm/api/services/') && method.toLowerCase() === 'get') {
+    } else if (url.startsWith('/_dynapm/api/services/') && method === 'get') {
       const serviceName = url.split('/')[4];
       this.getServiceDetail(res, serviceName);
-    } else if (url.endsWith('/stop') && method.toLowerCase() === 'post') {
+    } else if (url.endsWith('/stop') && method === 'post') {
       const parts = url.split('/');
       const serviceName = parts[4];
       this.stopService(res, serviceName);
-    } else if (url.endsWith('/start') && method.toLowerCase() === 'post') {
+    } else if (url.endsWith('/start') && method === 'post') {
       const parts = url.split('/');
       const serviceName = parts[4];
       this.startService(res, serviceName);
-    } else if (url === '/_dynapm/api/events' && method.toLowerCase() === 'get') {
+    } else if (url === '/_dynapm/api/events' && method === 'get') {
       this.handleEventStream(res);
     } else {
       res.cork(() => {
@@ -135,20 +170,7 @@ export class AdminApiHandler {
    * 获取服务列表
    */
   private getServicesList(res: HttpResponse): void {
-    // 使用 Set 避免重复服务（一个服务可能有多个路由）
-    const serviceMap = new Map<string, ServiceConfig>();
-
-    // 收集 hostname 路由的服务
-    for (const mapping of this.hostnameRoutes.values()) {
-      serviceMap.set(mapping.service.name, mapping.service);
-    }
-
-    // 收集端口绑定的服务
-    for (const mapping of this.portRoutes.values()) {
-      serviceMap.set(mapping.service.name, mapping.service);
-    }
-
-    const services = Array.from(serviceMap.values()).map((service) => {
+    const services = Array.from(this.getServiceMap().values()).map((service: ServiceConfig) => {
       return {
         name: service.name,
         base: service.base,
@@ -305,15 +327,25 @@ export class AdminApiHandler {
     try {
       service._state!.status = 'starting';
 
-      this.serviceManager.start(service).catch((err: Error) => {
-        this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: err.message });
-        service._state!.status = 'offline';
-      });
+      /** 先等待启动命令执行完成，再检查端口就绪（避免 fire-and-forget 竞态） */
+      await this.serviceManager.start(service);
+
+      /** 预解析 URL，避免循环内重复 new URL() */
+      const targetUrl = new URL(service.base);
+      const targetHost = targetUrl.hostname;
+      const targetPort = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'));
 
       const waitStartTime = Date.now();
       let isReady = false;
       while (Date.now() - waitStartTime < service.startTimeout) {
-        isReady = await checkTcpPort(service.base);
+        isReady = await new Promise<boolean>((resolve) => {
+          const socket = net.createConnection({ host: targetHost, port: targetPort, timeout: 100 }, () => {
+            socket.destroy();
+            resolve(true);
+          });
+          socket.on('error', () => { socket.destroy(); resolve(false); });
+          socket.on('timeout', () => { socket.destroy(); resolve(false); });
+        });
         if (isReady) {
           break;
         }
@@ -373,32 +405,6 @@ export class AdminApiHandler {
       res.end(`event: connected\ndata: {"timestamp":${Date.now()}}\n\n`);
     });
   }
-}
-
-/**
- * 快速检查 TCP 端口是否可用
- */
-function checkTcpPort(url: string): Promise<boolean> {
-  const parsed = new URL(url);
-  const host = parsed.hostname;
-  const port = parseInt(parsed.port || (parsed.protocol === 'https:' ? '443' : '80'));
-
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port, timeout: 100 }, () => {
-      socket.destroy();
-      resolve(true);
-    });
-
-    socket.on('error', () => {
-      socket.destroy();
-      resolve(false);
-    });
-
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve(false);
-    });
-  });
 }
 
 /**

@@ -179,7 +179,7 @@ const config: DynaPMConfig = {
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/serverless-host.ts 4000 >> ${logDir}/serverless.log 2>&1 &`,
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/serverless-host/index.ts 4000 >> ${logDir}/serverless.log 2>&1 &`,
         stop: 'lsof -i:4000 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
         check: 'lsof -i:4000 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },

@@ -43,11 +43,12 @@ export class CommandExecutor {
       });
 
       return { stdout, stderr, exitCode: 0 };
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const obj = error instanceof Error ? error : (typeof error === 'object' && error ? error : {});
       return {
-        stdout: error.stdout || '',
-        stderr: error.stderr || error.message,
-        exitCode: error.code || 1,
+        stdout: 'stdout' in obj ? String(obj.stdout) : '',
+        stderr: 'stderr' in obj ? String(obj.stderr) : (error instanceof Error ? error.message : String(error)),
+        exitCode: 'code' in obj ? Number(obj.code) || 1 : 1,
       };
     }
   }

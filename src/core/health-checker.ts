@@ -1,4 +1,3 @@
-import fetch from 'node-fetch';
 import { CommandExecutor } from './command-executor.js';
 import type { ServiceConfig, HealthCheckConfigInternal } from '../config/types.js';
 import net from 'node:net';
@@ -21,11 +20,16 @@ export class HealthChecker {
       return;
     }
 
+    /** 预解析 URL，避免循环内重复 new URL() */
+    const targetUrl = new URL(service.base);
+    const targetHost = targetUrl.hostname;
+    const targetPort = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'));
+
     const startTime = Date.now();
     const timeout = service.startTimeout;
 
     while (Date.now() - startTime < timeout) {
-      const isHealthy = await this.check(service, healthCheck);
+      const isHealthy = await this.check(service, healthCheck, targetHost, targetPort);
       if (isHealthy) {
         return;
       }
@@ -41,13 +45,15 @@ export class HealthChecker {
    * 执行健康检查
    * @param service - 服务配置
    * @param config - 健康检查配置
+   * @param targetHost - 预解析的目标主机
+   * @param targetPort - 预解析的目标端口
    * @returns 服务是否健康
    */
-  private async check(service: ServiceConfig, config: HealthCheckConfigInternal): Promise<boolean> {
+  private async check(service: ServiceConfig, config: HealthCheckConfigInternal, targetHost: string, targetPort: number): Promise<boolean> {
     try {
       switch (config.type) {
         case 'tcp':
-          return await this.checkTcp(service);
+          return await this.checkTcp(targetHost, targetPort);
 
         case 'http':
           return await this.checkHttp(config, service);
@@ -70,14 +76,11 @@ export class HealthChecker {
 
   /**
    * TCP端口连通性检查（使用socket原生超时）
-   * @param service - 服务配置
+   * @param host - 目标主机
+   * @param port - 目标端口
    * @returns 端口是否可连接
    */
-  private async checkTcp(service: ServiceConfig): Promise<boolean> {
-    const url = new URL(service.base);
-    const host = url.hostname;
-    const port = parseInt(url.port || (url.protocol === 'https:' ? '443' : '80'));
-
+  private async checkTcp(host: string, port: number): Promise<boolean> {
     return new Promise((resolve) => {
       const socket = net.createConnection(
         { host, port, timeout: 200 },

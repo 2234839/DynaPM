@@ -5,6 +5,46 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.15] - 2026-03-22
+
+### 🚀 性能优化
+- **`typeof` 替代 `Array.isArray`**: 响应头转发中 4 处 `Array.isArray(value)` 替换为 `typeof value === 'string'`，V8 内置类型检查比原型链遍历快 41%
+- **`getCaseSensitiveMethod()` 消除热路径 `toUpperCase()`**: uWS `getMethod()` 返回小写方法名，改为直接使用 `getCaseSensitiveMethod()` 获取原始大小写
+- **404 路径提前返回**: `handleRequest` 中 hostname 查找提前到 header 收集之前，404 请求跳过不必要的 CPU 和内存开销
+- **CRLF 快速路径**: 热路径中用 `includes('\r') || includes('\n')` 快速检查跳过正则替换
+- **移除 node-fetch 依赖**: 使用 Node.js 22 内置 `fetch` API
+- **预计算 targetPort**: RouteMapping 中缓存目标端口，避免每次 `parseInt`
+
+### 🔴 Bug 修复
+- **activeConnections 双重递减**: cleanup() 添加 `cleaned` 守卫防止多次触发
+- **代理请求 timeout 未处理**: proxyReq 监听 `timeout` 事件并 `destroy()`
+- **502 vs 504 区分**: 代理请求超时返回 504 Gateway Timeout，连接错误返回 502
+- **startService fire-and-forget 竞态**: `serviceManager.start()` 改为 `await`，避免端口短暂可用时错误标记为 online
+- **WebSocket handler 无条件日志修复**: `open` 回调中的 JSON.stringify 日志添加 `enableWebSocketLog` 守卫
+- **test-startup-recovery 闲置超时测试修复**: 等待时间从 14s 增加到 16s，修复时序敏感测试偶发失败
+
+### ✅ 代码质量
+- **消除所有 `any` 类型**: `test-all.ts`、`test-proxy-comprehensive.ts`、`test-gateway-robustness.ts`、`test-pilot.ts`、`command-executor.ts` 中的 `any` 替换为 `unknown` + `instanceof` 类型守卫
+- **Admin API `method.toLowerCase()` 移除**: uWS `getMethod()` 返回小写方法名，5 处冗余 `toLowerCase()` 已移除
+- **Admin API `findServiceMapping` O(n) → O(1)**: 懒初始化 `serviceName → RouteMapping` 索引 Map
+- **`getServicesList` 消除重复遍历**: 使用预构建的服务名称索引 Map
+- **health-checker.ts 消除循环内 `new URL()`**: 预解析 URL 对象，传入 `host`/`port` 参数
+- **`Buffer.alloc` → `Buffer.allocUnsafe`**: `collectRequestBody` 和 `handleDirectProxy` 中使用 `allocUnsafe` 跳过清零
+
+### 🧪 测试（224 个用例全部通过，22 个测试套件）
+- 新增 test-gateway-resilience.ts: 8 个网关韧性与边界深度测试
+- 新增 test-crlf-fastpath.ts: 11 个 CRLF 安全性验证测试
+- 新增 test-gzip-passthrough.ts: 5 个 Gzip 压缩响应透传测试
+- 新增 test-startservice-race.ts: 6 个 startService 竞态条件测试
+- 新增 test-port-ws-proxy.ts: 10 个端口绑定 WebSocket 代理测试
+- 新增 test-admin-api-deep.ts: 10 个管理 API 深度测试
+- 新增 test-gateway-boundary.ts: 10 个网关边界与安全测试
+- 新增 test-proxy-deep.ts: 10 个代理深度与资源管理测试
+- 新增 test-proxy-edge-paths.ts: 10 个代理边缘路径测试
+- 新增 test-concurrent-post-body.ts: 10 个并发与竞争条件测试
+- 新增 test-proxy-supplementary.ts: 10 个代理场景补充测试
+- 新增 test-ws-concurrent.ts: 10 个 WebSocket 并发与稳定性测试
+
 ## [1.0.14] - 2026-03-20
 
 ### 🔴 Bug 修复

@@ -469,7 +469,7 @@ async function test_admin_api_services() {
   }
 
   // 验证至少有 echo-proxy 服务（纯代理模式应该在线）
-  const echoProxy = data.services.find((s: any) => s.name === 'echo-proxy');
+  const echoProxy = data.services.find((s: { name?: string }) => s.name === 'echo-proxy');
   if (!echoProxy) {
     throw new Error('找不到 echo-proxy 服务');
   }

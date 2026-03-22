@@ -97,16 +97,36 @@ async function ensureEchoOnline(): Promise<void> {
  */
 async function ensureEchoOffline(): Promise<void> {
   if (!await checkPort(3099)) {
-    /** 后端已离线，但网关状态可能还是 online，发一个请求触发状态重置 */
+    /**
+     * 后端已离线。如果网关状态是 online，需要发一个请求让网关发现 ECONNREFUSED
+     * 并重置为 offline。但如果网关状态已经是 offline，发请求会触发按需启动！
+     * 所以先通过 admin API 检查状态，只有 online/stopping 时才发请求重置。
+     */
     try {
-      await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 5000 });
-    } catch {}
-    await sleep(200);
+      const statusRes = await httpRequest({
+        port: 3091,
+        path: '/_dynapm/api/services/echo-host',
+        timeout: 3000,
+      });
+      if (statusRes.status === 200) {
+        const data = JSON.parse(statusRes.body);
+        const svc = data.services?.[0] || data;
+        if (svc.status === 'online' || svc.status === 'stopping') {
+          /** 网关认为服务在线，发请求触发 ECONNREFUSED → 重置 offline */
+          try {
+            await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 5000 });
+          } catch {}
+          await sleep(200);
+        }
+      }
+    } catch {
+      /** admin API 不可用，保守地不发请求（避免触发按需启动） */
+    }
     return;
   }
   await killPort(3099);
   await sleep(300);
-  /** 发一个请求让网关发现后端不可达，重置为 offline */
+  /** 后端刚被杀，网关状态可能还是 online，发请求触发重置 */
   try {
     await httpRequest({ hostname: 'echo-host.test', path: '/echo', timeout: 5000 });
   } catch {}
@@ -257,9 +277,9 @@ async function test_rapid_start_stop_cycle() {
       throw new Error(`第 ${cycle + 1} 轮参数不匹配`);
     }
 
-    /** 等待闲置超时（10s）+ 3s buffer */
+    /** 等待闲置超时（10s）+ 检查间隔（3s）+ 停止执行 buffer（3s） */
     log(`    第 ${cycle + 1} 轮完成，等待闲置超时...`, C.yellow);
-    await sleep(14000);
+    await sleep(16000);
 
     if (await checkPort(3099)) {
       throw new Error(`第 ${cycle + 1} 轮：服务应已闲置停止`);

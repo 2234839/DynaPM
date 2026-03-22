@@ -4,6 +4,7 @@
  */
 
 import uWS from 'uWebSockets.js';
+import { gzipSync } from 'node:zlib';
 
 const PORT = parseInt(process.argv[2] || '3099');
 
@@ -75,6 +76,8 @@ function handleRequest(res: uWS.HttpResponse, method: string, url: string, query
     handleCustomResponse(res, params);
   } else if (url === '/no-content') {
     handleNoContent(res);
+  } else if (url === '/gzip') {
+    handleGzip(res);
   } else {
     handleDefault(res, method, url);
   }
@@ -281,6 +284,19 @@ function handleNoContent(res: uWS.HttpResponse) {
   res.cork(() => {
     res.writeStatus('204 No Content');
     res.end();
+  });
+}
+
+/** Gzip 压缩响应端点 — 返回 gzip 编码的 JSON 数据 */
+function handleGzip(res: uWS.HttpResponse) {
+  const payload = JSON.stringify({ message: 'gzip compressed', data: 'x'.repeat(1000) });
+  const compressed = gzipSync(Buffer.from(payload));
+
+  res.cork(() => {
+    res.writeStatus('200 OK');
+    res.writeHeader('Content-Type', 'application/json');
+    res.writeHeader('Content-Encoding', 'gzip');
+    res.end(compressed);
   });
 }
 

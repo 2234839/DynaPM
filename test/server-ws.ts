@@ -77,9 +77,10 @@ app.any('/*', (res, req) => {
   res.end('WebSocket Server - Use WebSocket protocol');
 });
 
-app.listen('127.0.0.1', 3011, (token) => {
+const wsPort = parseInt(process.argv[2] || '3011');
+app.listen('127.0.0.1', wsPort, (token) => {
   if (token) {
-    console.log('[ws-server] WebSocket 测试服务器已启动: ws://127.0.0.1:3011');
+    console.log(`[ws-server] WebSocket 测试服务器已启动: ws://127.0.0.1:${wsPort}`);
   } else {
     console.log('[ws-server] WebSocket 测试服务器启动失败');
   }

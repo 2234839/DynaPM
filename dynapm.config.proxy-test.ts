@@ -80,7 +80,7 @@ const config: DynaPMConfig = {
       },
     },
 
-    /** WebSocket 测试服务 */
+    /** WebSocket 测试服务（hostname 路由） */
     'ws-test': {
       name: 'ws-test',
       host: 'ws-proxy.test',
@@ -92,6 +92,25 @@ const config: DynaPMConfig = {
         start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-ws.ts >> ${logDir}/ws-test.log 2>&1 &`,
         stop: 'lsof -i:3011 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
         check: 'lsof -i:3011 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
+      },
+
+      healthCheck: {
+        type: 'tcp',
+      },
+    },
+
+    /** WebSocket 测试服务（端口路由，独立后端 3012） */
+    'ws-port-test': {
+      name: 'ws-port-test',
+      port: 3093,
+      base: 'http://127.0.0.1:3012',
+      idleTimeout: 10 * 1000,
+      startTimeout: 10 * 1000,
+
+      commands: {
+        start: `nohup node --experimental-strip-types ${process.cwd()}/test/server-ws.ts 3012 >> ${logDir}/ws-port-test.log 2>&1 &`,
+        stop: 'lsof -i:3012 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
+        check: 'lsof -i:3012 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
 
       healthCheck: {

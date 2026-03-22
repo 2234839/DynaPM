@@ -179,7 +179,7 @@ async function test_admin_api_list_all_services() {
   const data = JSON.parse(res.body);
   if (!data.services || !Array.isArray(data.services)) throw new Error('服务列表格式不正确');
 
-  const names = data.services.map((s: any) => s.name);
+  const names = data.services.map((s: { name?: string }) => s.name);
   const expected = ['echo-host', 'echo-proxy', 'sse-test', 'ws-test'];
   for (const name of expected) {
     if (!names.includes(name)) {

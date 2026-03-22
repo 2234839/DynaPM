@@ -186,7 +186,7 @@ async function test_admin_list_services() {
     throw new Error('服务列表格式不正确');
   }
 
-  const names = data.services.map((s: any) => s.name);
+  const names = data.services.map((s: { name?: string }) => s.name);
   const expected = ['app1', 'app2', 'app3', 'sse-server', 'ws-server', 'stream-test', 'serverless-host', 'dynapm-admin'];
   for (const name of expected) {
     if (!names.includes(name)) {

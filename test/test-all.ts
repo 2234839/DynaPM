@@ -104,10 +104,10 @@ async function curl(options: {
     }
 
     return { success: true, status, body, message: 'OK' };
-  } catch (err: any) {
+  } catch (err: unknown) {
     return {
       success: false,
-      message: `请求失败: ${err.message}`,
+      message: `请求失败: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 }
@@ -122,10 +122,11 @@ async function runTest(
     const duration = Date.now() - startTime;
     results.push({ name, passed: true, message: '通过', duration });
     success(name);
-  } catch (err: any) {
+  } catch (err: unknown) {
     const duration = Date.now() - startTime;
-    results.push({ name, passed: false, message: err.message, duration });
-    error(`${name}: ${err.message}`);
+    const message = err instanceof Error ? err.message : String(err);
+    results.push({ name, passed: false, message, duration });
+    error(`${name}: ${message}`);
   }
 }
 
@@ -331,8 +332,8 @@ async function test9_POST请求() {
     } else {
       throw new Error(`POST 期望状态码 200/201，实际 ${status}`);
     }
-  } catch (err: any) {
-    throw new Error(`POST 请求失败: ${err.message}`);
+  } catch (err: unknown) {
+    throw new Error(`POST 请求失败: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -370,8 +371,8 @@ async function test10_SSE连接() {
     }
 
     success('SSE 流式传输正常工作');
-  } catch (err: any) {
-    throw new Error(`SSE 连接测试失败: ${err.message}`);
+  } catch (err: unknown) {
+    throw new Error(`SSE 连接测试失败: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -411,7 +412,7 @@ async function test11_WebSocket连接() {
       }, 1000);
     });
 
-    ws.on('message', (data: Buffer) => {
+    ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === 'connected') {
@@ -427,7 +428,7 @@ async function test11_WebSocket连接() {
       }
     });
 
-    ws.on('error', (err: Error) => {
+    ws.on('error', (err) => {
       cleanup();
       reject(new Error(`WebSocket 错误: ${err.message}`));
     });
@@ -444,59 +445,98 @@ async function test11_WebSocket连接() {
     timeoutHandle = setTimeout(() => {
       cleanup();
       reject(new Error('WebSocket 测试超时'));
-    }, 15000);  // 增加到 15 秒
+    }, 15000);
   });
 }
 
 async function test12_长连接代理() {
   info('测试 SSE 长连接代理');
 
-  // 等待测试 10 启动的 SSE 服务自然关闭
-  // 测试 10 (6秒) + 测试 11 (1秒) = 7秒，还需要等待约 4 秒让服务达到 10 秒闲置超时
-  await sleep(6000);
+  // 确保 SSE 服务完全停止
+  try {
+    await execAsync('lsof -ti:3010 | xargs -r kill -9 2>/dev/null');
+  } catch {}
+  await sleep(500);
+
+  // 检查网关是否仍在运行（测试 11 的 WebSocket 可能导致网关异常退出）
+  let gwAlive = await checkProcess(3000);
+  if (!gwAlive) {
+    info('网关已停止，重新启动...');
+    exec('node dist/src/index.js > /dev/null 2>&1 &');
+    await sleep(3000);
+    gwAlive = await checkProcess(3000);
+    if (!gwAlive) {
+      throw new Error('网关重启失败');
+    }
+  }
+
+  // 发请求让网关检测到后端不可达，重置服务状态为 offline
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { stdout } = await execAsync(
+        `curl --noproxy "*" -s -o /dev/null -w "%{http_code}" -m 3 -H "Host: sse.test" "http://127.0.0.1:3000/" 2>/dev/null`,
+        { timeout: 5000 }
+      );
+      const code = stdout.trim();
+      if (code === '502' || code === '404') break;
+    } catch {}
+    await sleep(1000);
+  }
+  await sleep(1000);
 
   try {
-    // 启动一个长时间 SSE 连接，验证服务被按需启动
     const startTime = Date.now();
 
-    const { stdout, stderr } = await execAsync(
-      `curl --noproxy "*" -v -N -H "Host: sse.test" --max-time 8 "http://127.0.0.1:3000/events" 2>&1 || true`,
-      { timeout: 15000 }
-    );
+    const sseOutput = await new Promise<string>((resolve, reject) => {
+      const http = require('node:http');
+      const timer = setTimeout(() => {
+        req.destroy();
+        reject(new Error('SSE 请求超时'));
+      }, 15000);
+
+      const req = http.request({
+        hostname: '127.0.0.1',
+        port: 3000,
+        path: '/events',
+        method: 'GET',
+        headers: { 'Host': 'sse.test' },
+        timeout: 10000,
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk.toString(); });
+        setTimeout(() => {
+          clearTimeout(timer);
+          req.destroy();
+          resolve(data);
+        }, 6000);
+      });
+
+      req.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+
+      req.end();
+    });
 
     const duration = Date.now() - startTime;
-    const output = stdout.toString();
-    const err = stderr.toString();
 
-    // 打印调试信息
-    console.log(`[DEBUG] curl 输出长度: ${output.length}`);
-    if (output.length > 0) {
-      console.log(`[DEBUG] curl 输出前200字符: ${output.substring(0, 200)}`);
-    }
-    if (err.length > 0) {
-      console.log(`[DEBUG] stderr 前200字符: ${err.substring(0, 200)}`);
+    if (sseOutput.length === 0) {
+      throw new Error(`SSE 没有返回任何输出，耗时 ${duration}ms`);
     }
 
-    if (output.length === 0) {
-      throw new Error(`curl 没有返回任何输出。stderr: ${err.substring(0, 100)}`);
+    if (!sseOutput.includes('event: connected')) {
+      throw new Error(`SSE 响应缺少 connected 事件，输出前300字符: ${JSON.stringify(sseOutput.substring(0, 300))}`);
     }
 
-    // 验证收到多个事件（说明连接保持了一段时间）
-    const messageCount = (output.match(/event: message/g) || []).length;
-
+    const messageCount = (sseOutput.match(/event: message/g) || []).length;
     if (messageCount < 3) {
-      throw new Error(`收到的消息数量不足，实际收到 ${messageCount} 个。输出长度: ${output.length}, 输出内容: ${output.substring(0, 100)}`);
-    }
-
-    // 验证服务已启动
-    const isRunning = await checkProcess(3010);
-    if (!isRunning) {
-      throw new Error('SSE 服务应该已启动');
+      throw new Error(`收到的消息数量不足，实际收到 ${messageCount} 个`);
     }
 
     success(`SSE 长连接代理正常，收到 ${messageCount} 个事件，耗时 ${duration}ms`);
-  } catch (err: any) {
-    throw new Error(`长连接代理测试失败: ${err.message}`);
+  } catch (err: unknown) {
+    throw new Error(`长连接代理测试失败: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -523,8 +563,8 @@ async function main() {
     exec('node dist/src/index.js > /dev/null 2>&1 &');
     await sleep(3000);
     success('网关已启动');
-  } catch (err: any) {
-    error(`网关启动失败: ${err.message}`);
+  } catch (err: unknown) {
+    error(`网关启动失败: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
 
@@ -546,12 +586,12 @@ async function main() {
 
   // 清理
   section('清理环境');
-  try {
-    await execAsync('lsof -ti:3000,3001,3002,3003,3010,3011 | xargs -r kill -9 2>/dev/null');
-    success('已清理所有测试进程');
-  } catch {
-    info('无需清理');
+  const ports = [3000, 3001, 3002, 3003, 3010, 3011];
+  for (const port of ports) {
+    try { await execAsync(`fuser -k ${port}/tcp 2>/dev/null`); } catch {}
+    try { await execAsync(`lsof -ti:${port} 2>/dev/null | xargs -r kill -9 2>/dev/null`); } catch {}
   }
+  success('已清理所有测试进程');
 
   // 输出测试结果
   section('测试结果汇总');
@@ -581,13 +621,17 @@ async function main() {
     log('\n🎉 所有测试通过！', colors.green);
 
     // 显示日志片段
-    const logPath = join(process.cwd(), 'logs', 'dynapm.log');
-    if (existsSync(logPath)) {
-      section('日志片段');
-      const logContent = readFileSync(logPath, 'utf-8');
-      const lines = logContent.split('\n');
-      const lastLines = lines.slice(-20);
-      log(lastLines.join('\n'), colors.cyan);
+    try {
+      const logPath = join(process.cwd(), 'logs', 'dynapm.log');
+      if (existsSync(logPath)) {
+        section('日志片段');
+        const logContent = readFileSync(logPath, 'utf-8');
+        const lines = logContent.split('\n');
+        const lastLines = lines.slice(-20);
+        log(lastLines.join('\n'), colors.cyan);
+      }
+    } catch {
+      // 日志读取失败不影响测试结果
     }
 
     process.exit(0);

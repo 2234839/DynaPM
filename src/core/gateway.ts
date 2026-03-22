@@ -27,7 +27,8 @@ function collectRequestBody(res: HttpResponse): Promise<Buffer> {
     res.onData((ab: ArrayBuffer, isLast: boolean) => {
       if (resolved) return;
 
-      const chunk = Buffer.alloc(ab.byteLength);
+      /** allocUnsafe 安全：Buffer.from(ab).copy(chunk) 立即覆盖所有字节 */
+      const chunk = Buffer.allocUnsafe(ab.byteLength);
       Buffer.from(ab).copy(chunk);
       totalSize += chunk.length;
 
@@ -52,28 +53,28 @@ function collectRequestBody(res: HttpResponse): Promise<Buffer> {
   });
 }
 
-/**
- * 获取 HTTP 状态消息
- */
+/** HTTP 状态码消息映射（模块级常量，避免每次请求创建新对象） */
+const HTTP_STATUS_MESSAGES: Readonly<Record<number, string>> = {
+  200: 'OK',
+  201: 'Created',
+  204: 'No Content',
+  301: 'Moved Permanently',
+  302: 'Found',
+  304: 'Not Modified',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  403: 'Forbidden',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  409: 'Conflict',
+  500: 'Internal Server Error',
+  502: 'Bad Gateway',
+  503: 'Service Unavailable',
+};
+
+/** 获取 HTTP 状态消息 */
 function getStatusMessage(statusCode: number): string {
-  const messages: Record<number, string> = {
-    200: 'OK',
-    201: 'Created',
-    204: 'No Content',
-    301: 'Moved Permanently',
-    302: 'Found',
-    304: 'Not Modified',
-    400: 'Bad Request',
-    401: 'Unauthorized',
-    403: 'Forbidden',
-    404: 'Not Found',
-    405: 'Method Not Allowed',
-    409: 'Conflict',
-    500: 'Internal Server Error',
-    502: 'Bad Gateway',
-    503: 'Service Unavailable',
-  };
-  return messages[statusCode] || 'Unknown';
+  return HTTP_STATUS_MESSAGES[statusCode] || 'Unknown';
 }
 
 /** 网关常量 */
@@ -100,12 +101,9 @@ const GatewayConstants = {
 
 /**
  * 快速检查 TCP 端口是否可用
+ * 直接使用 host 和 port 参数，避免每次调用 new URL()
  */
-function checkTcpPort(url: string): Promise<boolean> {
-  const parsed = new URL(url);
-  const host = parsed.hostname;
-  const port = parseInt(parsed.port || (parsed.protocol === 'https:' ? '443' : '80'));
-
+function checkTcpPort(host: string, port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port, timeout: GatewayConstants.TCP_CHECK_TIMEOUT }, () => {
       socket.destroy();
@@ -132,6 +130,8 @@ interface ProxyState {
   aborted: boolean;
   /** 是否已发送响应（防止重复响应） */
   responded: boolean;
+  /** 代理请求是否超时（用于区分 504 vs 502） */
+  timedOut: boolean;
 }
 
 /**
@@ -305,18 +305,20 @@ export class Gateway {
   ): void {
     const service = mapping.service;
     const startTime = Date.now();
-    const method = req.getMethod();
+    const method = req.getCaseSensitiveMethod();
     const url = req.getUrl();
     const queryString = req.getQuery();
-    const fullUrl = queryString ? `${url}?${queryString}` : url;
+    const fullUrl = queryString ? url + '?' + queryString : url;
 
     const headers: Record<string, string> = {};
+    const crlfRegex = GatewayConstants.CRLF_REGEX;
     req.forEach((key: string, value: string) => {
-      const safeValue = value.replace(GatewayConstants.CRLF_REGEX, '');
-      headers[key] = safeValue;
+      headers[key] = (value.includes('\r') || value.includes('\n'))
+        ? value.replace(crlfRegex, '')
+        : value;
     });
 
-    service._state!.lastAccessTime = Date.now();
+    service._state!.lastAccessTime = startTime;
 
     const status = service._state!.status;
 
@@ -354,15 +356,10 @@ export class Gateway {
       const colonIndex = hostHeader.indexOf(':');
       hostname = colonIndex !== -1 ? hostHeader.substring(0, colonIndex) : hostHeader;
     }
-    const method = req.getMethod();
+    const method = req.getCaseSensitiveMethod();
     const url = req.getUrl();
     const queryString = req.getQuery();
     const fullUrl = queryString ? url + '?' + queryString : url;
-
-    const headers: Record<string, string> = {};
-    req.forEach((key: string, value: string) => {
-      headers[key] = value.replace(GatewayConstants.CRLF_REGEX, '');
-    });
 
     const mapping = this.hostnameRoutes.get(hostname);
 
@@ -375,8 +372,17 @@ export class Gateway {
       return;
     }
 
+    const headers: Record<string, string> = {};
+    const crlfRegex = GatewayConstants.CRLF_REGEX;
+    req.forEach((key: string, value: string) => {
+      /** 快速路径：正常请求无 CRLF 字符，用 indexOf 跳过正则替换 */
+      headers[key] = (value.includes('\r') || value.includes('\n'))
+        ? value.replace(crlfRegex, '')
+        : value;
+    });
+
     const service = mapping.service;
-    service._state!.lastAccessTime = Date.now();
+    service._state!.lastAccessTime = startTime;
 
     const status = service._state!.status;
 
@@ -437,8 +443,10 @@ export class Gateway {
 
       const waitStartTime = Date.now();
       let isReady = false;
+      const targetHost = mapping.targetUrl!.hostname;
+      const targetPort = mapping.targetPort;
       while (Date.now() - waitStartTime < service.startTimeout) {
-        isReady = await checkTcpPort(target);
+        isReady = await checkTcpPort(targetHost, targetPort);
         if (isReady) {
           const waitDuration = Date.now() - waitStartTime;
           this.logger.info({
@@ -598,17 +606,18 @@ export class Gateway {
     const service = mapping.service;
     const targetUrl = mapping.targetUrl!;
 
-    // 构建代理请求头
+    // 构建代理请求头（uWS forEach 的 key 已经是小写，无需 toLowerCase）
     const proxyHeaders: Record<string, string> = {};
+    const skipHeaders = GatewayConstants.SKIP_REQUEST_HEADERS;
     for (const key in headers) {
-      if (GatewayConstants.SKIP_REQUEST_HEADERS.has(key.toLowerCase())) {
+      if (skipHeaders.has(key)) {
         continue;
       }
       proxyHeaders[key] = headers[key];
     }
     proxyHeaders['host'] = targetUrl.host;
 
-    const state: ProxyState = { aborted: false, responded: false };
+    const state: ProxyState = { aborted: false, responded: false, timedOut: false };
     service._state!.activeConnections++;
 
     let cleaned = false;
@@ -628,7 +637,7 @@ export class Gateway {
       hostname: targetUrl.hostname,
       port: mapping.targetPort,
       path: fullUrl,
-      method: method.toUpperCase(),
+      method,
       headers: proxyHeaders,
       timeout: 30000,
     }, (proxyRes) => {
@@ -646,9 +655,10 @@ export class Gateway {
         res.cork(() => {
           if (state.aborted) return;
           res.writeStatus(`${statusCode} ${statusMessage}`);
-          for (const [key, value] of Object.entries(proxyRes.headers)) {
+          for (const key in proxyRes.headers) {
             if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
-            if (value) res.writeHeader(key, Array.isArray(value) ? value.join(', ') : value);
+            const value = proxyRes.headers[key];
+            if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
           }
           res.end();
           state.responded = true;
@@ -661,9 +671,10 @@ export class Gateway {
       res.cork(() => {
         if (state.aborted) return;
         res.writeStatus(`${statusCode} ${statusMessage}`);
-        for (const [key, value] of Object.entries(proxyRes.headers)) {
+        for (const key in proxyRes.headers) {
           if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
-          if (value) res.writeHeader(key, Array.isArray(value) ? value.join(', ') : value);
+          const value = proxyRes.headers[key];
+          if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
         }
       });
 
@@ -746,8 +757,13 @@ export class Gateway {
       if (!state.responded) {
         state.responded = true;
         res.cork(() => {
-          res.writeStatus('502 Bad Gateway');
-          res.end('Bad Gateway');
+          if (state.timedOut) {
+            res.writeStatus('504 Gateway Timeout');
+            res.end('Gateway Timeout');
+          } else {
+            res.writeStatus('502 Bad Gateway');
+            res.end('Bad Gateway');
+          }
         });
       }
       /** 后端不可达时，将非 proxyOnly 服务状态重置为 offline，允许后续按需启动 */
@@ -758,9 +774,10 @@ export class Gateway {
       cleanup();
     });
 
-    /** 代理请求超时处理：销毁连接并返回 504 */
+    /** 代理请求超时处理：设置标志后销毁连接，error handler 据此返回 504 */
     proxyReq.on('timeout', () => {
       this.logger.error({ msg: `⏱️ [${service.name}] 代理请求超时` });
+      state.timedOut = true;
       proxyReq.destroy();
     });
 
@@ -771,8 +788,8 @@ export class Gateway {
         return;
       }
 
-      /** uWS 的 ArrayBuffer 是借用语义，必须复制数据 */
-      const chunk = Buffer.alloc(ab.byteLength);
+      /** uWS 的 ArrayBuffer 是借用语义，必须复制数据（allocUnsafe 安全：copy 立即覆盖所有字节） */
+      const chunk = Buffer.allocUnsafe(ab.byteLength);
       Buffer.from(ab).copy(chunk);
 
       if (isLast) {
@@ -804,10 +821,11 @@ export class Gateway {
     const perfPrepStart = perfLog ? performance.now() : 0;
     const targetUrl = mapping.targetUrl!;
 
-    // 构建代理请求头
+    // 构建代理请求头（uWS forEach 的 key 已经是小写，无需 toLowerCase）
     const proxyHeaders: Record<string, string> = {};
+    const skipHeaders = GatewayConstants.SKIP_REQUEST_HEADERS;
     for (const key in headers) {
-      if (GatewayConstants.SKIP_REQUEST_HEADERS.has(key.toLowerCase())) {
+      if (skipHeaders.has(key)) {
         continue;
       }
       proxyHeaders[key] = headers[key];
@@ -821,7 +839,7 @@ export class Gateway {
 
     const perfPrepTime = perfLog ? performance.now() - perfPrepStart : 0;
 
-    const state: ProxyState = { aborted: false, responded: false };
+    const state: ProxyState = { aborted: false, responded: false, timedOut: false };
     service._state!.activeConnections++;
 
     let cleaned = false;
@@ -850,7 +868,7 @@ export class Gateway {
           hostname: targetUrl.hostname,
           port: mapping.targetPort,
           path,
-          method: method.toUpperCase(),
+          method,
           headers: proxyHeaders,
           timeout: 30000,
         }, (proxyRes) => {
@@ -875,12 +893,13 @@ export class Gateway {
               if (state.aborted) return;
               res.writeStatus(`${statusCode} ${statusMessage}`);
 
-              for (const [key, value] of Object.entries(proxyRes.headers)) {
+              for (const key in proxyRes.headers) {
                 if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) {
                   continue;
                 }
+                const value = proxyRes.headers[key];
                 if (value) {
-                  res.writeHeader(key, Array.isArray(value) ? value.join(', ') : value);
+                  res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
                 }
               }
               res.end();
@@ -897,12 +916,13 @@ export class Gateway {
             if (state.aborted) return;
             res.writeStatus(`${statusCode} ${statusMessage}`);
 
-            for (const [key, value] of Object.entries(proxyRes.headers)) {
+            for (const key in proxyRes.headers) {
               if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) {
                 continue;
               }
+              const value = proxyRes.headers[key];
               if (value) {
-                res.writeHeader(key, Array.isArray(value) ? value.join(', ') : value);
+                res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
               }
             }
           });
@@ -1016,17 +1036,23 @@ export class Gateway {
           if (!state.responded) {
             state.responded = true;
             res.cork(() => {
-              res.writeStatus('502 Bad Gateway');
-              res.end('Bad Gateway');
+              if (state.timedOut) {
+                res.writeStatus('504 Gateway Timeout');
+                res.end('Gateway Timeout');
+              } else {
+                res.writeStatus('502 Bad Gateway');
+                res.end('Bad Gateway');
+              }
             });
           }
           cleanup();
           reject(err);
         });
 
-        /** 代理请求超时处理：销毁连接触发 error → 502 */
+        /** 代理请求超时处理：设置标志后销毁连接，error handler 据此返回 504 */
         proxyReq.on('timeout', () => {
           this.logger.error({ msg: `⏱️ [${service.name}] 代理请求超时` });
+          state.timedOut = true;
           proxyReq.destroy();
         });
 
@@ -1127,6 +1153,7 @@ export class Gateway {
         (async () => {
           try {
             const needsStart = service._state!.status === 'offline';
+            const targetUrl = new URL(target);
 
             if (needsStart) {
               this.logger.info({ msg: `🚀 [${service.name}] WebSocket - 启动服务...` });
@@ -1137,7 +1164,7 @@ export class Gateway {
               const waitStartTime = Date.now();
               let isReady = false;
               while (Date.now() - waitStartTime < service.startTimeout) {
-                isReady = await checkTcpPort(target);
+                isReady = await checkTcpPort(targetUrl.hostname, parseInt(targetUrl.port || '80'));
                 if (isReady) {
                   const waitDuration = Date.now() - waitStartTime;
                   this.logger.info({
@@ -1160,7 +1187,6 @@ export class Gateway {
               service._state!.startCount++;
             }
 
-            const targetUrl = new URL(target);
             const wsUserData = ws.getUserData();
             const clientPath = wsUserData.clientPath as string;
             const clientHeaders = wsUserData.clientHeaders as Record<string, string>;
@@ -1173,18 +1199,20 @@ export class Gateway {
             const backendHeaders: Record<string, string> = {};
             const skipHeaders = GatewayConstants.WS_SKIP_HEADERS;
 
-            for (const [key, value] of Object.entries(clientHeaders)) {
-              if (!skipHeaders.has(key.toLowerCase())) {
-                backendHeaders[key] = value;
+            for (const key in clientHeaders) {
+              if (!skipHeaders.has(key)) {
+                backendHeaders[key] = clientHeaders[key];
               }
             }
 
             backendHeaders['Host'] = targetUrl.host;
 
-            this.logger.info({
-              msg: `🔌 [${service.name}] 转发 WebSocket 请求头`,
-              headers: JSON.stringify(backendHeaders, null, 2)
-            });
+            if (this.logging.enableWebSocketLog) {
+              this.logger.info({
+                msg: `🔌 [${service.name}] 转发 WebSocket 请求头`,
+                headers: JSON.stringify(backendHeaders, null, 2)
+              });
+            }
 
             const backendWs = new WS(wsUrl, {
               headers: backendHeaders,
@@ -1422,6 +1450,7 @@ export class Gateway {
         (async () => {
           try {
             const needsStart = svc._state!.status === 'offline';
+            const targetUrl = new URL(backendTarget);
 
             if (needsStart) {
               this.logger.info({ msg: `🚀 [${svc.name}] 端口${portNum} WebSocket - 启动服务...` });
@@ -1432,7 +1461,7 @@ export class Gateway {
               const waitStartTime = Date.now();
               let isReady = false;
               while (Date.now() - waitStartTime < svc.startTimeout) {
-                isReady = await checkTcpPort(backendTarget);
+                isReady = await checkTcpPort(targetUrl.hostname, parseInt(targetUrl.port || '80'));
                 if (isReady) {
                   const waitDuration = Date.now() - waitStartTime;
                   this.logger.info({
@@ -1455,7 +1484,6 @@ export class Gateway {
               svc._state!.startCount++;
             }
 
-            const targetUrl = new URL(backendTarget);
             const wsUserData = ws.getUserData();
             const clientPath = wsUserData.clientPath as string;
             const clientHeaders = wsUserData.clientHeaders as Record<string, string>;
@@ -1468,9 +1496,9 @@ export class Gateway {
             const backendHeaders: Record<string, string> = {};
             const skipHeaders = GatewayConstants.WS_SKIP_HEADERS;
 
-            for (const [key, value] of Object.entries(clientHeaders)) {
-              if (!skipHeaders.has(key.toLowerCase())) {
-                backendHeaders[key] = value;
+            for (const key in clientHeaders) {
+              if (!skipHeaders.has(key)) {
+                backendHeaders[key] = clientHeaders[key];
               }
             }
 
