@@ -187,7 +187,7 @@ async function test_admin_list_services() {
   }
 
   const names = data.services.map((s: { name?: string }) => s.name);
-  const expected = ['app1', 'app2', 'app3', 'sse-server', 'ws-server', 'stream-test', 'serverless-host', 'dynapm-admin'];
+  const expected = ['app1', 'app2', 'app3', 'sse-server', 'ws-server', 'stream-test', 'dynapm-admin'];
   for (const name of expected) {
     if (!names.includes(name)) {
       throw new Error(`缺少服务: ${name}`);

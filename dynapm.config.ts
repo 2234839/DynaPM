@@ -17,7 +17,7 @@ const config: DynaPMConfig = {
   // 管理 API 配置
   adminApi: {
     enabled: true,
-    port: 4000,
+    port: 4100,
   },
 
   // 日志配置（生产环境建议关闭以提升性能）
@@ -166,26 +166,6 @@ const config: DynaPMConfig = {
         start: 'echo "proxy only - no start command"',
         stop: 'echo "proxy only - no stop command"',
         check: 'echo "proxy only - no check command"',
-      },
-    },
-
-    // Serverless Host 演示服务
-    // 访问地址: http://127.0.0.1:4001 （Web 管理界面）
-    'serverless-host': {
-      name: 'serverless-host',
-      host: 'serverless.test',
-      base: 'http://127.0.0.1:4000',
-      idleTimeout: 10 * 60 * 1000,
-      startTimeout: 10 * 1000,
-
-      commands: {
-        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/serverless-host/index.ts 4000 >> ${logDir}/serverless.log 2>&1 &`,
-        stop: 'lsof -i:4000 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
-        check: 'lsof -i:4000 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
-      },
-
-      healthCheck: {
-        type: 'tcp',
       },
     },
   },
