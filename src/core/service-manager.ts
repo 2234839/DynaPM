@@ -1,5 +1,44 @@
 import { CommandExecutor } from './command-executor.js';
+import net from 'node:net';
 import type { ServiceConfig } from '../config/types.js';
+
+/** TCP 端口探测超时（毫秒） */
+const TCP_PROBE_TIMEOUT = 100;
+
+/**
+ * 快速探测 TCP 端口是否可连接
+ */
+function probeTcpPort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port, timeout: TCP_PROBE_TIMEOUT }, () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.on('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
+/**
+ * 从服务配置解析出目标端口（base 为 http(s) URL 时可解析）
+ * 无法解析时返回 undefined，调用方回退到 check 命令
+ */
+function resolveServicePort(service: ServiceConfig): number | undefined {
+  const base = service.base;
+  if (!base) return undefined;
+  const match = /^https?:\/\/[^/:]+:(\d+)/.exec(base);
+  if (match) return parseInt(match[1]);
+  /** 无显式端口：http=80 / https=443 */
+  if (/^https:\/\//.test(base)) return 443;
+  if (/^http:\/\//.test(base)) return 80;
+  return undefined;
+}
 
 /**
  * 服务管理器
@@ -12,10 +51,17 @@ export class ServiceManager {
 
   /**
    * 检查服务是否运行中
+   * 端口可解析时优先用 TCP 探测短路（省一次 shell fork，约 3-10ms），
+   * 端口通直接返回 true；端口不通或不可解析时回退执行 check 命令兜底
+   * （check 可能携带非端口语义，如进程/文件检查）
    * @param service - 服务配置
    * @returns 服务是否运行中
    */
   async isRunning(service: ServiceConfig): Promise<boolean> {
+    const port = resolveServicePort(service);
+    if (port !== undefined && (await probeTcpPort(port))) {
+      return true;
+    }
     const result = await this.executor.check(service.commands.check, {
       cwd: service.commands.cwd,
       env: service.commands.env,
@@ -95,6 +141,8 @@ export class ServiceManager {
     const result = await this.executor.execute(service.commands.stop, {
       cwd: service.commands.cwd,
       env: service.commands.env,
+      /** 停止命令超时兜底（可配置注入）：挂起的 stop 命令不应阻塞整个停止流程 */
+      timeout: service._timeouts?.stopTimeoutMs,
     });
 
     if (result.exitCode !== 0) {

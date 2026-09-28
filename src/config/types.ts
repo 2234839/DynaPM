@@ -72,6 +72,8 @@ export interface ServiceConfig {
 
   /** 运行时状态（内部使用） */
   _state?: ServiceState;
+  /** 全局超时配置（内部使用，loader 填充） */
+  _timeouts?: TimeoutsConfig;
 }
 
 /** 服务运行状态 */
@@ -103,6 +105,16 @@ export interface AdminApiConfig {
   allowedIps?: string[];
 }
 
+/** 超时配置（可注入，未配置时使用默认值） */
+export interface TimeoutsConfig {
+  /** 等待服务停止完成的超时上限（毫秒，默认 30000） */
+  stopWaitMs?: number;
+  /** 停止命令执行超时（毫秒，默认 30000）；防止 stop 命令挂起导致服务永远卡在 stopping */
+  stopTimeoutMs?: number;
+  /** 代理请求超时（毫秒，后端无响应即 504，默认 30000） */
+  proxyTimeoutMs?: number;
+}
+
 /** 日志配置 */
 export interface LoggingConfig {
   /** 是否启用请求日志（每个请求响应记录） */
@@ -125,6 +137,8 @@ export interface DynaPMConfig {
   services: Record<string, ServiceConfig>;
   /** 管理 API 配置 */
   adminApi?: AdminApiConfig;
+  /** 超时配置 */
+  timeouts?: TimeoutsConfig;
   /** 日志配置 */
   logging?: LoggingConfig;
 }

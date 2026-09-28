@@ -20,10 +20,24 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
       adminApi: {
         enabled: true,
         port: 4000,
-        allowedIps: ['127.0.0.1', '::1'],
+        /** 注意：allowedIps 不放这里——c12 会把默认值数组合并进用户配置，
+         *  导致用户显式白名单被追加 127.0.0.1/::1 而失效。
+         *  默认值改为下方代码兜底。 */
       },
     },
   });
+
+  /** timeouts 默认值兜底：与硬编码默认值一致，保证向后兼容 */
+  config.timeouts = config.timeouts ?? {};
+  config.timeouts.stopWaitMs = config.timeouts.stopWaitMs || 30 * 1000;
+  config.timeouts.stopTimeoutMs = config.timeouts.stopTimeoutMs || 30 * 1000;
+  config.timeouts.proxyTimeoutMs = config.timeouts.proxyTimeoutMs || 30 * 1000;
+
+  /** adminApi 白名单兜底：仅在用户未配置时使用（精确语义，用户配置的列表不追加） */
+  config.adminApi = config.adminApi ?? {};
+  if (!config.adminApi.allowedIps) {
+    config.adminApi.allowedIps = ['127.0.0.1', '::1'];
+  }
 
   // 宽松验证：至少需要一个服务
   if (!config.services || Object.keys(config.services).length === 0) {
@@ -47,6 +61,8 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
     // 设置默认超时
     service.idleTimeout = service.idleTimeout || 5 * 60 * 1000; // 5分钟
     service.startTimeout = service.startTimeout || 30 * 1000; // 30秒
+    /** 注入全局超时配置（stopTimeoutMs 等供 service-manager 消费） */
+    service._timeouts = config.timeouts;
 
     // 默认使用TCP端口连通性检查（无需服务修改代码）
     service.healthCheck = service.healthCheck || { type: 'tcp' };

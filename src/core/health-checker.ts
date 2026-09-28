@@ -2,12 +2,50 @@ import { CommandExecutor } from './command-executor.js';
 import type { ServiceConfig, HealthCheckConfigInternal } from '../config/types.js';
 import net from 'node:net';
 
+/** TCP 端口检查超时（毫秒），与网关原有快速失败语义一致 */
+const TCP_CHECK_TIMEOUT = 100;
+
+/**
+ * 快速检查 TCP 端口是否可用
+ * 使用原生 socket 超时快速失败，供网关就绪等待循环高频调用
+ */
+export function checkTcpPort(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port, timeout: TCP_CHECK_TIMEOUT }, () => {
+      socket.destroy();
+      resolve(true);
+    });
+
+    socket.on('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
 /**
  * 健康检查器
  * 支持TCP端口、HTTP和自定义命令三种检查方式
  */
 export class HealthChecker {
   private executor = new CommandExecutor();
+
+  /**
+   * 对指定目标执行单次健康检查（按服务 healthCheck.type 分派，默认 tcp）
+   * 默认 tcp 分支与网关原有裸 TCP 轮询实现完全一致（100ms socket 超时、无 sleep），保证冷启动性能不回退
+   */
+  async checkTarget(service: ServiceConfig, targetHost: string, targetPort: number): Promise<boolean> {
+    const healthCheck = service.healthCheck;
+    if (!healthCheck || healthCheck.type === 'none' || healthCheck.type === 'tcp') {
+      return checkTcpPort(targetHost, targetPort);
+    }
+    return this.check(service, healthCheck, targetHost, targetPort);
+  }
 
   /**
    * 等待服务健康（快速轮询）
@@ -53,7 +91,7 @@ export class HealthChecker {
     try {
       switch (config.type) {
         case 'tcp':
-          return await this.checkTcp(targetHost, targetPort);
+          return await checkTcpPort(targetHost, targetPort);
 
         case 'http':
           return await this.checkHttp(config, service);
@@ -72,34 +110,6 @@ export class HealthChecker {
     } catch (error) {
       return false;
     }
-  }
-
-  /**
-   * TCP端口连通性检查（使用socket原生超时）
-   * @param host - 目标主机
-   * @param port - 目标端口
-   * @returns 端口是否可连接
-   */
-  private async checkTcp(host: string, port: number): Promise<boolean> {
-    return new Promise((resolve) => {
-      const socket = net.createConnection(
-        { host, port, timeout: 200 },
-        () => {
-          socket.destroy();
-          resolve(true);
-        }
-      );
-
-      socket.on('error', () => {
-        socket.destroy();
-        resolve(false);
-      });
-
-      socket.on('timeout', () => {
-        socket.destroy();
-        resolve(false);
-      });
-    });
   }
 
   /**

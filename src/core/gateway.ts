@@ -8,6 +8,7 @@ import { URL } from 'node:url';
 import http from 'node:http';
 import WS from 'ws';
 import { AdminApiHandler } from './admin-api.js';
+import { checkTcpPort, HealthChecker } from './health-checker.js';
 import { formatTime } from '../utils/format.js';
 
 /**
@@ -18,7 +19,7 @@ import { formatTime } from '../utils/format.js';
  * 重要：uWS 的 onData 回调中的 ArrayBuffer 是借用的，
  * 回调返回后会被回收，必须在回调内复制数据。
  */
-function collectRequestBody(res: HttpResponse): Promise<Buffer> {
+function collectRequestBody(res: HttpResponse): Promise<Buffer | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let totalSize = 0;
@@ -34,7 +35,12 @@ function collectRequestBody(res: HttpResponse): Promise<Buffer> {
 
       if (totalSize > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
         resolved = true;
-        resolve(Buffer.concat(chunks));
+        /** 超限：返回 413 并结束响应，返回 null 表示不转发 */
+        res.cork(() => {
+          res.writeStatus('413 Payload Too Large');
+          res.end('Payload Too Large');
+        });
+        resolve(null);
         return;
       }
 
@@ -100,29 +106,6 @@ const GatewayConstants = {
 } as const;
 
 /**
- * 快速检查 TCP 端口是否可用
- * 直接使用 host 和 port 参数，避免每次调用 new URL()
- */
-function checkTcpPort(host: string, port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port, timeout: GatewayConstants.TCP_CHECK_TIMEOUT }, () => {
-      socket.destroy();
-      resolve(true);
-    });
-
-    socket.on('error', () => {
-      socket.destroy();
-      resolve(false);
-    });
-
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve(false);
-    });
-  });
-}
-
-/**
  * 代理请求状态跟踪
  */
 interface ProxyState {
@@ -173,9 +156,19 @@ export class Gateway {
   private adminApi: AdminApiHandler;
   /** 服务启动 Promise 追踪：serviceName -> 启动完成 Promise */
   private startingPromises = new Map<string, Promise<void>>();
+  /** HTTP keep-alive 连接池：serviceName -> Agent（避免每请求新建 TCP 连接） */
+  private agentPool = new Map<string, http.Agent>();
+  /** 等待服务停止完成的超时上限（毫秒，可配置注入） */
+  private stopWaitMs: number;
+  /** 代理请求超时（毫秒，可配置注入） */
+  private proxyTimeoutMs: number;
+  /** 健康检查器：按服务 healthCheck.type 分派就绪检查（默认 tcp 保持原有快速轮询语义） */
+  private healthChecker = new HealthChecker();
 
   constructor(private config: DynaPMConfig, logger: Logger) {
     this.logger = logger;
+    this.stopWaitMs = config.timeouts?.stopWaitMs ?? 30000;
+    this.proxyTimeoutMs = config.timeouts?.proxyTimeoutMs ?? 30000;
     this.logging = {
       enableRequestLog: config.logging?.enableRequestLog ?? false,
       enableWebSocketLog: config.logging?.enableWebSocketLog ?? false,
@@ -184,6 +177,52 @@ export class Gateway {
     this.adminApi = new AdminApiHandler(config, logger, this.hostnameRoutes, this.portRoutes, this.serviceManager);
     this.initServices();
     this.initIdleChecker();
+  }
+
+  /**
+   * 等待后端就绪：按服务 healthCheck.type 分派检查，默认 tcp 沿用原有快速轮询语义
+   * @param service - 服务配置（含 healthCheck 与 startTimeout）
+   * @param targetHost - 目标主机
+   * @param targetPort - 目标端口
+   * @param retryDelayMs - 未就绪时的重试间隔（毫秒）：HTTP 路径原有紧轮询传 0，WS 路径原有 50ms 间隔
+   * @returns 是否在 startTimeout 内就绪
+   */
+  private async waitForBackendReady(service: ServiceConfig, targetHost: string, targetPort: number, retryDelayMs: number): Promise<boolean> {
+    const waitStartTime = Date.now();
+    let isReady = false;
+    while (Date.now() - waitStartTime < service.startTimeout) {
+      isReady = await this.healthChecker.checkTarget(service, targetHost, targetPort);
+      if (isReady) {
+        const waitDuration = Date.now() - waitStartTime;
+        this.logger.info({
+          msg: `✅ [${service.name}] 服务就绪 (等待${formatTime(waitDuration)})`,
+        });
+        break;
+      }
+      if (retryDelayMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      }
+    }
+    return isReady;
+  }
+
+  /**
+   * 获取服务对应的 keep-alive Agent（按服务缓存，跨路由共享）
+   * 后端重启导致池中 socket 失效时，socket 会触发 error 由请求侧 error handler 兜底，
+   * Agent 会自动移除失效 socket，后续请求重建连接。
+   */
+  private getAgent(serviceName: string): http.Agent {
+    let agent = this.agentPool.get(serviceName);
+    if (!agent) {
+      agent = new http.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        maxSockets: 256,
+        maxFreeSockets: 32,
+      });
+      this.agentPool.set(serviceName, agent);
+    }
+    return agent;
   }
 
   /**
@@ -436,25 +475,21 @@ export class Gateway {
       resolveStartPromise = resolve;
       rejectStartPromise = reject;
     });
+    /** 保底消费：启动失败时若尚无并发等待者，被 reject 的 promise 会变成 unhandledRejection 直接杀死进程。
+     *  挂一个空 catch 不影响后续 await（await 拿到的是同一个 promise 的 rejection） */
+    startPromise.catch(() => {});
     this.startingPromises.set(service.name, startPromise);
 
     try {
       await this.serviceManager.start(service);
 
-      const waitStartTime = Date.now();
-      let isReady = false;
-      const targetHost = mapping.targetUrl!.hostname;
-      const targetPort = mapping.targetPort;
-      while (Date.now() - waitStartTime < service.startTimeout) {
-        isReady = await checkTcpPort(targetHost, targetPort);
-        if (isReady) {
-          const waitDuration = Date.now() - waitStartTime;
-          this.logger.info({
-            msg: `✅ [${service.name}] 服务就绪 (等待${formatTime(waitDuration)})`,
-          });
-          break;
-        }
-      }
+      const isReady = await this.waitForBackendReady(
+        service,
+        mapping.targetUrl!.hostname,
+        mapping.targetPort,
+        0
+      );
+
 
       if (!isReady) {
         service._state!.status = 'offline';
@@ -481,6 +516,10 @@ export class Gateway {
       rejectStartPromise!(error instanceof Error ? error : new Error(message));
 
       this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: message });
+      /** 启动失败后将状态复位为 offline，允许后续请求重新按需启动（否则卡死在 starting，后续请求会直接代理到死端口） */
+      if (service._state!.status === 'starting') {
+        service._state!.status = 'offline';
+      }
       try {
         res.cork(() => {
           res.writeStatus('503 Service Unavailable');
@@ -510,7 +549,7 @@ export class Gateway {
     const bodyPromise = collectRequestBody(res);
 
     (async () => {
-      const maxWaitTime = 30000;
+      const maxWaitTime = this.stopWaitMs;
       const checkInterval = 100;
       const waitStartTime = Date.now();
 
@@ -532,6 +571,8 @@ export class Gateway {
 
       this.logger.info({ msg: `✅ [${service.name}] 服务已停止，开始启动...` });
       const body = await bodyPromise;
+      /** 超限请求已在 collectRequestBody 中返回 413，不再转发 */
+      if (body === null) return;
       await this.startServiceAndProxy(res, mapping, fullUrl, startTime, method, headers, body);
     })();
   }
@@ -568,6 +609,8 @@ export class Gateway {
       }
 
       const body = await bodyPromise;
+      /** 超限请求已在 collectRequestBody 中返回 413，不再转发 */
+      if (body === null) return;
       await this.forwardProxyRequest(res, mapping, fullUrl, startTime, method, headers, body);
     })();
   }
@@ -587,6 +630,8 @@ export class Gateway {
 
     (async () => {
       const body = await bodyPromise;
+      /** 超限请求已在 collectRequestBody 中返回 413，不再转发 */
+      if (body === null) return;
       await this.startServiceAndProxy(res, mapping, fullUrl, startTime, method, headers, body);
     })();
   }
@@ -639,7 +684,8 @@ export class Gateway {
       path: fullUrl,
       method,
       headers: proxyHeaders,
-      timeout: 30000,
+      agent: this.getAgent(service.name),
+      timeout: this.proxyTimeoutMs,
     }, (proxyRes) => {
       if (state.aborted) {
         proxyRes.destroy();
@@ -782,6 +828,8 @@ export class Gateway {
     });
 
     // 边收请求体边写入代理请求（真正的双向流式）
+    let directBodySize = 0;
+    let directResponded = false;
     res.onData((ab: ArrayBuffer, isLast: boolean) => {
       if (state.aborted) {
         proxyReq.destroy();
@@ -791,11 +839,27 @@ export class Gateway {
       /** uWS 的 ArrayBuffer 是借用语义，必须复制数据（allocUnsafe 安全：copy 立即覆盖所有字节） */
       const chunk = Buffer.allocUnsafe(ab.byteLength);
       Buffer.from(ab).copy(chunk);
+      directBodySize += chunk.length;
+
+      /** 请求体超限：销毁代理请求，返回 413，不再转发 */
+      if (directBodySize > GatewayConstants.MAX_REQUEST_BODY_SIZE && !directResponded) {
+        directResponded = true;
+        state.responded = true;
+        proxyReq.destroy();
+        this.logger.warn({ msg: `⚠️ [${service.name}] 请求体超过 ${GatewayConstants.MAX_REQUEST_BODY_SIZE} 字节，返回 413` });
+        res.cork(() => {
+          if (state.aborted) return;
+          res.writeStatus('413 Payload Too Large');
+          res.end('Payload Too Large');
+        });
+        cleanup();
+        return;
+      }
 
       if (isLast) {
-        proxyReq.end(chunk);
+        if (!directResponded) proxyReq.end(chunk);
       } else {
-        proxyReq.write(chunk);
+        if (!directResponded) proxyReq.write(chunk);
       }
     });
   }
@@ -870,7 +934,8 @@ export class Gateway {
           path,
           method,
           headers: proxyHeaders,
-          timeout: 30000,
+          agent: this.getAgent(service.name),
+          timeout: this.proxyTimeoutMs,
         }, (proxyRes) => {
           if (perfLog && perfTtfb === 0) {
             perfTtfb = performance.now() - perfHttpStart;
@@ -1087,9 +1152,9 @@ export class Gateway {
 
     const app = uWS.App();
 
-    // WebSocket 处理器
-    app.ws('/*', {
-      upgrade: (res: HttpResponse, req: HttpRequest, context) => {
+    // WebSocket 处理器（hostname 路由：upgrade 时按 Host 头解析目标服务）
+    app.ws('/*', this.createWsProxyBehavior({
+      resolveContext: (res, req) => {
         const hostname = req.getHeader('host')?.split(':')[0] || '';
         const mapping = this.hostnameRoutes.get(hostname);
 
@@ -1098,10 +1163,76 @@ export class Gateway {
             res.writeStatus('404 Not Found');
             res.end(`Service not found: ${hostname}`);
           });
-          return;
+          return null;
         }
 
-        const { service, target } = mapping;
+        return { service: mapping.service, target: mapping.target, hostname };
+      },
+    }));
+
+    app.any('/*', (res: HttpResponse, req: HttpRequest) => {
+      this.handleRequest(res, req);
+    });
+
+    app.listen(host, port, (token: unknown) => {
+      if (token) {
+        this.logger.info({ msg: `DynaPM 网关已启动: http://${host}:${port}` });
+      } else {
+        this.logger.error({ msg: `❌ DynaPM 网关启动失败: ${host}:${port}` });
+      }
+    });
+
+    for (const [portNum, mapping] of this.portRoutes) {
+      this.createPortBindingListener(host, portNum, mapping);
+    }
+
+    const adminApiConfig = this.config.adminApi;
+    if (adminApiConfig && adminApiConfig.enabled !== false && adminApiConfig.port) {
+      this.createAdminApiListener(host, adminApiConfig.port);
+    }
+  }
+
+  /**
+   * 为管理 API 创建监听器
+   */
+  private createAdminApiListener(host: string, port: number): void {
+    const app = uWS.App();
+
+    app.any('/*', (res: HttpResponse, req: HttpRequest) => {
+      this.adminApi.handleAdminApi(res, req);
+    });
+
+    app.listen(host, port, (token: unknown) => {
+      if (token) {
+        this.logger.info({ msg: `🔌 管理 API 已启动: http://${host}:${port}` });
+      } else {
+        this.logger.error({ msg: `❌ 管理 API 启动失败: ${host}:${port}` });
+      }
+    });
+  }
+
+  /**
+   * 创建可复用的 WebSocket 代理 uWS behavior
+   * hostname 路由与端口路由共用同一实现，差异仅在于 upgrade 时的目标解析方式（resolveContext）
+   * open 后按需启动服务、等待就绪（走 HealthChecker，默认 tcp）、建立后端 WS 并双向转发；
+   * 客户端->后端方向带消息队列，后端->客户端方向带背压处理（ws.send 返回 false 时 pause 后端，drain 恢复）
+   */
+  private createWsProxyBehavior(options: {
+    /**
+     * upgrade 阶段解析路由目标
+     * @param res - uWS 响应对象（用于 404）
+     * @param req - uWS 请求对象
+     * @returns 解析结果；返回 null 表示路由未命中（已回应 404，不再 upgrade）
+     */
+    resolveContext: (res: HttpResponse, req: HttpRequest) => { service: ServiceConfig; target: string } | null;
+  }): uWS.WebSocketBehavior<Record<string, unknown>> {
+
+    return {
+      upgrade: (res: HttpResponse, req: HttpRequest, context) => {
+        const resolved = options.resolveContext(res, req);
+        if (!resolved) return;
+
+        const { service, target } = resolved;
         service._state!.lastAccessTime = Date.now();
 
         const clientHeaders: Record<string, string> = {};
@@ -1114,7 +1245,6 @@ export class Gateway {
 
         res.upgrade(
           {
-            hostname,
             service,
             target,
             clientHeaders,
@@ -1154,6 +1284,7 @@ export class Gateway {
           try {
             const needsStart = service._state!.status === 'offline';
             const targetUrl = new URL(target);
+            const targetPort = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'));
 
             if (needsStart) {
               this.logger.info({ msg: `🚀 [${service.name}] WebSocket - 启动服务...` });
@@ -1161,19 +1292,7 @@ export class Gateway {
 
               await this.serviceManager.start(service);
 
-              const waitStartTime = Date.now();
-              let isReady = false;
-              while (Date.now() - waitStartTime < service.startTimeout) {
-                isReady = await checkTcpPort(targetUrl.hostname, parseInt(targetUrl.port || '80'));
-                if (isReady) {
-                  const waitDuration = Date.now() - waitStartTime;
-                  this.logger.info({
-                    msg: `✅ [${service.name}] WebSocket 服务就绪 (等待${formatTime(waitDuration)})`,
-                  });
-                  break;
-                }
-                await new Promise(resolve => setTimeout(resolve, GatewayConstants.BACKEND_READY_CHECK_DELAY));
-              }
+              const isReady = await this.waitForBackendReady(service, targetUrl.hostname, targetPort, GatewayConstants.BACKEND_READY_CHECK_DELAY);
 
               if (!isReady) {
                 service._state!.status = 'offline';
@@ -1207,17 +1326,7 @@ export class Gateway {
 
             backendHeaders['Host'] = targetUrl.host;
 
-            if (this.logging.enableWebSocketLog) {
-              this.logger.info({
-                msg: `🔌 [${service.name}] 转发 WebSocket 请求头`,
-                headers: JSON.stringify(backendHeaders, null, 2)
-              });
-            }
-
-            const backendWs = new WS(wsUrl, {
-              headers: backendHeaders,
-            });
-
+            const backendWs = new WS(wsUrl, { headers: backendHeaders });
             wsState.backendWs = backendWs;
 
             backendWs.on('open', () => {
@@ -1232,9 +1341,6 @@ export class Gateway {
               while (wsState.messageQueue.length > 0 && backendWs.readyState === WS.OPEN) {
                 const msg = wsState.messageQueue.shift();
                 if (msg) {
-                  if (this.logging.enableWebSocketLog) {
-                    this.logger.info({ msg: `📨 [${service.name}] 发送队列消息: ${msg.length} 字节` });
-                  }
                   backendWs.send(msg);
                 }
               }
@@ -1244,6 +1350,7 @@ export class Gateway {
               if (ws !== null) {
                 const success = ws.send(data, isBinary, false);
                 if (!success) {
+                  /** 客户端侧背压：暂停后端读取，客户端可写（drain）后重发并恢复 */
                   backendWs.pause();
 
                   const drainHandler = () => {
@@ -1310,6 +1417,7 @@ export class Gateway {
           backendReady: boolean;
           messageQueue: Buffer[];
           backendWs?: WS;
+          closing?: boolean;
         };
 
         if (wsState.backendReady && wsState.backendWs && wsState.backendWs.readyState === WS.OPEN) {
@@ -1325,6 +1433,14 @@ export class Gateway {
           }
           if (wsState.messageQueue.length < GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE) {
             wsState.messageQueue.push(Buffer.from(message));
+          } else {
+            /** 队列超限：记录 warning 并主动关闭连接，让客户端可感知并重连 */
+            this.logger.warn({
+              msg: `⚠️ [${service.name}] WebSocket 消息队列超过 ${GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE} 条，主动关闭连接`,
+              service: service.name,
+            });
+            wsState.closing = true;
+            ws.close();
           }
         }
       },
@@ -1348,47 +1464,7 @@ export class Gateway {
           wsState.backendWs.close();
         }
       },
-    });
-
-    app.any('/*', (res: HttpResponse, req: HttpRequest) => {
-      this.handleRequest(res, req);
-    });
-
-    app.listen(host, port, (token: unknown) => {
-      if (token) {
-        this.logger.info({ msg: `DynaPM 网关已启动: http://${host}:${port}` });
-      } else {
-        this.logger.error({ msg: `❌ DynaPM 网关启动失败: ${host}:${port}` });
-      }
-    });
-
-    for (const [portNum, mapping] of this.portRoutes) {
-      this.createPortBindingListener(host, portNum, mapping);
-    }
-
-    const adminApiConfig = this.config.adminApi;
-    if (adminApiConfig && adminApiConfig.enabled !== false && adminApiConfig.port) {
-      this.createAdminApiListener(host, adminApiConfig.port);
-    }
-  }
-
-  /**
-   * 为管理 API 创建监听器
-   */
-  private createAdminApiListener(host: string, port: number): void {
-    const app = uWS.App();
-
-    app.any('/*', (res: HttpResponse, req: HttpRequest) => {
-      this.adminApi.handleAdminApi(res, req);
-    });
-
-    app.listen(host, port, (token: unknown) => {
-      if (token) {
-        this.logger.info({ msg: `🔌 管理 API 已启动: http://${host}:${port}` });
-      } else {
-        this.logger.error({ msg: `❌ 管理 API 启动失败: ${host}:${port}` });
-      }
-    });
+    };
   }
 
   /**
@@ -1399,193 +1475,10 @@ export class Gateway {
 
     const app = uWS.App();
 
-    app.ws('/*', {
-      upgrade: (res: HttpResponse, req: HttpRequest, context) => {
-        service._state!.lastAccessTime = Date.now();
-
-        const clientHeaders: Record<string, string> = {};
-        req.forEach((key: string, value: string) => {
-          const safeValue = value.replace(GatewayConstants.CRLF_REGEX, '');
-          clientHeaders[key] = safeValue;
-        });
-
-        const clientPath = req.getUrl() + (req.getQuery() ? `?${req.getQuery()}` : '');
-
-        res.upgrade(
-          {
-            service,
-            target,
-            clientHeaders,
-            clientPath,
-          },
-          req.getHeader('sec-websocket-key'),
-          req.getHeader('sec-websocket-protocol'),
-          req.getHeader('sec-websocket-extensions'),
-          context
-        );
-
-        if (this.logging.enableWebSocketLog) {
-          this.logger.info({ msg: `🔌 [${service.name}] 端口${portNum} WebSocket 升级请求: ${clientPath}` });
-        }
-      },
-
-      open: (ws: WebSocket<Record<string, unknown>>) => {
-        const userData = ws.getUserData();
-        const svc = userData.service as ServiceConfig;
-        const backendTarget = userData.target as string;
-
-        svc._state!.activeConnections++;
-        if (this.logging.enableWebSocketLog) {
-          this.logger.info({ msg: `🔌 [${svc.name}] 端口${portNum} WebSocket 连接已建立` });
-        }
-
-        const wsState = {
-          backendReady: false,
-          messageQueue: [] as Buffer[],
-          backendWs: undefined as WS | undefined,
-          closing: false,
-        };
-        (ws as unknown as Record<string, unknown>).wsState = wsState;
-
-        (async () => {
-          try {
-            const needsStart = svc._state!.status === 'offline';
-            const targetUrl = new URL(backendTarget);
-
-            if (needsStart) {
-              this.logger.info({ msg: `🚀 [${svc.name}] 端口${portNum} WebSocket - 启动服务...` });
-              svc._state!.status = 'starting';
-
-              await this.serviceManager.start(svc);
-
-              const waitStartTime = Date.now();
-              let isReady = false;
-              while (Date.now() - waitStartTime < svc.startTimeout) {
-                isReady = await checkTcpPort(targetUrl.hostname, parseInt(targetUrl.port || '80'));
-                if (isReady) {
-                  const waitDuration = Date.now() - waitStartTime;
-                  this.logger.info({
-                    msg: `✅ [${svc.name}] 端口${portNum} WebSocket 服务就绪 (等待${formatTime(waitDuration)})`,
-                  });
-                  break;
-                }
-                await new Promise(resolve => setTimeout(resolve, GatewayConstants.BACKEND_READY_CHECK_DELAY));
-              }
-
-              if (!isReady) {
-                svc._state!.status = 'offline';
-                this.logger.error({ msg: `❌ [${svc.name}] 端口${portNum} WebSocket 服务启动超时` });
-                ws.close();
-                return;
-              }
-
-              svc._state!.status = 'online';
-              svc._state!.startTime = Date.now();
-              svc._state!.startCount++;
-            }
-
-            const wsUserData = ws.getUserData();
-            const clientPath = wsUserData.clientPath as string;
-            const clientHeaders = wsUserData.clientHeaders as Record<string, string>;
-            const wsUrl = `${targetUrl.protocol === 'https:' ? 'wss:' : 'ws:'}//${targetUrl.host}${clientPath}`;
-
-            if (this.logging.enableWebSocketLog) {
-              this.logger.info({ msg: `🔌 [${svc.name}] 端口${portNum} 连接后端 WebSocket: ${wsUrl}` });
-            }
-
-            const backendHeaders: Record<string, string> = {};
-            const skipHeaders = GatewayConstants.WS_SKIP_HEADERS;
-
-            for (const key in clientHeaders) {
-              if (!skipHeaders.has(key)) {
-                backendHeaders[key] = clientHeaders[key];
-              }
-            }
-
-            backendHeaders['Host'] = targetUrl.host;
-
-            const backendWs = new WS(wsUrl, { headers: backendHeaders });
-            wsState.backendWs = backendWs;
-
-            backendWs.on('open', () => {
-              if (this.logging.enableWebSocketLog) {
-                this.logger.info({ msg: `✅ [${svc.name}] 端口${portNum} 后端 WebSocket 连接已建立` });
-              }
-              wsState.backendReady = true;
-
-              while (wsState.messageQueue.length > 0 && backendWs.readyState === WS.OPEN) {
-                const msg = wsState.messageQueue.shift();
-                if (msg) {
-                  backendWs.send(msg);
-                }
-              }
-            });
-
-            backendWs.on('message', (data: Buffer, isBinary: boolean) => {
-              if (ws !== null) {
-                ws.send(data, isBinary, false);
-              }
-            });
-
-            backendWs.on('close', () => {
-              if (ws !== null && !wsState.closing) {
-                wsState.closing = true;
-                ws.close();
-              }
-            });
-
-            backendWs.on('error', () => {
-              wsState.closing = true;
-              if (ws !== null) {
-                ws.close();
-              }
-            });
-
-          } catch (error: unknown) {
-            const message = error instanceof Error ? error.message : String(error);
-            this.logger.error({ msg: `❌ [${service.name}] WebSocket 连接失败`, error: message });
-            if (ws !== null) {
-              ws.close();
-            }
-          }
-        })();
-      },
-
-      message: (ws: WebSocket<Record<string, unknown>>, message: ArrayBuffer, _isBinary: boolean) => {
-        const userData = ws.getUserData();
-        const svc = userData.service as ServiceConfig;
-        const wsState = (ws as unknown as Record<string, unknown>).wsState as {
-          backendReady: boolean;
-          messageQueue: Buffer[];
-          backendWs?: WS;
-        };
-
-        if (wsState.backendReady && wsState.backendWs && wsState.backendWs.readyState === WS.OPEN) {
-          wsState.backendWs.send(Buffer.from(message));
-          svc._state!.lastAccessTime = Date.now();
-        } else {
-          if (wsState.messageQueue.length < GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE) {
-            wsState.messageQueue.push(Buffer.from(message));
-          }
-        }
-      },
-
-      close: (ws: WebSocket<Record<string, unknown>>) => {
-        const userData = ws.getUserData();
-        const svc = userData.service as ServiceConfig;
-        svc._state!.activeConnections--;
-
-        const wsState = (ws as unknown as Record<string, unknown>).wsState as {
-          backendWs?: WS;
-          closing?: boolean;
-        } | undefined;
-
-        if (wsState?.backendWs && wsState.backendWs.readyState === WS.OPEN) {
-          wsState.closing = true;
-          wsState.backendWs.close();
-        }
-      },
-    });
+    // WebSocket 处理器（端口路由：upgrade 时目标已由端口绑定确定）
+    app.ws('/*', this.createWsProxyBehavior({
+      resolveContext: () => ({ service, target }),
+    }));
 
     app.any('/*', (res: HttpResponse, req: HttpRequest) => {
       this.handlePortBindingRequest(res, req, mapping);

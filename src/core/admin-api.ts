@@ -114,9 +114,14 @@ export class AdminApiHandler {
    * 处理管理 API 请求
    */
   handleAdminApi(res: HttpResponse, req: HttpRequest): void {
-    const ip = req.getHeader('x-forwarded-for')?.split(',')[0]?.trim() ||
-               req.getHeader('cf-connecting-ip') ||
-               '127.0.0.1';
+    /** 使用 uWS 提供的真实远端地址，不信任可伪造的 x-forwarded-for 等请求头 */
+    const remoteAddressBuf = res.getRemoteAddress();
+    const remoteBytes = remoteAddressBuf ? Buffer.from(remoteAddressBuf) : Buffer.alloc(0);
+    const ip = remoteBytes.byteLength === 4
+      ? `${remoteBytes[0]}.${remoteBytes[1]}.${remoteBytes[2]}.${remoteBytes[3]}`
+      : remoteBytes.byteLength === 16
+        ? Array.from({ length: 8 }, (_, i) => remoteBytes.readUInt16BE(i * 2).toString(16)).join(':')
+        : 'unknown';
 
     // IP 白名单检查
     if (!this.isIpAllowed(ip)) {

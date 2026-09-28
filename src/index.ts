@@ -1,4 +1,5 @@
 import { Gateway } from './core/gateway.js';
+import { createFatalErrorHandler } from './core/fatal-error-handler.js';
 import { loadDynaPMConfig } from './config/loader.js';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -46,17 +47,22 @@ function createLogger() {
 async function main() {
   const logger = createLogger();
 
-  // 全局错误处理，防止未捕获的异常导致进程退出
-  process.on('uncaughtException', (err: Error) => {
-    logger.error({ msg: '❌ 未捕获的异常', error: err.message, stack: err.stack });
-    // 不退出进程，只记录错误
-  });
+  // 全局错误处理：记录错误 → 尽力清理 → 退出进程（exit 1）
+  const gatewayRef: { current: Gateway | null } = { current: null };
+  const fatalHandler = createFatalErrorHandler(
+    logger,
+    async () => {
+      const gateway = gatewayRef.current;
+      if (gateway) {
+        await gateway.cleanup();
+      }
+    },
+    (code) => process.exit(code),
+  );
 
-  process.on('unhandledRejection', (reason: unknown) => {
-    const message = reason instanceof Error ? reason.message : String(reason);
-    logger.error({ msg: '❌ 未处理的 Promise rejection', error: message });
-    // 不退出进程，只记录错误
-  });
+  process.on('uncaughtException', (err: Error) => fatalHandler(err, 'uncaughtException'));
+
+  process.on('unhandledRejection', (reason: unknown) => fatalHandler(reason, 'unhandledRejection'));
 
   // 启动日志
   logger.info({ msg: 'DynaPM 网关启动中...' });
@@ -67,6 +73,7 @@ async function main() {
 
     // 创建并启动网关
     const gateway = new Gateway(config, logger);
+    gatewayRef.current = gateway;
     await gateway.start();
 
     logger.info({ msg: 'DynaPM 网关已启动', port: config.port || 3000 });
