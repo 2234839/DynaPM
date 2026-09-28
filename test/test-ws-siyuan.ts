@@ -278,12 +278,16 @@ async function main() {
 
   await runTest('7. 协议层 ping/pong 心跳', async () => {
     const ws = await connectWs('/ws', {});
-    const pongPromise = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('未收到 pong 帧')), 8000);
-      ws.once('pong', () => { clearTimeout(timer); resolve(); });
+    /**
+     * uWS 网关无主动发送 pong 控制帧的 API（send 仅发数据帧），故心跳感知契约
+     * 以客户端收到协议层 ping 帧为准（客户端 ws 库收到 ping 会自动回 pong 维持链路）
+     */
+    const pingPromise = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('未收到协议层 ping 帧')), 8000);
+      ws.once('ping', () => { clearTimeout(timer); resolve(); });
     });
     ws.send(JSON.stringify({ type: 'ping-frame' }));
-    await pongPromise;
+    await pingPromise;
     ws.close();
   });
 

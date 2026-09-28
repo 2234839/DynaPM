@@ -1228,6 +1228,8 @@ export class Gateway {
   }): uWS.WebSocketBehavior<Record<string, unknown>> {
 
     return {
+      /** 单帧最大 16MB：uWS 默认仅 4KB 级别，思源等场景的大同步块（2MB+）会被静默断连（1006） */
+      maxPayloadLength: 16 * 1024 * 1024,
       upgrade: (res: HttpResponse, req: HttpRequest, context) => {
         const resolved = options.resolveContext(res, req);
         if (!resolved) return;
@@ -1243,12 +1245,18 @@ export class Gateway {
 
         const clientPath = req.getUrl() + (req.getQuery() ? `?${req.getQuery()}` : '');
 
+        /** 客户端请求的子协议，透传给后端 */
+        const clientProtocols = req.getHeader('sec-websocket-protocol')
+          ? req.getHeader('sec-websocket-protocol').split(',').map((p) => p.trim()).filter(Boolean)
+          : undefined;
+
         res.upgrade(
           {
             service,
             target,
             clientHeaders,
             clientPath,
+            clientProtocols,
           },
           req.getHeader('sec-websocket-key'),
           req.getHeader('sec-websocket-protocol'),
@@ -1274,7 +1282,7 @@ export class Gateway {
 
         const wsState = {
           backendReady: false,
-          messageQueue: [] as Buffer[],
+          messageQueue: [] as { data: Buffer; isBinary: boolean }[],
           backendWs: undefined as WS | undefined,
           closing: false,
         };
@@ -1326,7 +1334,11 @@ export class Gateway {
 
             backendHeaders['Host'] = targetUrl.host;
 
-            const backendWs = new WS(wsUrl, { headers: backendHeaders });
+            /** 子协议透传：ws 库第二参数 protocols 握手时带 sec-websocket-protocol 头 */
+            const clientProtocols = wsUserData.clientProtocols as string[] | undefined;
+            const backendWs = clientProtocols && clientProtocols.length > 0
+              ? new WS(wsUrl, clientProtocols, { headers: backendHeaders })
+              : new WS(wsUrl, { headers: backendHeaders });
             wsState.backendWs = backendWs;
 
             backendWs.on('open', () => {
@@ -1339,9 +1351,9 @@ export class Gateway {
                 this.logger.info({ msg: `📤 [${service.name}] 发送队列中的 ${wsState.messageQueue.length} 条消息` });
               }
               while (wsState.messageQueue.length > 0 && backendWs.readyState === WS.OPEN) {
-                const msg = wsState.messageQueue.shift();
-                if (msg) {
-                  backendWs.send(msg);
+                const queued = wsState.messageQueue.shift();
+                if (queued) {
+                  backendWs.send(queued.data, { binary: queued.isBinary });
                 }
               }
             });
@@ -1370,13 +1382,28 @@ export class Gateway {
               }
             });
 
-            backendWs.on('close', () => {
+            backendWs.on('close', (code: number, reason: Buffer) => {
               if (this.logging.enableWebSocketLog) {
-                this.logger.info({ msg: `🔌 [${service.name}] 后端 WebSocket 连接关闭` });
+                this.logger.info({ msg: `🔌 [${service.name}] 后端 WebSocket 连接关闭 code=${code}` });
               }
               if (ws !== null && !wsState.closing) {
                 wsState.closing = true;
-                ws.close();
+                /** 透传后端关闭码/原因给客户端（1000/1005 之外的常规透传，异常码原样传递） */
+                if (code && code !== 1000 && code !== 1005) {
+                  const reasonText = (reason?.toString('utf8') || '').slice(0, 123);
+                  ws.end(code, reasonText);
+                } else {
+                  ws.close();
+                }
+              }
+            });
+
+            /** 转发后端协议层 ping 帧给客户端，保证客户端心跳 pong 可感知 */
+            backendWs.on('ping', (data: Buffer) => {
+              if (ws !== null) {
+                ws.cork(() => {
+                  ws.ping(data);
+                });
               }
             });
 
@@ -1410,29 +1437,34 @@ export class Gateway {
         })();
       },
 
-      message: (ws: WebSocket<Record<string, unknown>>, message: ArrayBuffer, _isBinary: boolean) => {
+      message: (ws: WebSocket<Record<string, unknown>>, message: ArrayBuffer, isBinary: boolean) => {
         const userData = ws.getUserData();
         const service = userData.service as ServiceConfig;
         const wsState = (ws as unknown as Record<string, unknown>).wsState as {
           backendReady: boolean;
-          messageQueue: Buffer[];
+          messageQueue: { data: Buffer; isBinary: boolean }[];
           backendWs?: WS;
           closing?: boolean;
         };
 
+        /**
+         * uWS message 回调的 ArrayBuffer 是借用的（回调返回后会被回收/复用），
+         * 必须显式拷贝：Buffer.from(Uint8Array) 才是真实拷贝（Buffer.from(ArrayBuffer) 仅创建视图）
+         */
+        const msgBuffer = Buffer.from(new Uint8Array(message));
+
         if (wsState.backendReady && wsState.backendWs && wsState.backendWs.readyState === WS.OPEN) {
-          const msgBuffer = Buffer.from(message);
           if (this.logging.enableWebSocketLog) {
-            this.logger.info({ msg: `📨 [${service.name}] 转发消息到后端: ${msgBuffer.length} 字节` });
+            this.logger.info({ msg: `📨 [${service.name}] 转发消息到后端: ${msgBuffer.length} 字节 binary=${isBinary}` });
           }
-          wsState.backendWs.send(msgBuffer);
+          wsState.backendWs.send(msgBuffer, { binary: isBinary });
           service._state!.lastAccessTime = Date.now();
         } else {
           if (this.logging.enableWebSocketLog) {
             this.logger.info({ msg: `📦 [${service.name}] 消息加入队列` });
           }
           if (wsState.messageQueue.length < GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE) {
-            wsState.messageQueue.push(Buffer.from(message));
+            wsState.messageQueue.push({ data: msgBuffer, isBinary });
           } else {
             /** 队列超限：记录 warning 并主动关闭连接，让客户端可感知并重连 */
             this.logger.warn({
