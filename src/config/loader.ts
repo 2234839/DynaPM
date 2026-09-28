@@ -70,7 +70,10 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
       service.agent.maxFreeSockets = service.agent.maxFreeSockets || 32;
       service.agent.keepAliveMsecs = service.agent.keepAliveMsecs || 30 * 1000;
     }
-
+    /** keepWarm 服务：独立闲置回收阈值兑底（默认 30s） */
+    if (service.keepWarm) {
+      service.warmIdleTimeout = service.warmIdleTimeout || 30 * 1000;
+    }
     // 默认使用TCP端口连通性检查（无需服务修改代码）
     service.healthCheck = service.healthCheck || { type: 'tcp' };
 

@@ -71,6 +71,10 @@ export interface ServiceConfig {
   proxyOnly?: boolean;
   /** TCP 直通模式：端口路由整条连接纯 TCP 直通；hostname 路由下 WS upgrade 走直通（普通 HTTP 仍走流式代理） */
   passthrough?: boolean;
+  /** 常驻软预热：闲置回收时使用独立的 warmIdleTimeout 判定（更短），实现“常驻但快速回收” */
+  keepWarm?: boolean;
+  /** keepWarm 服务的闲置回收阈值（毫秒，默认 30000）：仅 keepWarm: true 时生效 */
+  warmIdleTimeout?: number;
   /** HTTP keep-alive Agent 池参数（可选，未配置使用默认值） */
   agent?: AgentPoolConfig;
 

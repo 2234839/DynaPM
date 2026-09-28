@@ -17,15 +17,43 @@ import { formatTime } from '../utils/format.js';
  * 收集 uWS 请求体为 Buffer
  * 在 onData 的 isLast 回调中完成收集
  * 超过 MAX_REQUEST_BODY_SIZE 时截断并返回已收集的数据
+ * @param timeoutMs - 慢客户端发送超时（毫秒）：超时未发完 body 时关闭客户端连接并返回 null，
+ *   防止慢客户端拖住冷启动流程永久占用后端连接（不传则不启用超时）
  *
  * 重要：uWS 的 onData 回调中的 ArrayBuffer 是借用的，
  * 回调返回后会被回收，必须在回调内复制数据。
  */
-function collectRequestBody(res: HttpResponse): Promise<Buffer | null> {
+function collectRequestBody(res: HttpResponse, timeoutMs?: number): Promise<Buffer | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let totalSize = 0;
     let resolved = false;
+
+    /** 慢客户端停滞计时：超时未发完 body 即断开客户端并中止收集 */
+    let slowTimer: NodeJS.Timeout | undefined;
+    const finish = (result: Buffer | null) => {
+      if (slowTimer) {
+        clearTimeout(slowTimer);
+        slowTimer = undefined;
+      }
+      if (resolved) return;
+      resolved = true;
+      resolve(result);
+    };
+
+    if (timeoutMs && timeoutMs > 0) {
+      slowTimer = setTimeout(() => {
+        slowTimer = undefined;
+        try {
+          res.cork(() => {
+            res.close();
+          });
+        } catch {
+          // 忽略关闭失败
+        }
+        finish(null);
+      }, timeoutMs);
+    }
 
     res.onData((ab: ArrayBuffer, isLast: boolean) => {
       if (resolved) return;
@@ -36,27 +64,23 @@ function collectRequestBody(res: HttpResponse): Promise<Buffer | null> {
       totalSize += chunk.length;
 
       if (totalSize > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
-        resolved = true;
         /** 超限：返回 413 并结束响应，返回 null 表示不转发 */
         res.cork(() => {
           res.writeStatus('413 Payload Too Large');
           res.end('Payload Too Large');
         });
-        resolve(null);
+        finish(null);
         return;
       }
 
       chunks.push(chunk);
       if (isLast) {
-        resolved = true;
-        resolve(Buffer.concat(chunks));
+        finish(Buffer.concat(chunks));
       }
     });
 
     res.onAborted(() => {
-      if (resolved) return;
-      resolved = true;
-      resolve(Buffer.concat(chunks));
+      finish(Buffer.concat(chunks));
     });
   });
 }
@@ -109,9 +133,31 @@ const GatewayConstants = {
   WS_SKIP_HEADERS: new Set(['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version']),
   /** 请求体最大大小（10MB），防止 DoS 攻击 */
   MAX_REQUEST_BODY_SIZE: 10 * 1024 * 1024,
+  /** keepWarm 服务默认闲置回收阈值（毫秒），用户未配置 warmIdleTimeout 时使用 */
+  WARM_IDLE_TIMEOUT_DEFAULT: 30 * 1000,
   /** WebSocket 消息队列最大长度（1000 条），防止内存泄漏 */
   MAX_WS_MESSAGE_QUEUE_SIZE: 1000,
 } as const;
+
+/**
+ * 性能分析状态（enablePerformanceLog 时由 forwardProxyRequest 注入 pipeResponse）
+ */
+interface PerfState {
+  /** 是否启用性能统计 */
+  enabled: boolean;
+  /** 准备阶段起始时间戳 */
+  perfPrepStart: number;
+  /** 发起 http.request 的起始时间戳 */
+  perfHttpStart: number;
+  /** 首字节时间（毫秒） */
+  perfTtfb: number;
+  /** 流式转发起始时间戳 */
+  perfStreamStart: number;
+  /** 已转发 chunk 数 */
+  chunkCount: number;
+  /** 已转发总字节数 */
+  totalBytes: number;
+}
 
 /**
  * 代理请求状态跟踪
@@ -366,16 +412,21 @@ export class Gateway {
 
   /**
    * 检查单个服务是否闲置
+   * keepWarm 服务使用独立的 warmIdleTimeout 判定（更短的软预热回收阈值），其余服务用通用 idleTimeout
    */
   private checkIdleService(service: ServiceConfig, now: number): void {
     if (service.proxyOnly) {
       return;
     }
 
+    const idleThreshold = service.keepWarm
+      ? (service.warmIdleTimeout ?? GatewayConstants.WARM_IDLE_TIMEOUT_DEFAULT)
+      : service.idleTimeout;
+
     if (
       service._state!.status === 'online' &&
       service._state!.activeConnections === 0 &&
-      now - service._state!.lastAccessTime > service.idleTimeout
+      now - service._state!.lastAccessTime > idleThreshold
     ) {
       this.logger.info({ msg: `🛌 [${service.name}] 闲置超时，正在停止...` });
       service._state!.status = 'stopping';
@@ -604,7 +655,7 @@ export class Gateway {
     this.logger.info({ msg: `⏳ [${service.name}] ${method} ${fullUrl} - 等待服务停止完成...` });
 
     // 边收集请求体边等待服务停止
-    const bodyPromise = collectRequestBody(res);
+    const bodyPromise = collectRequestBody(res, this.proxyTimeoutMs);
 
     (async () => {
       const maxWaitTime = this.stopWaitMs;
@@ -648,7 +699,7 @@ export class Gateway {
     headers: Record<string, string>,
     startPromise: Promise<void>,
   ): void {
-    const bodyPromise = collectRequestBody(res);
+    const bodyPromise = collectRequestBody(res, this.proxyTimeoutMs);
 
     (async () => {
       try {
@@ -684,7 +735,7 @@ export class Gateway {
     method: string,
     headers: Record<string, string>
   ): void {
-    const bodyPromise = collectRequestBody(res);
+    const bodyPromise = collectRequestBody(res, this.proxyTimeoutMs);
 
     (async () => {
       const body = await bodyPromise;
@@ -692,6 +743,204 @@ export class Gateway {
       if (body === null) return;
       await this.startServiceAndProxy(res, mapping, fullUrl, startTime, method, headers, body);
     })();
+  }
+
+  /**
+   * 公共响应转发实现：101 特判、响应头转发、响应体流式转发（含背压与慢客户端停滞超时）、end/error 处理
+   * handleDirectProxy 与 forwardProxyRequest 共用，保证两处行为一致
+   * 慢客户端停滞超时：客户端背压导致 proxyRes 长时间 pause（超过 proxyTimeoutMs）时，
+   * 断开客户端、销毁后端响应流并清理连接，避免慢客户端永久占用后端连接导致服务无法闲置回收
+   */
+  private pipeResponse(
+    res: HttpResponse,
+    proxyRes: http.IncomingMessage,
+    state: ProxyState,
+    opts: {
+      /** 服务配置（日志与状态） */
+      service: ServiceConfig;
+      /** 请求方法（请求日志） */
+      method: string;
+      /** 请求路径（请求日志） */
+      path: string;
+      /** 请求开始时间戳（请求日志耗时） */
+      startTime: number;
+      /** 响应状态码 */
+      statusCode: number;
+      /** 连接清理回调（activeConnections 递减，幂等） */
+      cleanup: () => void;
+      /** 响应正常结束回调（forwardProxyRequest 用于 resolve Promise） */
+      onEnd?: () => void;
+      /** 响应错误回调（forwardProxyRequest 用于 reject Promise） */
+      onError?: (err: Error) => void;
+      /** 性能分析状态（enablePerformanceLog 时注入，未注入则不做统计） */
+      perf?: PerfState;
+    },
+  ): void {
+    const { service, method, path, startTime, statusCode, cleanup } = opts;
+    const perf = opts.perf;
+
+    if (perf && perf.perfTtfb === 0) {
+      perf.perfTtfb = performance.now() - perf.perfHttpStart;
+      perf.perfStreamStart = performance.now();
+    }
+
+    const statusMessage = getStatusMessage(statusCode);
+
+    /** 慢客户端停滞计时：背压 pause 时启动，恢复可写或流结束时清除 */
+    let stallTimer: NodeJS.Timeout | undefined;
+    const clearStallTimer = () => {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = undefined;
+      }
+    };
+
+    // 特殊处理 101 WebSocket 升级
+    if (statusCode === 101) {
+      res.cork(() => {
+        if (state.aborted) return;
+        res.writeStatus(`${statusCode} ${statusMessage}`);
+        for (const key in proxyRes.headers) {
+          if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
+          const value = proxyRes.headers[key];
+          if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
+        }
+        res.end();
+        state.responded = true;
+      });
+      cleanup();
+      opts.onEnd?.();
+      return;
+    }
+
+    // 设置响应头（proxyRes.headers 的 key 已经是小写的，无需 toLowerCase）
+    res.cork(() => {
+      if (state.aborted) return;
+      res.writeStatus(`${statusCode} ${statusMessage}`);
+      for (const key in proxyRes.headers) {
+        if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
+        const value = proxyRes.headers[key];
+        if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
+      }
+    });
+
+    // 流式转发响应体
+    proxyRes.on('data', (chunk: Buffer) => {
+      if (state.aborted) {
+        clearStallTimer();
+        proxyRes.destroy();
+        return;
+      }
+
+      if (perf) {
+        perf.chunkCount++;
+        perf.totalBytes += chunk.length;
+      }
+
+      let writeSuccess = false;
+      res.cork(() => {
+        if (state.aborted) return;
+        writeSuccess = res.write(chunk);
+      });
+
+      if (!writeSuccess) {
+        proxyRes.pause();
+        /** 首次背压时启动停滞计时，超时即判定为慢客户端并断开 */
+        if (!stallTimer) {
+          stallTimer = setTimeout(() => {
+            stallTimer = undefined;
+            if (state.aborted) return;
+            this.logger.error({
+              msg: `⏱️ [${service.name}] 慢客户端停滞超时（>${this.proxyTimeoutMs}ms 未消费响应），断开连接`,
+            });
+            state.responded = true;
+            cleanup();
+            try {
+              /** 直接强制断开客户端连接（无需 cork，close 是强制关闭语义） */
+              res.close();
+            } catch {
+              // 忽略关闭失败
+            }
+            proxyRes.destroy();
+          }, this.proxyTimeoutMs);
+        }
+        res.onWritable(() => {
+          if (state.aborted) {
+            proxyRes.destroy();
+            return false;
+          }
+          clearStallTimer();
+          proxyRes.resume();
+          return true;
+        });
+      }
+    });
+
+    proxyRes.on('end', () => {
+      clearStallTimer();
+      if (state.aborted) {
+        cleanup();
+        opts.onEnd?.();
+        return;
+      }
+
+      const perfStreamTime = perf ? performance.now() - perf.perfStreamStart : 0;
+      const perfTotalTime = perf ? performance.now() - perf.perfPrepStart : 0;
+
+      res.cork(() => {
+        if (state.aborted) return;
+        res.end();
+        state.responded = true;
+
+        if (this.logging.enableRequestLog) {
+          const responseTime = Date.now() - startTime;
+          this.logger.info({
+            msg: `📤 [${service.name}] ${method} ${path} - ${statusCode} - ${formatTime(responseTime)}`,
+            service: service.name,
+            method,
+            path,
+            statusCode,
+            responseTime,
+          });
+        }
+
+        if (perf) {
+          console.error(`⚡ [${service.name}] 性能分析:`, {
+            method,
+            path,
+            statusCode,
+            ttfb: perf.perfTtfb.toFixed(3) + 'ms',
+            streamTime: perfStreamTime.toFixed(3) + 'ms',
+            totalTime: perfTotalTime.toFixed(3) + 'ms',
+            chunkCount: perf.chunkCount,
+            totalBytes: perf.totalBytes,
+            avgChunkSize: perf.chunkCount > 0 ? (perf.totalBytes / perf.chunkCount).toFixed(1) + 'B' : '0B',
+          });
+        }
+      });
+
+      cleanup();
+      opts.onEnd?.();
+    });
+
+    proxyRes.on('error', (err: Error) => {
+      clearStallTimer();
+      if (state.aborted) {
+        cleanup();
+        opts.onEnd?.();
+        return;
+      }
+      this.logger.error({ msg: `❌ [${service.name}] 代理响应错误`, error: err.message });
+      if (!state.responded) {
+        state.responded = true;
+        res.cork(() => {
+          res.writeStatus('502 Bad Gateway');
+          res.end('Bad Gateway');
+        });
+      }
+      cleanup();
+      opts.onError?.(err);
+    });
   }
 
   /**
@@ -752,103 +1001,13 @@ export class Gateway {
       }
 
       const statusCode = proxyRes.statusCode || 200;
-      const statusMessage = getStatusMessage(statusCode);
-
-      // 特殊处理 101 WebSocket 升级
-      if (statusCode === 101) {
-        res.cork(() => {
-          if (state.aborted) return;
-          res.writeStatus(`${statusCode} ${statusMessage}`);
-          for (const key in proxyRes.headers) {
-            if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
-            const value = proxyRes.headers[key];
-            if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
-          }
-          res.end();
-          state.responded = true;
-        });
-        cleanup();
-        return;
-      }
-
-      // 设置响应头（proxyRes.headers 的 key 已经是小写的，无需 toLowerCase）
-      res.cork(() => {
-        if (state.aborted) return;
-        res.writeStatus(`${statusCode} ${statusMessage}`);
-        for (const key in proxyRes.headers) {
-          if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
-          const value = proxyRes.headers[key];
-          if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
-        }
-      });
-
-      // 流式转发响应体
-      proxyRes.on('data', (chunk: Buffer) => {
-        if (state.aborted) {
-          proxyRes.destroy();
-          return;
-        }
-
-        let writeSuccess = false;
-        res.cork(() => {
-          if (state.aborted) return;
-          writeSuccess = res.write(chunk);
-        });
-
-        if (!writeSuccess) {
-          proxyRes.pause();
-          res.onWritable(() => {
-            if (state.aborted) {
-              proxyRes.destroy();
-              return false;
-            }
-            proxyRes.resume();
-            return true;
-          });
-        }
-      });
-
-      proxyRes.on('end', () => {
-        if (state.aborted) {
-          cleanup();
-          return;
-        }
-
-        res.cork(() => {
-          if (state.aborted) return;
-          res.end();
-          state.responded = true;
-
-          if (this.logging.enableRequestLog) {
-            const responseTime = Date.now() - startTime;
-            this.logger.info({
-              msg: `📤 [${service.name}] ${method} ${fullUrl} - ${statusCode} - ${formatTime(responseTime)}`,
-              service: service.name,
-              method,
-              path: fullUrl,
-              statusCode,
-              responseTime,
-            });
-          }
-        });
-
-        cleanup();
-      });
-
-      proxyRes.on('error', (err: Error) => {
-        if (state.aborted) {
-          cleanup();
-          return;
-        }
-        this.logger.error({ msg: `❌ [${service.name}] 代理响应错误`, error: err.message });
-        if (!state.responded) {
-          state.responded = true;
-          res.cork(() => {
-            res.writeStatus('502 Bad Gateway');
-            res.end('Bad Gateway');
-          });
-        }
-        cleanup();
+      this.pipeResponse(res, proxyRes, state, {
+        service,
+        method,
+        path: fullUrl,
+        startTime,
+        statusCode,
+        cleanup,
       });
     });
 
@@ -959,8 +1118,6 @@ export class Gateway {
       proxyHeaders['content-length'] = String(body.length);
     }
 
-    const perfPrepTime = perfLog ? performance.now() - perfPrepStart : 0;
-
     const state: ProxyState = { aborted: false, responded: false, timedOut: false };
     service._state!.activeConnections++;
 
@@ -977,10 +1134,15 @@ export class Gateway {
     });
 
     const perfHttpStart = perfLog ? performance.now() : 0;
-    let perfTtfb = 0;
-    let perfStreamStart = 0;
-    let chunkCount = 0;
-    let totalBytes = 0;
+    const perf: PerfState = {
+      enabled: perfLog,
+      perfPrepStart,
+      perfHttpStart,
+      perfTtfb: 0,
+      perfStreamStart: 0,
+      chunkCount: 0,
+      totalBytes: 0,
+    };
 
     return new Promise((resolve, reject) => {
       let proxyReq: http.ClientRequest;
@@ -995,13 +1157,7 @@ export class Gateway {
           agent: this.getAgent(service.name),
           timeout: this.proxyTimeoutMs,
         }, (proxyRes) => {
-          if (perfLog && perfTtfb === 0) {
-            perfTtfb = performance.now() - perfHttpStart;
-            perfStreamStart = performance.now();
-          }
-
           const statusCode = proxyRes.statusCode || 200;
-          const statusMessage = getStatusMessage(statusCode);
 
           if (state.aborted) {
             proxyRes.destroy();
@@ -1010,141 +1166,16 @@ export class Gateway {
             return;
           }
 
-          // 特殊处理 101 WebSocket 升级
-          if (statusCode === 101) {
-            res.cork(() => {
-              if (state.aborted) return;
-              res.writeStatus(`${statusCode} ${statusMessage}`);
-
-              for (const key in proxyRes.headers) {
-                if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) {
-                  continue;
-                }
-                const value = proxyRes.headers[key];
-                if (value) {
-                  res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
-                }
-              }
-              res.end();
-              state.responded = true;
-            });
-
-            cleanup();
-            resolve();
-            return;
-          }
-
-          // 设置响应头（proxyRes.headers 的 key 已经是小写的，无需 toLowerCase）
-          res.cork(() => {
-            if (state.aborted) return;
-            res.writeStatus(`${statusCode} ${statusMessage}`);
-
-            for (const key in proxyRes.headers) {
-              if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) {
-                continue;
-              }
-              const value = proxyRes.headers[key];
-              if (value) {
-                res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
-              }
-            }
-          });
-
-          // 流式转发响应体
-          proxyRes.on('data', (chunk: Buffer) => {
-            if (state.aborted) {
-              proxyRes.destroy();
-              return;
-            }
-
-            if (perfLog) {
-              chunkCount++;
-              totalBytes += chunk.length;
-            }
-
-            let writeSuccess = false;
-            res.cork(() => {
-              if (state.aborted) return;
-              writeSuccess = res.write(chunk);
-            });
-
-            if (!writeSuccess) {
-              proxyRes.pause();
-              res.onWritable(() => {
-                if (state.aborted) {
-                  proxyRes.destroy();
-                  return false;
-                }
-                proxyRes.resume();
-                return true;
-              });
-            }
-          });
-
-          proxyRes.on('end', () => {
-            if (state.aborted) {
-              cleanup();
-              resolve();
-              return;
-            }
-
-            const perfStreamTime = perfLog ? performance.now() - perfStreamStart : 0;
-            const perfTotalTime = perfLog ? performance.now() - perfPrepStart : 0;
-
-            res.cork(() => {
-              if (state.aborted) return;
-              res.end();
-              state.responded = true;
-
-              if (this.logging.enableRequestLog) {
-                const responseTime = Date.now() - startTime;
-                this.logger.info({
-                  msg: `📤 [${service.name}] ${method} ${path} - ${statusCode} - ${formatTime(responseTime)}`,
-                  service: service.name,
-                  method,
-                  path,
-                  statusCode,
-                  responseTime,
-                });
-              }
-
-              if (perfLog) {
-                console.error(`⚡ [${service.name}] 性能分析:`, {
-                  method,
-                  path,
-                  statusCode,
-                  prepTime: perfPrepTime.toFixed(3) + 'ms',
-                  ttfb: perfTtfb.toFixed(3) + 'ms',
-                  streamTime: perfStreamTime.toFixed(3) + 'ms',
-                  totalTime: perfTotalTime.toFixed(3) + 'ms',
-                  chunkCount,
-                  totalBytes,
-                  avgChunkSize: chunkCount > 0 ? (totalBytes / chunkCount).toFixed(1) + 'B' : '0B',
-                });
-              }
-            });
-
-            cleanup();
-            resolve();
-          });
-
-          proxyRes.on('error', (err: Error) => {
-            if (state.aborted) {
-              cleanup();
-              resolve();
-              return;
-            }
-
-            this.logger.error({ msg: `❌ [${service.name}] 代理响应错误`, error: err.message });
-            if (!state.responded) {
-              state.responded = true;
-              res.cork(() => {
-                res.writeStatus('502 Bad Gateway');
-                res.end('Bad Gateway');
-              });
-            }
-            cleanup();
-            reject(err);
+          this.pipeResponse(res, proxyRes, state, {
+            service,
+            method,
+            path,
+            startTime,
+            statusCode,
+            cleanup,
+            onEnd: resolve,
+            onError: reject,
+            perf: perfLog ? perf : undefined,
           });
         });
 
