@@ -9,6 +9,8 @@ import http from 'node:http';
 import WS from 'ws';
 import { AdminApiHandler } from './admin-api.js';
 import { checkTcpPort, HealthChecker } from './health-checker.js';
+import { pipeTcpSockets } from './tcp-pipe.js';
+import { HttpUpgradeSniffer } from './upgrade-sniffer.js';
 import { formatTime } from '../utils/format.js';
 
 /**
@@ -1500,10 +1502,190 @@ export class Gateway {
   }
 
   /**
+   * 为 passthrough 服务创建端口监听器（纯 TCP 层，绕过 uWS）
+   * 架构：
+   *  - 外层 net server 监听配置端口，嗅探每个连接的首个 HTTP 请求头
+   *  - WS upgrade 连接：按需启动服务、等就绪后整条连接 TCP 直通（原始头字节 + 已缓冲字节原样转发）
+   *  - 非 upgrade 的普通 HTTP 连接：pipe 到内部 uWS app（动态 loopback 端口），
+   *    复用现有 uWS 流式代理与 WS 代理行为，保持完整可观测性
+   */
+  private createPassthroughPortListener(host: string, portNum: number, mapping: RouteMapping): void {
+    const { service, target } = mapping;
+    const targetUrl = new URL(target);
+    const targetHost = targetUrl.hostname;
+    const targetPort = mapping.targetPort;
+
+    /** 内部 uWS app：承接普通 HTTP 连接（含可能后续出现的 WS upgrade——只有非直通分流会到这） */
+    const internalApp = uWS.App();
+    internalApp.ws('/*', this.createWsProxyBehavior({
+      resolveContext: () => ({ service, target }),
+    }));
+    internalApp.any('/*', (res: HttpResponse, req: HttpRequest) => {
+      this.handlePortBindingRequest(res, req, mapping);
+    });
+
+    internalApp.listen('127.0.0.1', 0, (token) => {
+      if (!token) {
+        this.logger.error({ msg: `❌ [${service.name}] passthrough 内部 uWS 监听失败` });
+        return;
+      }
+      const internalPort = uWS.us_socket_local_port(token);
+
+      const server = net.createServer((client) => {
+        const sniffer = new HttpUpgradeSniffer();
+        const buffered: Buffer[] = [];
+        let routed = false;
+        /** 是否已把缓冲字节写出并建立 pipe（写出前到达的字节必须继续缓冲） */
+        let piped = false;
+
+        /** 分流：决定连接去向（直通后端 或 内部 uWS） */
+        const route = (isUpgrade: boolean, headBytes: Buffer): void => {
+          routed = true;
+          service._state!.lastAccessTime = Date.now();
+
+          /** 将缓冲字节写出并建立双向 pipe，之后到达的字节由 socket 流直接承载 */
+          const flushAndPipe = (socket: net.Socket, onDestroyed: () => void): void => {
+            if (headBytes.length > 0) socket.write(headBytes);
+            for (const b of buffered) socket.write(b);
+            buffered.length = 0;
+            piped = true;
+            pipeTcpSockets(client, socket, onDestroyed);
+          };
+
+          if (!isUpgrade) {
+            /** 普通 HTTP：连同已读头字节一起交给内部 uWS（保证字节流不丢不重） */
+            const upstream = net.connect({ host: '127.0.0.1', port: internalPort }, () => {
+              flushAndPipe(upstream, () => {});
+            });
+            upstream.on('error', (err: Error) => {
+              this.logger.error({ msg: `❌ [${service.name}] passthrough 内部 uWS 连接失败`, error: err.message });
+              client.destroy();
+            });
+            return;
+          }
+
+          /** WS upgrade：按需启动 + 就绪等待 + TCP 直通 */
+          void (async () => {
+            try {
+              if (service._state!.status === 'offline' || service._state!.status === 'stopping') {
+                await this.ensureServiceOnline(service, mapping);
+              }
+
+              const backend = net.connect({ host: targetHost, port: targetPort }, () => {
+                if (this.logging.enableWebSocketLog) {
+                  this.logger.info({ msg: `⚡ [${service.name}] passthrough WS 直通已建立 -> ${targetHost}:${targetPort}` });
+                }
+                service._state!.activeConnections++;
+                flushAndPipe(backend, () => {
+                  service._state!.activeConnections--;
+                });
+              });
+              backend.on('error', (err: Error) => {
+                this.logger.error({ msg: `❌ [${service.name}] passthrough 后端连接失败`, error: err.message });
+                client.destroy();
+              });
+            } catch (error: unknown) {
+              const message = error instanceof Error ? error.message : String(error);
+              this.logger.error({ msg: `❌ [${service.name}] passthrough 服务启动失败`, error: message });
+              client.destroy();
+            }
+          })();
+        };
+
+        client.on('data', (chunk: Buffer) => {
+          if (routed) {
+            /** 已分流但 pipe 尚未建立（启动/连接进行中）：继续缓冲，flushAndPipe 时统一写出 */
+            if (!piped) buffered.push(chunk);
+            return;
+          }
+          const rest = sniffer.feed(chunk);
+          if (!sniffer.parsed) {
+            /** 头未完整：先缓冲已读字节，等分片补齐 */
+            buffered.push(chunk);
+            return;
+          }
+          const headBytes = Buffer.concat([chunk.subarray(0, chunk.length - rest.length)]);
+          buffered.length = 0;
+          /** 头结束符之后的剩余字节（body/后续协议帧）也必须原样转发，不能丢弃 */
+          if (rest.length > 0) buffered.push(rest);
+          route(sniffer.result!.isUpgrade, headBytes);
+        });
+
+        client.on('error', (err: Error) => {
+          this.logger.error({ msg: `❌ [${service.name}] passthrough 客户端连接错误`, error: err.message });
+        });
+      });
+
+      server.on('error', (err: Error) => {
+        this.logger.error({ msg: `❌ passthrough 端口监听失败: ${portNum}`, error: err.message });
+      });
+
+      server.listen(portNum, host, () => {
+        this.logger.info({ msg: `⚡ passthrough 端口绑定已启动: ${host}:${portNum} -> ${service.name} (WS 直通 / HTTP 经内部网关)` });
+      });
+    });
+  }
+
+  /**
+   * 确保服务在线：offline/stopping 时执行启动命令并等待就绪
+   * 复用 startServiceAndProxy 的状态机语义（startingPromises、状态复位），
+   * 但不代理任何请求——供 passthrough 直通路径在建立 TCP 连接前调用
+   */
+  private async ensureServiceOnline(service: ServiceConfig, mapping: RouteMapping): Promise<void> {
+    if (service.proxyOnly || service._state!.status === 'online') return;
+    if (service._state!.status === 'starting') {
+      const pending = this.startingPromises.get(service.name);
+      if (pending) await pending;
+      return;
+    }
+
+    service._state!.status = 'starting';
+    let resolveStartPromise!: () => void;
+    let rejectStartPromise!: (err: Error) => void;
+    const startPromise = new Promise<void>((resolve, reject) => {
+      resolveStartPromise = resolve;
+      rejectStartPromise = reject;
+    });
+    startPromise.catch(() => {});
+    this.startingPromises.set(service.name, startPromise);
+
+    try {
+      await this.serviceManager.start(service);
+      const isReady = await this.waitForBackendReady(
+        service,
+        mapping.targetUrl!.hostname,
+        mapping.targetPort,
+        GatewayConstants.BACKEND_READY_CHECK_DELAY,
+      );
+      if (!isReady) {
+        service._state!.status = 'offline';
+        throw new Error(`服务启动超时: 端口 ${mapping.target} 不可用`);
+      }
+      service._state!.status = 'online';
+      service._state!.startTime = Date.now();
+      service._state!.startCount++;
+      resolveStartPromise();
+      this.startingPromises.delete(service.name);
+    } catch (error: unknown) {
+      this.startingPromises.delete(service.name);
+      if (service._state!.status === 'starting') {
+        service._state!.status = 'offline';
+      }
+      rejectStartPromise!(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+  }
+
+  /**
    * 为指定端口创建监听器
    */
   private createPortBindingListener(host: string, portNum: number, mapping: RouteMapping): void {
     const { service, target } = mapping;
+
+    if (service.passthrough) {
+      this.createPassthroughPortListener(host, portNum, mapping);
+      return;
+    }
 
     const app = uWS.App();
 

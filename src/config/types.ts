@@ -59,6 +59,8 @@ export interface ServiceConfig {
   healthCheck?: HealthCheckConfig;
   /** 纯代理模式：只做反向代理，不启动/停止服务 */
   proxyOnly?: boolean;
+  /** TCP 直通模式：端口路由整条连接纯 TCP 直通；hostname 路由下 WS upgrade 走直通（普通 HTTP 仍走流式代理） */
+  passthrough?: boolean;
 
   // === 简化配置（向后兼容） ===
   /** Hostname 映射（可选）：配置后可通过此 hostname 访问 */
