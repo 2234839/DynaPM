@@ -16,6 +16,10 @@ export function pipeTcpSockets(
 ): void {
   let tornDown = false;
 
+  /** 显式开启 TCP_NODELAY：消除对 Node 默认行为的隐式依赖，直通小包不被 Nagle 缓冲 */
+  client.setNoDelay(true);
+  backend.setNoDelay(true);
+
   /** 销毁双侧 socket 并触发一次清理回调 */
   const teardown = (): void => {
     if (tornDown) return;

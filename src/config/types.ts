@@ -43,6 +43,16 @@ export interface RouteConfig {
   target: string;
 }
 
+/** 服务 HTTP keep-alive Agent 池参数（未配置时使用内置默认值） */
+export interface AgentPoolConfig {
+  /** 每服务最大并发 socket 数（默认 256） */
+  maxSockets?: number;
+  /** 最大空闲 keep-alive socket 数（默认 32） */
+  maxFreeSockets?: number;
+  /** 空闲 socket keep-alive 探活间隔（毫秒，默认 30000） */
+  keepAliveMsecs?: number;
+}
+
 /** 服务配置 */
 export interface ServiceConfig {
   /** 服务标识 */
@@ -61,6 +71,8 @@ export interface ServiceConfig {
   proxyOnly?: boolean;
   /** TCP 直通模式：端口路由整条连接纯 TCP 直通；hostname 路由下 WS upgrade 走直通（普通 HTTP 仍走流式代理） */
   passthrough?: boolean;
+  /** HTTP keep-alive Agent 池参数（可选，未配置使用默认值） */
+  agent?: AgentPoolConfig;
 
   // === 简化配置（向后兼容） ===
   /** Hostname 映射（可选）：配置后可通过此 hostname 访问 */

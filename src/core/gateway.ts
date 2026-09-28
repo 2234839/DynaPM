@@ -93,6 +93,12 @@ const GatewayConstants = {
   TCP_CHECK_TIMEOUT: 100,
   /** 后端就绪检查延迟（毫秒） */
   BACKEND_READY_CHECK_DELAY: 50,
+  /** 冷启动重试间隔（毫秒）：首批快速重试，维持快速就绪即转发的低延迟 */
+  BACKEND_RETRY_FAST_MS: 2,
+  /** 冷启动重试退避上限（毫秒） */
+  BACKEND_RETRY_MAX_MS: 50,
+  /** 冷启动重试退避倍率 */
+  BACKEND_RETRY_BACKOFF: 1.5,
   /** 不应转发的响应头（小写） */
   SKIP_RESPONSE_HEADERS: new Set(['connection', 'transfer-encoding', 'keep-alive', 'content-length']),
   /** 预编译 CRLF 清理正则（热路径中使用） */
@@ -160,6 +166,8 @@ export class Gateway {
   private startingPromises = new Map<string, Promise<void>>();
   /** HTTP keep-alive 连接池：serviceName -> Agent（避免每请求新建 TCP 连接） */
   private agentPool = new Map<string, http.Agent>();
+  /** 每服务的 Agent 池参数（initServices 时从 ServiceConfig.agent 登记） */
+  private serviceAgentOptions = new Map<string, NonNullable<ServiceConfig['agent']>>();
   /** 等待服务停止完成的超时上限（毫秒，可配置注入） */
   private stopWaitMs: number;
   /** 代理请求超时（毫秒，可配置注入） */
@@ -176,7 +184,7 @@ export class Gateway {
       enableWebSocketLog: config.logging?.enableWebSocketLog ?? false,
       enablePerformanceLog: config.logging?.enablePerformanceLog ?? false,
     };
-    this.adminApi = new AdminApiHandler(config, logger, this.hostnameRoutes, this.portRoutes, this.serviceManager);
+    this.adminApi = new AdminApiHandler(config, logger, this.hostnameRoutes, this.portRoutes, this.serviceManager, this);
     this.initServices();
     this.initIdleChecker();
   }
@@ -186,12 +194,13 @@ export class Gateway {
    * @param service - 服务配置（含 healthCheck 与 startTimeout）
    * @param targetHost - 目标主机
    * @param targetPort - 目标端口
-   * @param retryDelayMs - 未就绪时的重试间隔（毫秒）：HTTP 路径原有紧轮询传 0，WS 路径原有 50ms 间隔
+   * @param retryDelayMs - 未就绪时的重试间隔（毫秒）：传 0 时使用内置退避（首试 2ms，上限 50ms）；传正值则固定间隔（WS 路径 50ms）
    * @returns 是否在 startTimeout 内就绪
    */
   private async waitForBackendReady(service: ServiceConfig, targetHost: string, targetPort: number, retryDelayMs: number): Promise<boolean> {
     const waitStartTime = Date.now();
     let isReady = false;
+    let delay = retryDelayMs > 0 ? retryDelayMs : GatewayConstants.BACKEND_RETRY_FAST_MS;
     while (Date.now() - waitStartTime < service.startTimeout) {
       isReady = await this.healthChecker.checkTarget(service, targetHost, targetPort);
       if (isReady) {
@@ -201,8 +210,9 @@ export class Gateway {
         });
         break;
       }
-      if (retryDelayMs > 0) {
-        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      await new Promise(resolve => setTimeout(resolve, delay));
+      if (retryDelayMs <= 0) {
+        delay = Math.min(delay * GatewayConstants.BACKEND_RETRY_BACKOFF, GatewayConstants.BACKEND_RETRY_MAX_MS);
       }
     }
     return isReady;
@@ -216,15 +226,57 @@ export class Gateway {
   private getAgent(serviceName: string): http.Agent {
     let agent = this.agentPool.get(serviceName);
     if (!agent) {
-      agent = new http.Agent({
+      const agentOptions = this.serviceAgentOptions.get(serviceName);
+      const created = new http.Agent({
         keepAlive: true,
-        keepAliveMsecs: 30000,
-        maxSockets: 256,
-        maxFreeSockets: 32,
+        keepAliveMsecs: agentOptions?.keepAliveMsecs ?? 30000,
+        maxSockets: agentOptions?.maxSockets ?? 256,
+        maxFreeSockets: agentOptions?.maxFreeSockets ?? 32,
       });
+      /** 显式开启 TCP_NODELAY：消除对 Node 默认行为的隐式依赖，降低小包转发延迟。
+       *  覆写 Agent 的 createConnection，新建 socket 后立即 setNoDelay */
+      const originalCreateConnection = created.createConnection.bind(created);
+      const patched = created as unknown as {
+        createConnection: (...args: unknown[]) => net.Socket | undefined;
+      };
+      patched.createConnection = (...args: unknown[]) => {
+        const socket = originalCreateConnection(...(args as Parameters<http.Agent['createConnection']>)) as net.Socket | undefined;
+        if (socket) socket.setNoDelay(true);
+        return socket;
+      };
+      agent = created;
       this.agentPool.set(serviceName, agent);
     }
     return agent;
+  }
+
+  /**
+   * 登记服务的 Agent 池参数（initServices 时调用，供 getAgent 建池时消费）
+   */
+  private rememberAgentOptions(service: ServiceConfig): void {
+    if (service.agent) {
+      this.serviceAgentOptions.set(service.name, service.agent);
+    }
+  }
+
+  /**
+   * 查询服务是否仍持有 keep-alive Agent（测试与运维观测用）
+   */
+  isAgentActive(serviceName: string): boolean {
+    return this.agentPool.has(serviceName);
+  }
+
+  /**
+   * 清理服务的 keep-alive Agent：销毁空闲 socket（含 keep-alive 定时器）并从池中移除
+   * 服务停止/闲置回收后必须调用，否则空闲 socket 与定时器泄漏 FD
+   */
+  cleanupAgent(serviceName: string): void {
+    const agent = this.agentPool.get(serviceName);
+    if (agent) {
+      agent.destroy();
+      this.agentPool.delete(serviceName);
+      this.logger.info({ msg: `♻️ [${serviceName}] Agent 池已清理` });
+    }
   }
 
   /**
@@ -239,6 +291,9 @@ export class Gateway {
     console.log('[DynaPM] 服务数量:', Object.keys(this.config.services).length);
 
     for (const service of Object.values(this.config.services)) {
+      // 登记该服务的 Agent 池参数（供 getAgent 建池时消费）
+      this.rememberAgentOptions(service);
+
       // 初始化状态
       service._state = {
         // 纯代理模式：服务始终在线，不需要启动
@@ -331,6 +386,7 @@ export class Gateway {
       this.serviceManager.stop(service).catch((err: Error) => {
         this.logger.error({ msg: `❌ [${service.name}] 停止失败`, error: err.message });
       }).finally(() => {
+        this.cleanupAgent(service.name);
         service._state!.status = 'offline';
       });
     }
@@ -1724,6 +1780,8 @@ export class Gateway {
 
     const stopPromises: Promise<void>[] = [];
     for (const service of cleanedServices) {
+      /** 无论服务是否在运行都清理 Agent 池，避免泄漏 */
+      this.cleanupAgent(service.name);
       if (service._state!.status === 'online' || service._state!.status === 'starting') {
         stopPromises.push(
           this.serviceManager.stop(service).catch((err: Error) => {

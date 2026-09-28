@@ -2,6 +2,7 @@ import type { ServiceConfig } from '../config/types.js';
 import type { HttpResponse, HttpRequest } from 'uWebSockets.js';
 import type { Logger } from 'pino';
 import type { ServiceManager } from './service-manager.js';
+import type { Gateway } from './gateway.js';
 import net from 'node:net';
 import { URL } from 'node:url';
 
@@ -25,13 +26,19 @@ export class AdminApiHandler {
   /** 按服务名称索引的路由映射（懒初始化） */
   private _routeMap: Map<string, RouteMapping> | undefined;
 
+  /** 网关引用（可选，用于停止服务后清理 keep-alive Agent 池） */
+  private gateway?: Pick<Gateway, 'cleanupAgent'>;
+
   constructor(
     private config: DynaPMConfig,
     private logger: Logger,
     private hostnameRoutes: Map<string, RouteMapping>,
     private portRoutes: Map<number, RouteMapping>,
-    private serviceManager: ServiceManager
-  ) {}
+    private serviceManager: ServiceManager,
+    gateway?: Pick<Gateway, 'cleanupAgent'>
+  ) {
+    this.gateway = gateway;
+  }
 
   /** 获取（或首次构建）服务名称索引 */
   private getServiceMap(): Map<string, ServiceConfig> {
@@ -274,6 +281,9 @@ export class AdminApiHandler {
       }
 
       await this.serviceManager.stop(service);
+
+      /** 停止后清理该服务的 keep-alive Agent 池（销毁空闲 socket，防 FD 泄漏） */
+      this.gateway?.cleanupAgent(service.name);
 
       service._state!.status = 'offline';
 

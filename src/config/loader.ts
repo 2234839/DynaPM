@@ -64,6 +64,13 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
     /** 注入全局超时配置（stopTimeoutMs 等供 service-manager 消费） */
     service._timeouts = config.timeouts;
 
+    /** Agent 池参数默认值兜底 */
+    if (service.agent) {
+      service.agent.maxSockets = service.agent.maxSockets || 256;
+      service.agent.maxFreeSockets = service.agent.maxFreeSockets || 32;
+      service.agent.keepAliveMsecs = service.agent.keepAliveMsecs || 30 * 1000;
+    }
+
     // 默认使用TCP端口连通性检查（无需服务修改代码）
     service.healthCheck = service.healthCheck || { type: 'tcp' };
 
