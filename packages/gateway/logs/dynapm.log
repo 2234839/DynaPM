@@ -3917,3 +3917,22 @@
 {"level":30,"time":"2026-09-29T01:23:24.264Z","msg":"🔌 端口绑定已启动: http://127.0.0.1:3151 -> siyuan-mock"}
 {"level":30,"time":"2026-09-29T01:23:24.286Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3152"}
 {"level":30,"time":"2026-09-29T01:23:24.286Z","msg":"ModelRep 网关已启动","port":3150}
+{"level":30,"time":"2026-09-29T05:00:06.227Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T05:00:06.293Z","msg":"📊 共配置 2 个 hostname 映射, 0 个端口绑定"}
+{"level":30,"time":"2026-09-29T05:00:06.306Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3130"}
+{"level":30,"time":"2026-09-29T05:00:06.329Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3131"}
+{"level":30,"time":"2026-09-29T05:00:06.329Z","msg":"ModelRep 网关已启动","port":3130}
+{"level":30,"time":"2026-09-29T05:00:06.760Z","msg":"🚀 [echo-host] POST /echo?echo=ok - 启动服务..."}
+{"level":30,"time":"2026-09-29T05:00:07.080Z","msg":"✅ [echo-host] 服务就绪 (等待113ms)"}
+{"level":40,"time":"2026-09-29T05:00:07.107Z","msg":"⚠️ [echo-host] 请求体超过 10485760 字节，返回 413"}
+{"level":50,"time":"2026-09-29T05:00:07.108Z","msg":"❌ [echo-host] 代理请求错误","error":"socket hang up"}
+{"level":30,"time":"2026-09-29T05:00:07.108Z","msg":"🔄 [echo-host] 后端不可达，重置状态为 offline"}
+{"level":40,"time":"2026-09-29T05:00:07.110Z","msg":"🚫 [Admin API] 拒绝访问: 127.0.0.1"}
+{"level":30,"time":"2026-09-29T05:00:07.118Z","msg":"🚀 [ws-slow] WebSocket - 启动服务..."}
+{"level":40,"time":"2026-09-29T05:00:07.127Z","msg":"⚠️ [ws-slow] WebSocket 消息队列超过 1000 条，主动关闭连接","service":"ws-slow"}
+{"level":30,"time":"2026-09-29T05:00:13.534Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T05:00:13.540Z","msg":"📊 共配置 0 个 hostname 映射, 1 个端口绑定"}
+{"level":30,"time":"2026-09-29T05:00:13.552Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3150"}
+{"level":30,"time":"2026-09-29T05:00:13.573Z","msg":"🔌 端口绑定已启动: http://127.0.0.1:3151 -> siyuan-mock"}
+{"level":30,"time":"2026-09-29T05:00:13.595Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3152"}
+{"level":30,"time":"2026-09-29T05:00:13.595Z","msg":"ModelRep 网关已启动","port":3150}
