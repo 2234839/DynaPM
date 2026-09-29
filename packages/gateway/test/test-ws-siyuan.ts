@@ -153,7 +153,8 @@ function checkPort(port: number): Promise<boolean> {
 
 async function killPort(port: number) {
   try {
-    await execAsync(`lsof -ti:${port} -sTCP:LISTEN | xargs -r kill -9 2>/dev/null`);
+    /** 排除测试进程自身 pid：mock backend 在测试进程内 listen，否则 kill -9 自杀（exit 137） */
+    await execAsync(`lsof -ti:${port} -sTCP:LISTEN | grep -v -w ${process.pid} | xargs -r kill -9 2>/dev/null`);
   } catch {}
 }
 

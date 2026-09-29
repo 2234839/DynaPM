@@ -444,10 +444,15 @@ export class BunGateway {
                     if (self.logging.enableRequestLog) {
                       self.logger.warn({ msg: `⏱️ [${service.name}] 慢客户端停滞超时（>${self.proxyTimeoutMs}ms 未消费响应），断开连接` });
                     }
+                    /**
+                     * 【Bun 平台语义差异】Node 版此处会 res.close() 主动断开客户端
+                     * socket。Bun 1.4.serve 无 per-request socket 断开 API
+                     * （server.timeout(req,0)、closeIdleConnections、controller.error
+                     * 经实测均不能断开有 write 积压的客户端连接——uWS 发送缓冲非空时
+                     * idle 计时不工作），因此只能做后端侧止损：abort 上游 fetch，
+                     * 释放后端连接，保证服务可闲置回收。客户端 socket 留待
+                     * Bun.serve 的 idleTimeout 兜底或客户端主动断开。 */
                     void reader.cancel();
-                    /** Bun 1.4.0 局限：controller.error/close 均不会向停滞客户端发 FIN
-                     *  （服务端无 per-request socket 断开 API）。此处尽力标记流出错，
-                     *  实际 socket 释放依赖客户端主动断开或连接空闲回收。 */
                     try { controller.error(new Error('stall timeout')); } catch { /* 已出错 */ }
                   }, self.proxyTimeoutMs);
                 } else if (controller.desiredSize !== null && controller.desiredSize > 0) {
@@ -663,6 +668,8 @@ export class BunGateway {
     const mainServer = Bun.serve({
       hostname: host,
       port,
+      /** 连接空闲兜底（秒）：Bun 无 per-request 断开 API，慢客户端靠此最终回收 */
+      idleTimeout: 10,
       /**
        * HTTP 入口：hostname 路由分发
        */
@@ -725,6 +732,8 @@ export class BunGateway {
     const server = Bun.serve({
       hostname: host,
       port,
+      /** 连接空闲兜底（秒），与主监听器一致 */
+      idleTimeout: 10,
       fetch: (req, srv) => this.adminApi.handleAdminApi(req, srv.requestIP(req)),
     });
     this.servers.push(server);
@@ -738,6 +747,8 @@ export class BunGateway {
     const server = Bun.serve({
       hostname: host,
       port: portNum,
+      /** 连接空闲兜底（秒），与主监听器一致 */
+      idleTimeout: 10,
       fetch: (req, srv) => {
         if ((req.headers.get('upgrade') || '').toLowerCase() === 'websocket') {
           const prepared = prepareWsUpgrade(req, () => ({ service: mapping.service, target: mapping.target }));
@@ -774,6 +785,8 @@ export class BunGateway {
     const internalServer = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
+      /** 连接空闲兜底（秒），仅承接 loopback 内部流量 */
+      idleTimeout: 10,
       fetch: (req) => this.handlePortRequest(req, mapping),
     });
     this.servers.push(internalServer);

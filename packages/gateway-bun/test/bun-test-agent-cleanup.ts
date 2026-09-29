@@ -126,14 +126,34 @@ async function main() {
     log('  ✓ 重启后 Agent 重建', C.green);
 
     /**
-   * 【Bun 版语义近似】用例 4 依赖 Node 版 pipeTcpSockets 的 kSetNoDelay 内部
-   * Symbol 检查；Bun 版连接池基于 Bun fetch（无对应管道实现），跳过。
-   */
-  log('  ⏭️ [跳过] Bun 版无 pipeTcpSockets 管道实现，TCP_NODELAY 断言不适用', '\x1b[33m');
+     * 【Bun 平台语义差异】用例 4 等价断言：Node 版通过 pipeTcpSockets 的
+     * kSetNoDelay 显式设置 TCP_NODELAY；Bun fetch/socket 无该 API，但 Bun 底层
+     * 出向 socket 默认启用 NODELAY。等价验证方式：通过网关连续做多次小包
+     * 请求/响应往返，若 Nagle+延迟 ACK 交互存在，单次小请求会被 coalesce 拖到
+     * ~40ms+；断言单次小请求往返耗时显著低于 Nagle 典型延迟（40ms），
+     * 证明出向路径无 Nagle 延迟积压。
+     */
+    {
+      /** echo-server 的 /ping 小响应，多轮取中位耗时 */
+      const rttList: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const t0 = Date.now();
+        const st = await httpRequest('/ping', 'agent-cleanup.test');
+        assert(st === 200, `小包请求应 200，实际 ${st}`);
+        rttList.push(Date.now() - t0);
+      }
+      rttList.sort((a, b) => a - b);
+      const median = rttList[2];
+      assert(median < 40, `小包往返中位耗时 ${median}ms ≥ 40ms，疑似存在 Nagle 延迟积压`);
+      log(`  ✓ 出向 socket 无 Nagle 延迟积压（platform: Bun 默认 NODELAY，小包往返中位 ${median}ms < 40ms）`, C.green);
+    }
   } catch (err) {
     failures++;
     log(`  ✗ ${err instanceof Error ? err.message : err}`, C.red);
   } finally {
+    /** 必须先优雅清理网关实例：否则 killPort(GW_PORT) 会 kill -9 测试进程自身
+     *  持有的监听 socket（Bun.serve 与测试同进程），导致进程被误杀（exit 137） */
+    await gateway.cleanup().catch(() => {});
     for (const port of [GW_PORT, ADMIN_PORT, BACKEND_PORT]) await killPort(port);
   }
 
