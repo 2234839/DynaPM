@@ -11,12 +11,12 @@ DynaPM 是一个智能网关(类似nginx)/进程管理工具(类似pm2)，通过
 
 ## 技术栈
 
-- **运行时**: Node.js 22+
+- **运行时**: Bun 1.4+（Bun.serve + bun --compile 单文件二进制）
 - **Web 框架**: uWebSockets.js（最佳性能）
-- **日志**: Pino
+- **日志**: 内置 JSON-line 结构化日志
 - **配置**: c12（支持 TypeScript）
 - **包管理**: pnpm
-- **测试**: tsx + 自定义测试套件
+- **测试**: bun run test/run-all.ts（8 个套件串行）
 
 ## 项目结构
 

@@ -1,123 +1,33 @@
 import { ServiceManager } from './service-manager.js';
 import type { ServiceConfig, DynaPMConfig } from '../config/types.js';
-import type { HttpResponse, HttpRequest, WebSocket } from 'uWebSockets.js';
-import type { Logger } from 'pino';
-import uWS from 'uWebSockets.js';
 import net from 'node:net';
-import { URL } from 'node:url';
-import http from 'node:http';
-import WS from 'ws';
 import { AdminApiHandler } from './admin-api.js';
 import { checkTcpPort, HealthChecker } from './health-checker.js';
-import { pipeTcpSockets } from './tcp-pipe.js';
 import { HttpUpgradeSniffer } from './upgrade-sniffer.js';
 import { formatTime } from '../utils/format.js';
 
 /**
- * 收集 uWS 请求体为 Buffer
- * 在 onData 的 isLast 回调中完成收集
- * 超过 MAX_REQUEST_BODY_SIZE 时截断并返回已收集的数据
- * @param timeoutMs - 慢客户端发送超时（毫秒）：超时未发完 body 时关闭客户端连接并返回 null，
- *   防止慢客户端拖住冷启动流程永久占用后端连接（不传则不启用超时）
- *
- * 重要：uWS 的 onData 回调中的 ArrayBuffer 是借用的，
- * 回调返回后会被回收，必须在回调内复制数据。
+ * 连接池语义对齐（Node 版 http.Agent 池的 Bun 等价物）：
+ * Bun 的 fetch 内部自带连接复用（keep-alive），无法像 Node 那样按服务精细配置
+ * maxSockets/maxFreeSockets，这里用「登记 + 计数 + 停止时清理标记」语义对齐：
+ * - 请求代理后池中存在该服务的条目（isAgentActive 语义等价）
+ * - 服务停止/闲置回收后从池中移除（cleanupAgent 语义等价）
+ * 实际 socket 复用由 Bun fetch 内部连接池承担。
  */
-function collectRequestBody(res: HttpResponse, timeoutMs?: number): Promise<Buffer | null> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    let totalSize = 0;
-    let resolved = false;
-
-    /** 慢客户端停滞计时：超时未发完 body 即断开客户端并中止收集 */
-    let slowTimer: NodeJS.Timeout | undefined;
-    const finish = (result: Buffer | null) => {
-      if (slowTimer) {
-        clearTimeout(slowTimer);
-        slowTimer = undefined;
-      }
-      if (resolved) return;
-      resolved = true;
-      resolve(result);
-    };
-
-    if (timeoutMs && timeoutMs > 0) {
-      slowTimer = setTimeout(() => {
-        slowTimer = undefined;
-        try {
-          res.cork(() => {
-            res.close();
-          });
-        } catch {
-          // 忽略关闭失败
-        }
-        finish(null);
-      }, timeoutMs);
-    }
-
-    res.onData((ab: ArrayBuffer, isLast: boolean) => {
-      if (resolved) return;
-
-      /** allocUnsafe 安全：Buffer.from(ab).copy(chunk) 立即覆盖所有字节 */
-      const chunk = Buffer.allocUnsafe(ab.byteLength);
-      Buffer.from(ab).copy(chunk);
-      totalSize += chunk.length;
-
-      if (totalSize > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
-        /** 超限：返回 413 并结束响应，返回 null 表示不转发 */
-        res.cork(() => {
-          res.writeStatus('413 Payload Too Large');
-          res.end('Payload Too Large');
-        });
-        finish(null);
-        return;
-      }
-
-      chunks.push(chunk);
-      if (isLast) {
-        finish(Buffer.concat(chunks));
-      }
-    });
-
-    res.onAborted(() => {
-      finish(Buffer.concat(chunks));
-    });
-  });
+interface AgentPoolEntry {
+  /** 池参数（登记用，Bun 下不直接生效） */
+  options: NonNullable<ServiceConfig['agent']> | undefined;
+  /** 当前在途请求数（观测用） */
+  inFlight: number;
 }
 
-/** HTTP 状态码消息映射（模块级常量，避免每次请求创建新对象） */
-const HTTP_STATUS_MESSAGES: Readonly<Record<number, string>> = {
-  200: 'OK',
-  201: 'Created',
-  204: 'No Content',
-  301: 'Moved Permanently',
-  302: 'Found',
-  304: 'Not Modified',
-  400: 'Bad Request',
-  401: 'Unauthorized',
-  403: 'Forbidden',
-  404: 'Not Found',
-  405: 'Method Not Allowed',
-  409: 'Conflict',
-  500: 'Internal Server Error',
-  502: 'Bad Gateway',
-  503: 'Service Unavailable',
-};
-
-/** 获取 HTTP 状态消息 */
-function getStatusMessage(statusCode: number): string {
-  return HTTP_STATUS_MESSAGES[statusCode] || 'Unknown';
-}
-
-/** 网关常量 */
+/** 网关常量（与 Node 版 GatewayConstants 语义对齐） */
 const GatewayConstants = {
   /** 闲置检查间隔（毫秒） */
   IDLE_CHECK_INTERVAL: 3000,
-  /** TCP 端口检查超时（毫秒） */
-  TCP_CHECK_TIMEOUT: 100,
   /** 后端就绪检查延迟（毫秒） */
   BACKEND_READY_CHECK_DELAY: 50,
-  /** 冷启动重试间隔（毫秒）：首批快速重试，维持快速就绪即转发的低延迟 */
+  /** 冷启动重试间隔（毫秒） */
   BACKEND_RETRY_FAST_MS: 2,
   /** 冷启动重试退避上限（毫秒） */
   BACKEND_RETRY_MAX_MS: 50,
@@ -125,51 +35,17 @@ const GatewayConstants = {
   BACKEND_RETRY_BACKOFF: 1.5,
   /** 不应转发的响应头（小写） */
   SKIP_RESPONSE_HEADERS: new Set(['connection', 'transfer-encoding', 'keep-alive', 'content-length']),
-  /** 预编译 CRLF 清理正则（热路径中使用） */
-  CRLF_REGEX: /[\r\n]/g,
   /** 不应转发的请求头（小写） */
   SKIP_REQUEST_HEADERS: new Set(['connection', 'keep-alive', 'content-length', 'transfer-encoding']),
   /** WebSocket 升级时不应转发的请求头（小写） */
   WS_SKIP_HEADERS: new Set(['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version']),
   /** 请求体最大大小（10MB），防止 DoS 攻击 */
   MAX_REQUEST_BODY_SIZE: 10 * 1024 * 1024,
-  /** keepWarm 服务默认闲置回收阈值（毫秒），用户未配置 warmIdleTimeout 时使用 */
+  /** keepWarm 服务默认闲置回收阈值（毫秒） */
   WARM_IDLE_TIMEOUT_DEFAULT: 30 * 1000,
   /** WebSocket 消息队列最大长度（1000 条），防止内存泄漏 */
   MAX_WS_MESSAGE_QUEUE_SIZE: 1000,
 } as const;
-
-/**
- * 性能分析状态（enablePerformanceLog 时由 forwardProxyRequest 注入 pipeResponse）
- */
-interface PerfState {
-  /** 是否启用性能统计 */
-  enabled: boolean;
-  /** 准备阶段起始时间戳 */
-  perfPrepStart: number;
-  /** 发起 http.request 的起始时间戳 */
-  perfHttpStart: number;
-  /** 首字节时间（毫秒） */
-  perfTtfb: number;
-  /** 流式转发起始时间戳 */
-  perfStreamStart: number;
-  /** 已转发 chunk 数 */
-  chunkCount: number;
-  /** 已转发总字节数 */
-  totalBytes: number;
-}
-
-/**
- * 代理请求状态跟踪
- */
-interface ProxyState {
-  /** 客户端是否已断开连接 */
-  aborted: boolean;
-  /** 是否已发送响应（防止重复响应） */
-  responded: boolean;
-  /** 代理请求是否超时（用于区分 504 vs 502） */
-  timedOut: boolean;
-}
 
 /**
  * 路由映射信息
@@ -179,56 +55,52 @@ interface RouteMapping {
   service: ServiceConfig;
   /** 目标后端地址 */
   target: string;
-  /** 缓存的目标 URL 对象（避免重复解析） */
-  targetUrl?: URL;
-  /** 预计算的目标端口（避免每次请求 parseInt） */
+  /** 缓存的目标 URL 对象 */
+  targetUrl: URL;
+  /** 预计算的目标端口 */
   targetPort: number;
 }
 
 /**
- * DynaPM 网关
- * 负责请求拦截、服务启动和反向代理
+ * DynaPM 网关 Bun 版
+ * Bun.serve + 原生 fetch 实现，行为与 Node+uWS 版对齐
  */
-export class Gateway {
+export class BunGateway {
   private serviceManager = new ServiceManager();
   /** 主机名路由：hostname -> 路由映射信息 */
   private hostnameRoutes: Map<string, RouteMapping> = new Map();
   /** 端口路由：端口 -> 路由映射信息 */
   private portRoutes: Map<number, RouteMapping> = new Map();
-  /** 日志记录器 */
-  private logger: Logger;
+  /** 日志记录器（pino 兼容接口） */
+  private logger: { info: (obj: { msg: string; error?: unknown; service?: string }) => void; error: (obj: { msg: string; error?: unknown; service?: string }) => void; warn: (obj: { msg: string; error?: unknown; service?: string }) => void };
   /** 日志配置 */
-  private logging: {
-    /** 是否启用请求日志（每个请求响应记录） */
-    enableRequestLog: boolean;
-    /** 是否启用 WebSocket 生命周期日志 */
-    enableWebSocketLog: boolean;
-    /** 是否启用性能分析日志（用于性能优化调试） */
-    enablePerformanceLog: boolean;
-  };
+  private logging: { enableRequestLog: boolean; enableWebSocketLog: boolean };
   /** 管理 API 处理器 */
   private adminApi: AdminApiHandler;
   /** 服务启动 Promise 追踪：serviceName -> 启动完成 Promise */
   private startingPromises = new Map<string, Promise<void>>();
-  /** HTTP keep-alive 连接池：serviceName -> Agent（避免每请求新建 TCP 连接） */
-  private agentPool = new Map<string, http.Agent>();
-  /** 每服务的 Agent 池参数（initServices 时从 ServiceConfig.agent 登记） */
-  private serviceAgentOptions = new Map<string, NonNullable<ServiceConfig['agent']>>();
-  /** 等待服务停止完成的超时上限（毫秒，可配置注入） */
+  /** 连接池登记：serviceName -> 条目（Bun fetch 连接复用语义对齐层） */
+  private agentPool = new Map<string, AgentPoolEntry>();
+  /** 等待服务停止完成的超时上限（毫秒） */
   private stopWaitMs: number;
-  /** 代理请求超时（毫秒，可配置注入） */
+  /** 代理请求超时（毫秒） */
   private proxyTimeoutMs: number;
-  /** 健康检查器：按服务 healthCheck.type 分派就绪检查（默认 tcp 保持原有快速轮询语义） */
+  /** 健康检查器 */
   private healthChecker = new HealthChecker();
+  /** Bun.serve 实例集合（cleanup 时停止） */
+  private servers: Array<{ stop: (closeActiveConnections?: boolean) => void }> = [];
+  /** passthrough TCP 监听器集合（cleanup 时停止） */
+  private tcpListeners: Array<{ stop: (closeActiveConnections?: boolean) => void }> = [];
+  /** 闲置检查器定时器 */
+  private idleTimer: ReturnType<typeof setInterval> | undefined;
 
-  constructor(private config: DynaPMConfig, logger: Logger) {
+  constructor(private config: DynaPMConfig, logger: BunGateway['logger']) {
     this.logger = logger;
     this.stopWaitMs = config.timeouts?.stopWaitMs ?? 30000;
     this.proxyTimeoutMs = config.timeouts?.proxyTimeoutMs ?? 30000;
     this.logging = {
       enableRequestLog: config.logging?.enableRequestLog ?? false,
       enableWebSocketLog: config.logging?.enableWebSocketLog ?? false,
-      enablePerformanceLog: config.logging?.enablePerformanceLog ?? false,
     };
     this.adminApi = new AdminApiHandler(config, logger, this.hostnameRoutes, this.portRoutes, this.serviceManager, this);
     this.initServices();
@@ -236,11 +108,11 @@ export class Gateway {
   }
 
   /**
-   * 等待后端就绪：按服务 healthCheck.type 分派检查，默认 tcp 沿用原有快速轮询语义
-   * @param service - 服务配置（含 healthCheck 与 startTimeout）
+   * 等待后端就绪：按服务 healthCheck.type 分派检查，默认 tcp 快速轮询
+   * @param service - 服务配置
    * @param targetHost - 目标主机
    * @param targetPort - 目标端口
-   * @param retryDelayMs - 未就绪时的重试间隔（毫秒）：传 0 时使用内置退避（首试 2ms，上限 50ms）；传正值则固定间隔（WS 路径 50ms）
+   * @param retryDelayMs - 未就绪时重试间隔；传 0 时使用内置退避
    * @returns 是否在 startTimeout 内就绪
    */
   private async waitForBackendReady(service: ServiceConfig, targetHost: string, targetPort: number, retryDelayMs: number): Promise<boolean> {
@@ -251,9 +123,7 @@ export class Gateway {
       isReady = await this.healthChecker.checkTarget(service, targetHost, targetPort);
       if (isReady) {
         const waitDuration = Date.now() - waitStartTime;
-        this.logger.info({
-          msg: `✅ [${service.name}] 服务就绪 (等待${formatTime(waitDuration)})`,
-        });
+        this.logger.info({ msg: `✅ [${service.name}] 服务就绪 (等待${formatTime(waitDuration)})` });
         break;
       }
       await new Promise(resolve => setTimeout(resolve, delay));
@@ -265,64 +135,33 @@ export class Gateway {
   }
 
   /**
-   * 获取服务对应的 keep-alive Agent（按服务缓存，跨路由共享）
-   * 后端重启导致池中 socket 失效时，socket 会触发 error 由请求侧 error handler 兜底，
-   * Agent 会自动移除失效 socket，后续请求重建连接。
-   */
-  private getAgent(serviceName: string): http.Agent {
-    let agent = this.agentPool.get(serviceName);
-    if (!agent) {
-      const agentOptions = this.serviceAgentOptions.get(serviceName);
-      const created = new http.Agent({
-        keepAlive: true,
-        keepAliveMsecs: agentOptions?.keepAliveMsecs ?? 30000,
-        maxSockets: agentOptions?.maxSockets ?? 256,
-        maxFreeSockets: agentOptions?.maxFreeSockets ?? 32,
-      });
-      /** 显式开启 TCP_NODELAY：消除对 Node 默认行为的隐式依赖，降低小包转发延迟。
-       *  覆写 Agent 的 createConnection，新建 socket 后立即 setNoDelay */
-      const originalCreateConnection = created.createConnection.bind(created);
-      const patched = created as unknown as {
-        createConnection: (...args: unknown[]) => net.Socket | undefined;
-      };
-      patched.createConnection = (...args: unknown[]) => {
-        const socket = originalCreateConnection(...(args as Parameters<http.Agent['createConnection']>)) as net.Socket | undefined;
-        if (socket) socket.setNoDelay(true);
-        return socket;
-      };
-      agent = created;
-      this.agentPool.set(serviceName, agent);
-    }
-    return agent;
-  }
-
-  /**
-   * 登记服务的 Agent 池参数（initServices 时调用，供 getAgent 建池时消费）
-   */
-  private rememberAgentOptions(service: ServiceConfig): void {
-    if (service.agent) {
-      this.serviceAgentOptions.set(service.name, service.agent);
-    }
-  }
-
-  /**
-   * 查询服务是否仍持有 keep-alive Agent（测试与运维观测用）
+   * 查询服务是否仍持有连接池条目（Node 版 isAgentActive 语义等价）
    */
   isAgentActive(serviceName: string): boolean {
     return this.agentPool.has(serviceName);
   }
 
   /**
-   * 清理服务的 keep-alive Agent：销毁空闲 socket（含 keep-alive 定时器）并从池中移除
-   * 服务停止/闲置回收后必须调用，否则空闲 socket 与定时器泄漏 FD
+   * 清理服务的连接池登记：Node 版 cleanupAgent 语义等价。
+   * Bun fetch 的底层 socket 无法按服务定向销毁，这里移除登记条目；
+   * 后端停止后池中旧 socket 首次复用失败时 Bun 会自动重建连接。
    */
   cleanupAgent(serviceName: string): void {
-    const agent = this.agentPool.get(serviceName);
-    if (agent) {
-      agent.destroy();
-      this.agentPool.delete(serviceName);
+    if (this.agentPool.delete(serviceName)) {
       this.logger.info({ msg: `♻️ [${serviceName}] Agent 池已清理` });
     }
+  }
+
+  /**
+   * 获取（或创建）服务的连接池登记条目
+   */
+  private getAgentEntry(serviceName: string, service: ServiceConfig): AgentPoolEntry {
+    let entry = this.agentPool.get(serviceName);
+    if (!entry) {
+      entry = { options: service.agent, inFlight: 0 };
+      this.agentPool.set(serviceName, entry);
+    }
+    return entry;
   }
 
   /**
@@ -332,17 +171,11 @@ export class Gateway {
     if (!this.config.services) {
       return;
     }
-
-    console.log('[DynaPM] 初始化服务...');
-    console.log('[DynaPM] 服务数量:', Object.keys(this.config.services).length);
+    console.log('[DynaPM-Bun] 初始化服务...');
+    console.log('[DynaPM-Bun] 服务数量:', Object.keys(this.config.services).length);
 
     for (const service of Object.values(this.config.services)) {
-      // 登记该服务的 Agent 池参数（供 getAgent 建池时消费）
-      this.rememberAgentOptions(service);
-
-      // 初始化状态
       service._state = {
-        // 纯代理模式：服务始终在线，不需要启动
         status: service.proxyOnly ? 'online' : 'offline',
         lastAccessTime: Date.now(),
         activeConnections: 0,
@@ -350,16 +183,14 @@ export class Gateway {
         totalUptime: 0,
       };
 
-      // 处理路由配置
       const routes = service.routes || [];
       if (routes.length === 0) {
-        console.warn(`[DynaPM] ⚠️  [${service.name}] 没有配置路由`);
+        console.warn(`[DynaPM-Bun] ⚠️  [${service.name}] 没有配置路由`);
         continue;
       }
 
-      console.log(`[DynaPM] ✅ [${service.name}] 配置了 ${routes.length} 个路由:`);
+      console.log(`[DynaPM-Bun] ✅ [${service.name}] 配置了 ${routes.length} 个路由:`);
 
-      // 遍历路由配置
       for (const route of routes) {
         const targetUrl = new URL(route.target);
         const mapping: RouteMapping = {
@@ -371,18 +202,18 @@ export class Gateway {
         if (route.type === 'host') {
           const hostname = route.value as string;
           this.hostnameRoutes.set(hostname, mapping);
-          console.log(`[DynaPM]   └─ hostname: ${hostname} -> ${route.target}`);
+          console.log(`[DynaPM-Bun]   └─ hostname: ${hostname} -> ${route.target}`);
         } else if (route.type === 'port') {
           const port = route.value as number;
           this.portRoutes.set(port, mapping);
-          console.log(`[DynaPM]   └─ port: ${port} -> ${route.target}`);
+          console.log(`[DynaPM-Bun]   └─ port: ${port} -> ${route.target}`);
         }
       }
     }
 
     const hostnameCount = this.hostnameRoutes.size;
     const portCount = this.portRoutes.size;
-    console.log(`[DynaPM] 📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定`);
+    console.log(`[DynaPM-Bun] 📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定`);
     this.logger.info({ msg: `📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定` });
   }
 
@@ -390,7 +221,7 @@ export class Gateway {
    * 初始化闲置检查器
    */
   private initIdleChecker(): void {
-    setInterval(() => {
+    this.idleTimer = setInterval(() => {
       const now = Date.now();
       const checkedServices = new Set<ServiceConfig>();
 
@@ -400,7 +231,6 @@ export class Gateway {
           this.checkIdleService(mapping.service, now);
         }
       }
-
       for (const mapping of this.portRoutes.values()) {
         if (!checkedServices.has(mapping.service)) {
           checkedServices.add(mapping.service);
@@ -411,13 +241,10 @@ export class Gateway {
   }
 
   /**
-   * 检查单个服务是否闲置
-   * keepWarm 服务使用独立的 warmIdleTimeout 判定（更短的软预热回收阈值），其余服务用通用 idleTimeout
+   * 检查单个服务是否闲置（与 Node 版语义一致：keepWarm 用独立短阈值）
    */
   private checkIdleService(service: ServiceConfig, now: number): void {
-    if (service.proxyOnly) {
-      return;
-    }
+    if (service.proxyOnly) return;
 
     const idleThreshold = service.keepWarm
       ? (service.warmIdleTimeout ?? GatewayConstants.WARM_IDLE_TIMEOUT_DEFAULT)
@@ -444,532 +271,34 @@ export class Gateway {
   }
 
   /**
-   * 处理端口绑定请求
+   * 从 Request 构建代理 fetch 的 headers
+   * 剥离逐跳头，host 重写为目标 host
    */
-  private handlePortBindingRequest(
-    res: HttpResponse,
-    req: HttpRequest,
-    mapping: RouteMapping
-  ): void {
-    const service = mapping.service;
-    const startTime = Date.now();
-    const method = req.getCaseSensitiveMethod();
-    const url = req.getUrl();
-    const queryString = req.getQuery();
-    const fullUrl = queryString ? url + '?' + queryString : url;
-
-    const headers: Record<string, string> = {};
-    const crlfRegex = GatewayConstants.CRLF_REGEX;
-    req.forEach((key: string, value: string) => {
-      headers[key] = (value.includes('\r') || value.includes('\n'))
-        ? value.replace(crlfRegex, '')
-        : value;
+  private buildProxyHeaders(req: Request, targetUrl: URL, hasBody: boolean, bodyLength: number): Headers {
+    const headers = new Headers();
+    req.headers.forEach((value, key) => {
+      if (GatewayConstants.SKIP_REQUEST_HEADERS.has(key)) return;
+      /** 快速路径安全：剥离头值中的 CRLF（防注入，与 Node 版 CRLF 清理语义对齐） */
+      const safe = (value.includes('\r') || value.includes('\n')) ? value.replace(/[\r\n]/g, '') : value;
+      headers.set(key, safe);
     });
+    headers.set('host', targetUrl.host);
+    if (hasBody && bodyLength >= 0) {
+      headers.set('content-length', String(bodyLength));
+    }
+    return headers;
+  }
+
+  /**
+   * 代理转发核心：fetch 到后端并把响应流式回给客户端
+   * @returns Response（可直接被 Bun.serve fetch 返回）
+   */
+  private async proxyRequest(req: Request, mapping: RouteMapping, startTime: number): Promise<Response> {
+    const service = mapping.service;
+    const targetUrl = mapping.targetUrl;
+    const entry = this.getAgentEntry(service.name, service);
 
     service._state!.lastAccessTime = startTime;
-
-    const status = service._state!.status;
-
-    if (status === 'starting') {
-      const startPromise = this.startingPromises.get(service.name);
-      if (startPromise) {
-        this.handleServiceWithStartPromise(res, mapping, fullUrl, startTime, method, headers, startPromise);
-      } else {
-        this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
-      }
-      return;
-    }
-
-    const needsStart = status === 'offline' || status === 'stopping';
-
-    if (needsStart) {
-      if (status === 'stopping') {
-        this.handleServiceWithWait(res, mapping, fullUrl, startTime, method, headers);
-      } else {
-        this.handleServiceStart(res, mapping, fullUrl, startTime, method, headers);
-      }
-    } else {
-      this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
-    }
-  }
-
-  /**
-   * 处理传入的 HTTP 请求
-   */
-  private handleRequest(res: HttpResponse, req: HttpRequest): void {
-    const startTime = Date.now();
-    const hostHeader = req.getHeader('host');
-    let hostname = '';
-    if (hostHeader) {
-      const colonIndex = hostHeader.indexOf(':');
-      hostname = colonIndex !== -1 ? hostHeader.substring(0, colonIndex) : hostHeader;
-    }
-    const method = req.getCaseSensitiveMethod();
-    const url = req.getUrl();
-    const queryString = req.getQuery();
-    const fullUrl = queryString ? url + '?' + queryString : url;
-
-    const mapping = this.hostnameRoutes.get(hostname);
-
-    if (!mapping) {
-      this.logger.info({ msg: `❌ [${hostname}] ${method} ${fullUrl} - 404` });
-      res.cork(() => {
-        res.writeStatus('404 Not Found');
-        res.end(`Service not found: ${hostname}`);
-      });
-      return;
-    }
-
-    const headers: Record<string, string> = {};
-    const crlfRegex = GatewayConstants.CRLF_REGEX;
-    req.forEach((key: string, value: string) => {
-      /** 快速路径：正常请求无 CRLF 字符，用 indexOf 跳过正则替换 */
-      headers[key] = (value.includes('\r') || value.includes('\n'))
-        ? value.replace(crlfRegex, '')
-        : value;
-    });
-
-    const service = mapping.service;
-    service._state!.lastAccessTime = startTime;
-
-    const status = service._state!.status;
-
-    if (status === 'starting') {
-      /** 服务正在启动中，等待启动完成后再代理 */
-      const startPromise = this.startingPromises.get(service.name);
-      if (startPromise) {
-        this.handleServiceWithStartPromise(res, mapping, fullUrl, startTime, method, headers, startPromise);
-      } else {
-        /** 理论上不应该走到这里，但作为兜底处理 */
-        this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
-      }
-      return;
-    }
-
-    const needsStart = status === 'offline' || status === 'stopping';
-
-    if (needsStart) {
-      if (status === 'stopping') {
-        this.handleServiceWithWait(res, mapping, fullUrl, startTime, method, headers);
-      } else {
-        this.handleServiceStart(res, mapping, fullUrl, startTime, method, headers);
-      }
-    } else {
-      this.handleDirectProxy(res, mapping, fullUrl, startTime, method, headers);
-    }
-  }
-
-  /**
-   * 启动服务并代理请求
-   */
-  private async startServiceAndProxy(
-    res: HttpResponse,
-    mapping: RouteMapping,
-    fullUrl: string,
-    startTime: number,
-    method: string,
-    headers: Record<string, string>,
-    body: Buffer,
-  ): Promise<void> {
-    const service = mapping.service;
-    const target = mapping.target;
-
-    this.logger.info({ msg: `🚀 [${service.name}] ${method} ${fullUrl} - 启动服务...` });
-    service._state!.status = 'starting';
-
-    /** 创建启动 Promise 供后续并发请求等待 */
-    let resolveStartPromise: () => void;
-    let rejectStartPromise: (err: Error) => void;
-    const startPromise = new Promise<void>((resolve, reject) => {
-      resolveStartPromise = resolve;
-      rejectStartPromise = reject;
-    });
-    /** 保底消费：启动失败时若尚无并发等待者，被 reject 的 promise 会变成 unhandledRejection 直接杀死进程。
-     *  挂一个空 catch 不影响后续 await（await 拿到的是同一个 promise 的 rejection） */
-    startPromise.catch(() => {});
-    this.startingPromises.set(service.name, startPromise);
-
-    try {
-      await this.serviceManager.start(service);
-
-      const isReady = await this.waitForBackendReady(
-        service,
-        mapping.targetUrl!.hostname,
-        mapping.targetPort,
-        0
-      );
-
-
-      if (!isReady) {
-        service._state!.status = 'offline';
-        throw new Error(`服务启动超时: 端口 ${target} 不可用`);
-      }
-
-      service._state!.status = 'online';
-      service._state!.startTime = Date.now();
-      service._state!.startCount++;
-
-      resolveStartPromise!();
-      this.startingPromises.delete(service.name);
-
-      await this.forwardProxyRequest(res, mapping, fullUrl, startTime, method, headers, body);
-    } catch (error: unknown) {
-      this.startingPromises.delete(service.name);
-      const message = error instanceof Error ? error.message : String(error);
-
-      if (message === 'Client aborted') {
-        resolveStartPromise!();
-        return;
-      }
-
-      rejectStartPromise!(error instanceof Error ? error : new Error(message));
-
-      this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: message });
-      /** 启动失败后将状态复位为 offline，允许后续请求重新按需启动（否则卡死在 starting，后续请求会直接代理到死端口） */
-      if (service._state!.status === 'starting') {
-        service._state!.status = 'offline';
-      }
-      try {
-        res.cork(() => {
-          res.writeStatus('503 Service Unavailable');
-          res.end('Service Unavailable');
-        });
-      } catch {
-        // 忽略发送失败
-      }
-    }
-  }
-
-  /**
-   * 处理需要等待服务停止完成的场景
-   */
-  private handleServiceWithWait(
-    res: HttpResponse,
-    mapping: RouteMapping,
-    fullUrl: string,
-    startTime: number,
-    method: string,
-    headers: Record<string, string>
-  ): void {
-    const service = mapping.service;
-    this.logger.info({ msg: `⏳ [${service.name}] ${method} ${fullUrl} - 等待服务停止完成...` });
-
-    // 边收集请求体边等待服务停止
-    const bodyPromise = collectRequestBody(res, this.proxyTimeoutMs);
-
-    (async () => {
-      const maxWaitTime = this.stopWaitMs;
-      const checkInterval = 100;
-      const waitStartTime = Date.now();
-
-      while (service._state!.status === 'stopping') {
-        if (Date.now() - waitStartTime > maxWaitTime) {
-          this.logger.error({ msg: `❌ [${service.name}] 等待服务停止超时` });
-          try {
-            res.cork(() => {
-              res.writeStatus('503 Service Unavailable');
-              res.end('Service stopping timeout');
-            });
-          } catch {
-            // 忽略发送失败
-          }
-          return;
-        }
-        await new Promise(resolve => setTimeout(resolve, checkInterval));
-      }
-
-      this.logger.info({ msg: `✅ [${service.name}] 服务已停止，开始启动...` });
-      const body = await bodyPromise;
-      /** 超限请求已在 collectRequestBody 中返回 413，不再转发 */
-      if (body === null) return;
-      await this.startServiceAndProxy(res, mapping, fullUrl, startTime, method, headers, body);
-    })();
-  }
-
-  /**
-   * 处理服务正在启动中的场景
-   * 等待启动 Promise 完成后，如果成功则直接代理，如果失败则返回 503
-   */
-  private handleServiceWithStartPromise(
-    res: HttpResponse,
-    mapping: RouteMapping,
-    fullUrl: string,
-    startTime: number,
-    method: string,
-    headers: Record<string, string>,
-    startPromise: Promise<void>,
-  ): void {
-    const bodyPromise = collectRequestBody(res, this.proxyTimeoutMs);
-
-    (async () => {
-      try {
-        await startPromise;
-      } catch {
-        await bodyPromise;
-        try {
-          res.cork(() => {
-            res.writeStatus('503 Service Unavailable');
-            res.end('Service start failed');
-          });
-        } catch {
-          // 忽略发送失败
-        }
-        return;
-      }
-
-      const body = await bodyPromise;
-      /** 超限请求已在 collectRequestBody 中返回 413，不再转发 */
-      if (body === null) return;
-      await this.forwardProxyRequest(res, mapping, fullUrl, startTime, method, headers, body);
-    })();
-  }
-
-  /**
-   * 处理需要启动服务的场景
-   */
-  private handleServiceStart(
-    res: HttpResponse,
-    mapping: RouteMapping,
-    fullUrl: string,
-    startTime: number,
-    method: string,
-    headers: Record<string, string>
-  ): void {
-    const bodyPromise = collectRequestBody(res, this.proxyTimeoutMs);
-
-    (async () => {
-      const body = await bodyPromise;
-      /** 超限请求已在 collectRequestBody 中返回 413，不再转发 */
-      if (body === null) return;
-      await this.startServiceAndProxy(res, mapping, fullUrl, startTime, method, headers, body);
-    })();
-  }
-
-  /**
-   * 公共响应转发实现：101 特判、响应头转发、响应体流式转发（含背压与慢客户端停滞超时）、end/error 处理
-   * handleDirectProxy 与 forwardProxyRequest 共用，保证两处行为一致
-   * 慢客户端停滞超时：客户端背压导致 proxyRes 长时间 pause（超过 proxyTimeoutMs）时，
-   * 断开客户端、销毁后端响应流并清理连接，避免慢客户端永久占用后端连接导致服务无法闲置回收
-   */
-  private pipeResponse(
-    res: HttpResponse,
-    proxyRes: http.IncomingMessage,
-    state: ProxyState,
-    opts: {
-      /** 服务配置（日志与状态） */
-      service: ServiceConfig;
-      /** 请求方法（请求日志） */
-      method: string;
-      /** 请求路径（请求日志） */
-      path: string;
-      /** 请求开始时间戳（请求日志耗时） */
-      startTime: number;
-      /** 响应状态码 */
-      statusCode: number;
-      /** 连接清理回调（activeConnections 递减，幂等） */
-      cleanup: () => void;
-      /** 响应正常结束回调（forwardProxyRequest 用于 resolve Promise） */
-      onEnd?: () => void;
-      /** 响应错误回调（forwardProxyRequest 用于 reject Promise） */
-      onError?: (err: Error) => void;
-      /** 性能分析状态（enablePerformanceLog 时注入，未注入则不做统计） */
-      perf?: PerfState;
-    },
-  ): void {
-    const { service, method, path, startTime, statusCode, cleanup } = opts;
-    const perf = opts.perf;
-
-    if (perf && perf.perfTtfb === 0) {
-      perf.perfTtfb = performance.now() - perf.perfHttpStart;
-      perf.perfStreamStart = performance.now();
-    }
-
-    const statusMessage = getStatusMessage(statusCode);
-
-    /** 慢客户端停滞计时：背压 pause 时启动，恢复可写或流结束时清除 */
-    let stallTimer: NodeJS.Timeout | undefined;
-    const clearStallTimer = () => {
-      if (stallTimer) {
-        clearTimeout(stallTimer);
-        stallTimer = undefined;
-      }
-    };
-
-    // 特殊处理 101 WebSocket 升级
-    if (statusCode === 101) {
-      res.cork(() => {
-        if (state.aborted) return;
-        res.writeStatus(`${statusCode} ${statusMessage}`);
-        for (const key in proxyRes.headers) {
-          if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
-          const value = proxyRes.headers[key];
-          if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
-        }
-        res.end();
-        state.responded = true;
-      });
-      cleanup();
-      opts.onEnd?.();
-      return;
-    }
-
-    // 设置响应头（proxyRes.headers 的 key 已经是小写的，无需 toLowerCase）
-    res.cork(() => {
-      if (state.aborted) return;
-      res.writeStatus(`${statusCode} ${statusMessage}`);
-      for (const key in proxyRes.headers) {
-        if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) continue;
-        const value = proxyRes.headers[key];
-        if (value) res.writeHeader(key, typeof value === 'string' ? value : value.join(', '));
-      }
-    });
-
-    // 流式转发响应体
-    proxyRes.on('data', (chunk: Buffer) => {
-      if (state.aborted) {
-        clearStallTimer();
-        proxyRes.destroy();
-        return;
-      }
-
-      if (perf) {
-        perf.chunkCount++;
-        perf.totalBytes += chunk.length;
-      }
-
-      let writeSuccess = false;
-      res.cork(() => {
-        if (state.aborted) return;
-        writeSuccess = res.write(chunk);
-      });
-
-      if (!writeSuccess) {
-        proxyRes.pause();
-        /** 首次背压时启动停滞计时，超时即判定为慢客户端并断开 */
-        if (!stallTimer) {
-          stallTimer = setTimeout(() => {
-            stallTimer = undefined;
-            if (state.aborted) return;
-            this.logger.error({
-              msg: `⏱️ [${service.name}] 慢客户端停滞超时（>${this.proxyTimeoutMs}ms 未消费响应），断开连接`,
-            });
-            state.responded = true;
-            cleanup();
-            try {
-              /** 直接强制断开客户端连接（无需 cork，close 是强制关闭语义） */
-              res.close();
-            } catch {
-              // 忽略关闭失败
-            }
-            proxyRes.destroy();
-          }, this.proxyTimeoutMs);
-        }
-        res.onWritable(() => {
-          if (state.aborted) {
-            proxyRes.destroy();
-            return false;
-          }
-          clearStallTimer();
-          proxyRes.resume();
-          return true;
-        });
-      }
-    });
-
-    proxyRes.on('end', () => {
-      clearStallTimer();
-      if (state.aborted) {
-        cleanup();
-        opts.onEnd?.();
-        return;
-      }
-
-      const perfStreamTime = perf ? performance.now() - perf.perfStreamStart : 0;
-      const perfTotalTime = perf ? performance.now() - perf.perfPrepStart : 0;
-
-      res.cork(() => {
-        if (state.aborted) return;
-        res.end();
-        state.responded = true;
-
-        if (this.logging.enableRequestLog) {
-          const responseTime = Date.now() - startTime;
-          this.logger.info({
-            msg: `📤 [${service.name}] ${method} ${path} - ${statusCode} - ${formatTime(responseTime)}`,
-            service: service.name,
-            method,
-            path,
-            statusCode,
-            responseTime,
-          });
-        }
-
-        if (perf) {
-          console.error(`⚡ [${service.name}] 性能分析:`, {
-            method,
-            path,
-            statusCode,
-            ttfb: perf.perfTtfb.toFixed(3) + 'ms',
-            streamTime: perfStreamTime.toFixed(3) + 'ms',
-            totalTime: perfTotalTime.toFixed(3) + 'ms',
-            chunkCount: perf.chunkCount,
-            totalBytes: perf.totalBytes,
-            avgChunkSize: perf.chunkCount > 0 ? (perf.totalBytes / perf.chunkCount).toFixed(1) + 'B' : '0B',
-          });
-        }
-      });
-
-      cleanup();
-      opts.onEnd?.();
-    });
-
-    proxyRes.on('error', (err: Error) => {
-      clearStallTimer();
-      if (state.aborted) {
-        cleanup();
-        opts.onEnd?.();
-        return;
-      }
-      this.logger.error({ msg: `❌ [${service.name}] 代理响应错误`, error: err.message });
-      if (!state.responded) {
-        state.responded = true;
-        res.cork(() => {
-          res.writeStatus('502 Bad Gateway');
-          res.end('Bad Gateway');
-        });
-      }
-      cleanup();
-      opts.onError?.(err);
-    });
-  }
-
-  /**
-   * 处理直接代理场景（服务已在线）
-   * 双向流式转发：请求体边收边发，响应体边收边回
-   */
-  private handleDirectProxy(
-    res: HttpResponse,
-    mapping: RouteMapping,
-    fullUrl: string,
-    startTime: number,
-    method: string,
-    headers: Record<string, string>
-  ): void {
-    const service = mapping.service;
-    const targetUrl = mapping.targetUrl!;
-
-    // 构建代理请求头（uWS forEach 的 key 已经是小写，无需 toLowerCase）
-    const proxyHeaders: Record<string, string> = {};
-    const skipHeaders = GatewayConstants.SKIP_REQUEST_HEADERS;
-    for (const key in headers) {
-      if (skipHeaders.has(key)) {
-        continue;
-      }
-      proxyHeaders[key] = headers[key];
-    }
-    proxyHeaders['host'] = targetUrl.host;
-
-    const state: ProxyState = { aborted: false, responded: false, timedOut: false };
     service._state!.activeConnections++;
 
     let cleaned = false;
@@ -977,746 +306,212 @@ export class Gateway {
       if (cleaned) return;
       cleaned = true;
       service._state!.activeConnections--;
+      entry.inFlight--;
     };
 
-    res.onAborted(() => {
-      state.aborted = true;
-      cleanup();
-    });
+    entry.inFlight++;
 
-    // 立即发起代理请求，不等请求体收集完
-    const proxyReq = http.request({
-      hostname: targetUrl.hostname,
-      port: mapping.targetPort,
-      path: fullUrl,
-      method,
-      headers: proxyHeaders,
-      agent: this.getAgent(service.name),
-      timeout: this.proxyTimeoutMs,
-    }, (proxyRes) => {
-      if (state.aborted) {
-        proxyRes.destroy();
-        cleanup();
-        return;
-      }
+    /**
+     * 客户端断开感知：Bun.serve 的 req.signal 在客户端断开时 abort
+     */
+    const abortController = new AbortController();
+    req.signal.addEventListener('abort', () => abortController.abort());
 
-      const statusCode = proxyRes.statusCode || 200;
-      this.pipeResponse(res, proxyRes, state, {
-        service,
-        method,
-        path: fullUrl,
-        startTime,
-        statusCode,
-        cleanup,
-      });
-    });
+    /** 413 预检：content-length 声明超限直接拒绝（不转发） */
+    const declared = parseInt(req.headers.get('content-length') ?? '0');
+    if (declared > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
+      this.logger.warn({ msg: `⚠️ [${service.name}] 请求体超过 ${GatewayConstants.MAX_REQUEST_BODY_SIZE} 字节，返回 413` });
+      return new Response('Payload Too Large', { status: 413 });
+    }
 
-    proxyReq.on('error', (err: Error) => {
-      if (state.aborted) {
-        cleanup();
-        return;
-      }
-      this.logger.error({ msg: `❌ [${service.name}] 代理请求错误`, error: err.message });
-      if (!state.responded) {
-        state.responded = true;
-        res.cork(() => {
-          if (state.timedOut) {
-            res.writeStatus('504 Gateway Timeout');
-            res.end('Gateway Timeout');
-          } else {
-            res.writeStatus('502 Bad Gateway');
-            res.end('Bad Gateway');
+    /**
+     * 请求体流式透传 + 实际字节数计数：无 content-length（chunked）时
+     * 超限即截断并切换为 413 响应（与 Node 版 collectRequestBody 语义对齐）
+     */
+    let requestBody: ReadableStream<Uint8Array> | null = req.body;
+    let bodyOverflow = false;
+    /**
+     * 是否对流做计数包装。包装后转发必须走 chunked（不带 content-length）：
+     * Bun fetch 在「流被提前截断 + 声明超长 content-length」时会等待剩余字节直到
+     * 超时（后端表现为读错误），因此超限场景无法靠事后分支救回。改用 chunked
+     * 后 fetch 正常完成，bodyOverflow 分支可立即返回 413。
+     * 与 Node 版语义近似：Node 版 collectRequestBody 先缓冲后转发，字节根本
+     * 不会到后端；Bun 流式方案中前缀字节会到达后端，但客户端响应面一致。
+     */
+    let wrapsCounter = false;
+    if (requestBody && declared <= GatewayConstants.MAX_REQUEST_BODY_SIZE) {
+      wrapsCounter = true;
+      const source = requestBody;
+      let totalSize = 0;
+      requestBody = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const reader = source.getReader();
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              totalSize += value.byteLength;
+              if (totalSize > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
+                bodyOverflow = true;
+                try { controller.close(); } catch { /* 已关闭 */ }
+                return;
+              }
+              controller.enqueue(value);
+            }
+            controller.close();
+          } catch {
+            try { controller.close(); } catch { /* 已关闭 */ }
           }
+        },
+      });
+    }
+
+    /** 代理请求超时：后端超时未响应 → 504 */
+    const timeoutSignal = AbortSignal.timeout(this.proxyTimeoutMs);
+    const combined = AbortSignal.any([abortController.signal, timeoutSignal]);
+
+    const headers = this.buildProxyHeaders(req, targetUrl, !!requestBody, wrapsCounter ? -1 : declared);
+
+    try {
+      const upstream = await fetch(targetUrl.origin + new URL(req.url).pathname + new URL(req.url).search, {
+        method: req.method,
+        headers,
+        body: requestBody,
+        signal: combined,
+        /** Bun 特有：禁用自动重定向，网关应原样转发 3xx */
+        redirect: 'manual',
+      });
+
+      /** 请求体流式计数发现超限：不信任上游响应，返回 413（与 Node 版「不转发到后端」语义近似：
+       *  流式模式下前缀字节已可能到达后端，但响应面行为一致——客户端拿到 413） */
+      if (bodyOverflow) {
+        cleanup();
+        void upstream.body?.cancel();
+        return new Response('Payload Too Large', { status: 413 });
+      }
+
+      /** 客户端已在等待期间断开 */
+      if (abortController.signal.aborted) {
+        cleanup();
+        return new Response(null, { status: 502 });
+      }
+
+      const responseHeaders = new Headers();
+      upstream.headers.forEach((value, key) => {
+        if (GatewayConstants.SKIP_RESPONSE_HEADERS.has(key)) return;
+        responseHeaders.set(key, value);
+      });
+
+      const statusCode = upstream.status;
+      /** 101 特判：Bun.serve 无法在 HTTP fetch 路径回 101（升级走独立通道），返回空体 200 兜底。
+       *  实际 WS 升级流量走 upgrade 处理器，不会落到这里 */
+      if (statusCode === 101) {
+        cleanup();
+        return new Response(null, { status: 200 });
+      }
+
+      if (this.logging.enableRequestLog) {
+        this.logger.info({
+          msg: `📤 [${service.name}] ${req.method} ${new URL(req.url).pathname} - ${statusCode}`,
+          service: service.name,
         });
       }
-      /** 后端不可达时，将非 proxyOnly 服务状态重置为 offline，允许后续按需启动 */
+
+      /** 响应体流式透传：客户端断开时取消上游（自动背压由 Bun 流机制承担）。
+       *  慢客户端停滞超时：与 Node 版对齐——enqueue 后下游长时间不拉取（背压）
+       *  超过 proxyTimeoutMs 时，取消上游并关闭流（断开客户端连接）。
+       *  实现：desiredSize <= 0 表示下游背压，启动停滞计时；拉取恢复即清除 */
+      let body: ReadableStream<Uint8Array> | null = null;
+      if (upstream.body) {
+        const upstreamBody = upstream.body;
+        /** 箭头函数外捕获 this（stream 回调里 this 不指向网关实例） */
+        const self = this;
+        let stallTimer: ReturnType<typeof setTimeout> | undefined;
+        body = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const reader = upstreamBody.getReader();
+            const clearStall = () => {
+              if (stallTimer) { clearTimeout(stallTimer); stallTimer = undefined; }
+            };
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                controller.enqueue(value);
+                /** 背压检测：desiredSize <= 0 表示下游暂停消费，启动停滞计时（探针） */
+                if (controller.desiredSize !== null && controller.desiredSize <= 0 && !stallTimer) {
+                  stallTimer = setTimeout(() => {
+                    if (self.logging.enableRequestLog) {
+                      self.logger.warn({ msg: `⏱️ [${service.name}] 慢客户端停滞超时（>${self.proxyTimeoutMs}ms 未消费响应），断开连接` });
+                    }
+                    /**
+                     * 【Bun 平台语义差异】Node 版此处会 res.close() 主动断开客户端
+                     * socket。Bun 1.4.serve 无 per-request socket 断开 API
+                     * （server.timeout(req,0)、closeIdleConnections、controller.error
+                     * 经实测均不能断开有 write 积压的客户端连接——uWS 发送缓冲非空时
+                     * idle 计时不工作），因此只能做后端侧止损：abort 上游 fetch，
+                     * 释放后端连接，保证服务可闲置回收。客户端 socket 留待
+                     * Bun.serve 的 idleTimeout 兜底或客户端主动断开。 */
+                    void reader.cancel();
+                    try { controller.error(new Error('stall timeout')); } catch { /* 已出错 */ }
+                  }, self.proxyTimeoutMs);
+                } else if (controller.desiredSize !== null && controller.desiredSize > 0) {
+                  clearStall();
+                }
+              }
+              clearStall();
+              controller.close();
+            } catch {
+              clearStall();
+              try { controller.close(); } catch { /* 已关闭 */ }
+            } finally {
+              cleanup();
+              reader.releaseLock();
+            }
+          },
+          cancel() {
+            void upstreamBody.cancel();
+            cleanup();
+          },
+        });
+      } else {
+        cleanup();
+      }
+
+      return new Response(body, { status: statusCode, headers: responseHeaders });
+    } catch (error: unknown) {
+      cleanup();
+      /** 请求体流式计数发现超限（fetch 中途主动 abort 到达此处）：返回 413。
+       *  必须在客户端断开判断之前：超限 abort 是网关主动行为，客户端仍在线。
+       *  与 Node 版「不转发到后端」语义近似：流式模式下前缀字节已可能到达后端，
+       *  但响应面行为一致——客户端拿到 413 */
+      if (bodyOverflow) {
+        return new Response('Payload Too Large', { status: 413 });
+      }
+      if (abortController.signal.aborted) {
+        /** 客户端断开：无法再回响应，抛出让 Bun 关闭连接 */
+        throw error;
+      }
+
+      const timedOut = timeoutSignal.aborted;
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error({ msg: `❌ [${service.name}] 代理请求错误`, error: message });
+
+      /** 后端不可达时将非 proxyOnly 服务状态重置为 offline（与 Node 版一致） */
       if (!service.proxyOnly && service._state!.status === 'online') {
         this.logger.info({ msg: `🔄 [${service.name}] 后端不可达，重置状态为 offline` });
         service._state!.status = 'offline';
       }
-      cleanup();
-    });
 
-    /** 代理请求超时处理：设置标志后销毁连接，error handler 据此返回 504 */
-    proxyReq.on('timeout', () => {
-      this.logger.error({ msg: `⏱️ [${service.name}] 代理请求超时` });
-      state.timedOut = true;
-      proxyReq.destroy();
-    });
-
-    // 边收请求体边写入代理请求（真正的双向流式）
-    let directBodySize = 0;
-    let directResponded = false;
-    res.onData((ab: ArrayBuffer, isLast: boolean) => {
-      if (state.aborted) {
-        proxyReq.destroy();
-        return;
-      }
-
-      /** uWS 的 ArrayBuffer 是借用语义，必须复制数据（allocUnsafe 安全：copy 立即覆盖所有字节） */
-      const chunk = Buffer.allocUnsafe(ab.byteLength);
-      Buffer.from(ab).copy(chunk);
-      directBodySize += chunk.length;
-
-      /** 请求体超限：销毁代理请求，返回 413，不再转发 */
-      if (directBodySize > GatewayConstants.MAX_REQUEST_BODY_SIZE && !directResponded) {
-        directResponded = true;
-        state.responded = true;
-        proxyReq.destroy();
-        this.logger.warn({ msg: `⚠️ [${service.name}] 请求体超过 ${GatewayConstants.MAX_REQUEST_BODY_SIZE} 字节，返回 413` });
-        res.cork(() => {
-          if (state.aborted) return;
-          res.writeStatus('413 Payload Too Large');
-          res.end('Payload Too Large');
-        });
-        cleanup();
-        return;
-      }
-
-      if (isLast) {
-        if (!directResponded) proxyReq.end(chunk);
-      } else {
-        if (!directResponded) proxyReq.write(chunk);
-      }
-    });
-  }
-
-  /**
-   * 发起代理请求并流式转发响应（用于服务启动/等待场景）
-   *
-   * 仅在服务需要启动或等待停止时使用，此时请求体已缓冲为 Buffer。
-   * 响应体保持流式转发。
-   */
-  private async forwardProxyRequest(
-    res: HttpResponse,
-    mapping: RouteMapping,
-    path: string,
-    startTime: number,
-    method: string,
-    headers: Record<string, string>,
-    body: Buffer,
-  ): Promise<void> {
-    const service = mapping.service;
-    const perfLog = this.logging.enablePerformanceLog;
-
-    const perfPrepStart = perfLog ? performance.now() : 0;
-    const targetUrl = mapping.targetUrl!;
-
-    // 构建代理请求头（uWS forEach 的 key 已经是小写，无需 toLowerCase）
-    const proxyHeaders: Record<string, string> = {};
-    const skipHeaders = GatewayConstants.SKIP_REQUEST_HEADERS;
-    for (const key in headers) {
-      if (skipHeaders.has(key)) {
-        continue;
-      }
-      proxyHeaders[key] = headers[key];
-    }
-    proxyHeaders['host'] = targetUrl.host;
-
-    // 如果有请求体，设置 content-length
-    if (body.length > 0) {
-      proxyHeaders['content-length'] = String(body.length);
-    }
-
-    const state: ProxyState = { aborted: false, responded: false, timedOut: false };
-    service._state!.activeConnections++;
-
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      service._state!.activeConnections--;
-    };
-
-    res.onAborted(() => {
-      state.aborted = true;
-      cleanup();
-    });
-
-    const perfHttpStart = perfLog ? performance.now() : 0;
-    const perf: PerfState = {
-      enabled: perfLog,
-      perfPrepStart,
-      perfHttpStart,
-      perfTtfb: 0,
-      perfStreamStart: 0,
-      chunkCount: 0,
-      totalBytes: 0,
-    };
-
-    return new Promise((resolve, reject) => {
-      let proxyReq: http.ClientRequest;
-
-      try {
-        proxyReq = http.request({
-          hostname: targetUrl.hostname,
-          port: mapping.targetPort,
-          path,
-          method,
-          headers: proxyHeaders,
-          agent: this.getAgent(service.name),
-          timeout: this.proxyTimeoutMs,
-        }, (proxyRes) => {
-          const statusCode = proxyRes.statusCode || 200;
-
-          if (state.aborted) {
-            proxyRes.destroy();
-            cleanup();
-            resolve();
-            return;
-          }
-
-          this.pipeResponse(res, proxyRes, state, {
-            service,
-            method,
-            path,
-            startTime,
-            statusCode,
-            cleanup,
-            onEnd: resolve,
-            onError: reject,
-            perf: perfLog ? perf : undefined,
-          });
-        });
-
-        proxyReq.on('error', (err: Error) => {
-          if (state.aborted) {
-            cleanup();
-            resolve();
-            return;
-          }
-
-          this.logger.error({ msg: `❌ [${service.name}] 代理请求错误`, error: err.message });
-          if (!state.responded) {
-            state.responded = true;
-            res.cork(() => {
-              if (state.timedOut) {
-                res.writeStatus('504 Gateway Timeout');
-                res.end('Gateway Timeout');
-              } else {
-                res.writeStatus('502 Bad Gateway');
-                res.end('Bad Gateway');
-              }
-            });
-          }
-          cleanup();
-          reject(err);
-        });
-
-        /** 代理请求超时处理：设置标志后销毁连接，error handler 据此返回 504 */
-        proxyReq.on('timeout', () => {
-          this.logger.error({ msg: `⏱️ [${service.name}] 代理请求超时` });
-          state.timedOut = true;
-          proxyReq.destroy();
-        });
-
-        // 发送请求体（空 body 也会调用 end 来触发请求）
-        if (body.length > 0) {
-          proxyReq.end(body);
-        } else {
-          proxyReq.end();
-        }
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.logger.error({ msg: `❌ [${service.name}] 创建代理请求失败`, error: message });
-        if (!state.responded) {
-          state.responded = true;
-          res.cork(() => {
-            res.writeStatus('502 Bad Gateway');
-            res.end('Bad Gateway');
-          });
-        }
-        cleanup();
-        reject(new Error(message));
-      }
-    });
-  }
-
-  /**
-   * 启动网关
-   */
-  async start(): Promise<void> {
-    const host = this.config.host || '127.0.0.1';
-    const port = this.config.port || 3000;
-
-    const app = uWS.App();
-
-    // WebSocket 处理器（hostname 路由：upgrade 时按 Host 头解析目标服务）
-    app.ws('/*', this.createWsProxyBehavior({
-      resolveContext: (res, req) => {
-        const hostname = req.getHeader('host')?.split(':')[0] || '';
-        const mapping = this.hostnameRoutes.get(hostname);
-
-        if (!mapping) {
-          res.cork(() => {
-            res.writeStatus('404 Not Found');
-            res.end(`Service not found: ${hostname}`);
-          });
-          return null;
-        }
-
-        return { service: mapping.service, target: mapping.target, hostname };
-      },
-    }));
-
-    app.any('/*', (res: HttpResponse, req: HttpRequest) => {
-      this.handleRequest(res, req);
-    });
-
-    app.listen(host, port, (token: unknown) => {
-      if (token) {
-        this.logger.info({ msg: `DynaPM 网关已启动: http://${host}:${port}` });
-      } else {
-        this.logger.error({ msg: `❌ DynaPM 网关启动失败: ${host}:${port}` });
-      }
-    });
-
-    for (const [portNum, mapping] of this.portRoutes) {
-      this.createPortBindingListener(host, portNum, mapping);
-    }
-
-    const adminApiConfig = this.config.adminApi;
-    if (adminApiConfig && adminApiConfig.enabled !== false && adminApiConfig.port) {
-      this.createAdminApiListener(host, adminApiConfig.port);
+      return timedOut
+        ? new Response('Gateway Timeout', { status: 504 })
+        : new Response('Bad Gateway', { status: 502 });
     }
   }
 
   /**
-   * 为管理 API 创建监听器
-   */
-  private createAdminApiListener(host: string, port: number): void {
-    const app = uWS.App();
-
-    app.any('/*', (res: HttpResponse, req: HttpRequest) => {
-      this.adminApi.handleAdminApi(res, req);
-    });
-
-    app.listen(host, port, (token: unknown) => {
-      if (token) {
-        this.logger.info({ msg: `🔌 管理 API 已启动: http://${host}:${port}` });
-      } else {
-        this.logger.error({ msg: `❌ 管理 API 启动失败: ${host}:${port}` });
-      }
-    });
-  }
-
-  /**
-   * 创建可复用的 WebSocket 代理 uWS behavior
-   * hostname 路由与端口路由共用同一实现，差异仅在于 upgrade 时的目标解析方式（resolveContext）
-   * open 后按需启动服务、等待就绪（走 HealthChecker，默认 tcp）、建立后端 WS 并双向转发；
-   * 客户端->后端方向带消息队列，后端->客户端方向带背压处理（ws.send 返回 false 时 pause 后端，drain 恢复）
-   */
-  private createWsProxyBehavior(options: {
-    /**
-     * upgrade 阶段解析路由目标
-     * @param res - uWS 响应对象（用于 404）
-     * @param req - uWS 请求对象
-     * @returns 解析结果；返回 null 表示路由未命中（已回应 404，不再 upgrade）
-     */
-    resolveContext: (res: HttpResponse, req: HttpRequest) => { service: ServiceConfig; target: string } | null;
-  }): uWS.WebSocketBehavior<Record<string, unknown>> {
-
-    return {
-      /** 单帧最大 16MB：uWS 默认仅 4KB 级别，思源等场景的大同步块（2MB+）会被静默断连（1006） */
-      maxPayloadLength: 16 * 1024 * 1024,
-      upgrade: (res: HttpResponse, req: HttpRequest, context) => {
-        const resolved = options.resolveContext(res, req);
-        if (!resolved) return;
-
-        const { service, target } = resolved;
-        service._state!.lastAccessTime = Date.now();
-
-        const clientHeaders: Record<string, string> = {};
-        req.forEach((key: string, value: string) => {
-          const safeValue = value.replace(GatewayConstants.CRLF_REGEX, '');
-          clientHeaders[key] = safeValue;
-        });
-
-        const clientPath = req.getUrl() + (req.getQuery() ? `?${req.getQuery()}` : '');
-
-        /** 客户端请求的子协议，透传给后端 */
-        const clientProtocols = req.getHeader('sec-websocket-protocol')
-          ? req.getHeader('sec-websocket-protocol').split(',').map((p) => p.trim()).filter(Boolean)
-          : undefined;
-
-        res.upgrade(
-          {
-            service,
-            target,
-            clientHeaders,
-            clientPath,
-            clientProtocols,
-          },
-          req.getHeader('sec-websocket-key'),
-          req.getHeader('sec-websocket-protocol'),
-          req.getHeader('sec-websocket-extensions'),
-          context
-        );
-
-        if (this.logging.enableWebSocketLog) {
-          this.logger.info({ msg: `🔌 [${service.name}] WebSocket 升级请求: ${clientPath}` });
-        }
-      },
-
-      open: (ws: WebSocket<Record<string, unknown>>) => {
-        const userData = ws.getUserData();
-        const service = userData.service as ServiceConfig;
-        const target = userData.target as string;
-
-        service._state!.activeConnections++;
-
-        if (this.logging.enableWebSocketLog) {
-          this.logger.info({ msg: `🔌 [${service.name}] WebSocket 连接已建立` });
-        }
-
-        const wsState = {
-          backendReady: false,
-          messageQueue: [] as { data: Buffer; isBinary: boolean }[],
-          backendWs: undefined as WS | undefined,
-          closing: false,
-        };
-        (ws as unknown as Record<string, unknown>).wsState = wsState;
-
-        (async () => {
-          try {
-            const needsStart = service._state!.status === 'offline';
-            const targetUrl = new URL(target);
-            const targetPort = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'));
-
-            if (needsStart) {
-              this.logger.info({ msg: `🚀 [${service.name}] WebSocket - 启动服务...` });
-              service._state!.status = 'starting';
-
-              await this.serviceManager.start(service);
-
-              const isReady = await this.waitForBackendReady(service, targetUrl.hostname, targetPort, GatewayConstants.BACKEND_READY_CHECK_DELAY);
-
-              if (!isReady) {
-                service._state!.status = 'offline';
-                this.logger.error({ msg: `❌ [${service.name}] WebSocket 服务启动超时` });
-                ws.close();
-                return;
-              }
-
-              service._state!.status = 'online';
-              service._state!.startTime = Date.now();
-              service._state!.startCount++;
-            }
-
-            const wsUserData = ws.getUserData();
-            const clientPath = wsUserData.clientPath as string;
-            const clientHeaders = wsUserData.clientHeaders as Record<string, string>;
-            const wsUrl = `${targetUrl.protocol === 'https:' ? 'wss:' : 'ws:'}//${targetUrl.host}${clientPath}`;
-
-            if (this.logging.enableWebSocketLog) {
-              this.logger.info({ msg: `🔌 [${service.name}] 连接后端 WebSocket: ${wsUrl}` });
-            }
-
-            const backendHeaders: Record<string, string> = {};
-            const skipHeaders = GatewayConstants.WS_SKIP_HEADERS;
-
-            for (const key in clientHeaders) {
-              if (!skipHeaders.has(key)) {
-                backendHeaders[key] = clientHeaders[key];
-              }
-            }
-
-            backendHeaders['Host'] = targetUrl.host;
-
-            /** 子协议透传：ws 库第二参数 protocols 握手时带 sec-websocket-protocol 头 */
-            const clientProtocols = wsUserData.clientProtocols as string[] | undefined;
-            const backendWs = clientProtocols && clientProtocols.length > 0
-              ? new WS(wsUrl, clientProtocols, { headers: backendHeaders })
-              : new WS(wsUrl, { headers: backendHeaders });
-            wsState.backendWs = backendWs;
-
-            backendWs.on('open', () => {
-              if (this.logging.enableWebSocketLog) {
-                this.logger.info({ msg: `✅ [${service.name}] 后端 WebSocket 连接已建立` });
-              }
-              wsState.backendReady = true;
-
-              if (this.logging.enableWebSocketLog) {
-                this.logger.info({ msg: `📤 [${service.name}] 发送队列中的 ${wsState.messageQueue.length} 条消息` });
-              }
-              while (wsState.messageQueue.length > 0 && backendWs.readyState === WS.OPEN) {
-                const queued = wsState.messageQueue.shift();
-                if (queued) {
-                  backendWs.send(queued.data, { binary: queued.isBinary });
-                }
-              }
-            });
-
-            backendWs.on('message', (data: Buffer, isBinary: boolean) => {
-              if (ws !== null) {
-                const success = ws.send(data, isBinary, false);
-                if (!success) {
-                  /** 客户端侧背压：暂停后端读取，客户端可写（drain）后重发并恢复 */
-                  backendWs.pause();
-
-                  const drainHandler = () => {
-                    if (backendWs.readyState === WS.OPEN) {
-                      const retrySuccess = ws.send(data, isBinary, false);
-                      if (retrySuccess) {
-                        backendWs.resume();
-                      } else {
-                        return true;
-                      }
-                    }
-                    return false;
-                  };
-
-                  ws.cork(drainHandler);
-                }
-              }
-            });
-
-            backendWs.on('close', (code: number, reason: Buffer) => {
-              if (this.logging.enableWebSocketLog) {
-                this.logger.info({ msg: `🔌 [${service.name}] 后端 WebSocket 连接关闭 code=${code}` });
-              }
-              if (ws !== null && !wsState.closing) {
-                wsState.closing = true;
-                /** 透传后端关闭码/原因给客户端（1000/1005 之外的常规透传，异常码原样传递） */
-                if (code && code !== 1000 && code !== 1005) {
-                  const reasonText = (reason?.toString('utf8') || '').slice(0, 123);
-                  ws.end(code, reasonText);
-                } else {
-                  ws.close();
-                }
-              }
-            });
-
-            /** 转发后端协议层 ping 帧给客户端，保证客户端心跳 pong 可感知 */
-            backendWs.on('ping', (data: Buffer) => {
-              if (ws !== null) {
-                ws.cork(() => {
-                  ws.ping(data);
-                });
-              }
-            });
-
-            backendWs.on('error', (err: Error) => {
-              this.logger.error({ msg: `❌ [${service.name}] 后端 WebSocket 错误`, error: err.message });
-              wsState.closing = true;
-              if (ws !== null) {
-                ws.close();
-              }
-            });
-
-            backendWs.on('pause', () => {
-              if (this.logging.enableWebSocketLog) {
-                this.logger.info({ msg: `⏸️ [${service.name}] 后端 WebSocket 暂停（背压）` });
-              }
-            });
-
-            backendWs.on('resume', () => {
-              if (this.logging.enableWebSocketLog) {
-                this.logger.info({ msg: `▶️ [${service.name}] 后端 WebSocket 恢复` });
-              }
-            });
-
-          } catch (error: unknown) {
-            const message = error instanceof Error ? error.message : String(error);
-            this.logger.error({ msg: `❌ [${service.name}] WebSocket 连接失败`, error: message });
-            if (ws !== null) {
-              ws.close();
-            }
-          }
-        })();
-      },
-
-      message: (ws: WebSocket<Record<string, unknown>>, message: ArrayBuffer, isBinary: boolean) => {
-        const userData = ws.getUserData();
-        const service = userData.service as ServiceConfig;
-        const wsState = (ws as unknown as Record<string, unknown>).wsState as {
-          backendReady: boolean;
-          messageQueue: { data: Buffer; isBinary: boolean }[];
-          backendWs?: WS;
-          closing?: boolean;
-        };
-
-        /**
-         * uWS message 回调的 ArrayBuffer 是借用的（回调返回后会被回收/复用），
-         * 必须显式拷贝：Buffer.from(Uint8Array) 才是真实拷贝（Buffer.from(ArrayBuffer) 仅创建视图）
-         */
-        const msgBuffer = Buffer.from(new Uint8Array(message));
-
-        if (wsState.backendReady && wsState.backendWs && wsState.backendWs.readyState === WS.OPEN) {
-          if (this.logging.enableWebSocketLog) {
-            this.logger.info({ msg: `📨 [${service.name}] 转发消息到后端: ${msgBuffer.length} 字节 binary=${isBinary}` });
-          }
-          wsState.backendWs.send(msgBuffer, { binary: isBinary });
-          service._state!.lastAccessTime = Date.now();
-        } else {
-          if (this.logging.enableWebSocketLog) {
-            this.logger.info({ msg: `📦 [${service.name}] 消息加入队列` });
-          }
-          if (wsState.messageQueue.length < GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE) {
-            wsState.messageQueue.push({ data: msgBuffer, isBinary });
-          } else {
-            /** 队列超限：记录 warning 并主动关闭连接，让客户端可感知并重连 */
-            this.logger.warn({
-              msg: `⚠️ [${service.name}] WebSocket 消息队列超过 ${GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE} 条，主动关闭连接`,
-              service: service.name,
-            });
-            wsState.closing = true;
-            ws.close();
-          }
-        }
-      },
-
-      close: (ws: WebSocket<Record<string, unknown>>) => {
-        const userData = ws.getUserData();
-        const service = userData.service as ServiceConfig;
-        service._state!.activeConnections--;
-
-        if (this.logging.enableWebSocketLog) {
-          this.logger.info({ msg: `🔌 [${service.name}] 客户端 WebSocket 连接关闭` });
-        }
-
-        const wsState = (ws as unknown as Record<string, unknown>).wsState as {
-          backendWs?: WS;
-          closing?: boolean;
-        } | undefined;
-
-        if (wsState?.backendWs && wsState.backendWs.readyState === WS.OPEN) {
-          wsState.closing = true;
-          wsState.backendWs.close();
-        }
-      },
-    };
-  }
-
-  /**
-   * 为 passthrough 服务创建端口监听器（纯 TCP 层，绕过 uWS）
-   * 架构：
-   *  - 外层 net server 监听配置端口，嗅探每个连接的首个 HTTP 请求头
-   *  - WS upgrade 连接：按需启动服务、等就绪后整条连接 TCP 直通（原始头字节 + 已缓冲字节原样转发）
-   *  - 非 upgrade 的普通 HTTP 连接：pipe 到内部 uWS app（动态 loopback 端口），
-   *    复用现有 uWS 流式代理与 WS 代理行为，保持完整可观测性
-   */
-  private createPassthroughPortListener(host: string, portNum: number, mapping: RouteMapping): void {
-    const { service, target } = mapping;
-    const targetUrl = new URL(target);
-    const targetHost = targetUrl.hostname;
-    const targetPort = mapping.targetPort;
-
-    /** 内部 uWS app：承接普通 HTTP 连接（含可能后续出现的 WS upgrade——只有非直通分流会到这） */
-    const internalApp = uWS.App();
-    internalApp.ws('/*', this.createWsProxyBehavior({
-      resolveContext: () => ({ service, target }),
-    }));
-    internalApp.any('/*', (res: HttpResponse, req: HttpRequest) => {
-      this.handlePortBindingRequest(res, req, mapping);
-    });
-
-    internalApp.listen('127.0.0.1', 0, (token) => {
-      if (!token) {
-        this.logger.error({ msg: `❌ [${service.name}] passthrough 内部 uWS 监听失败` });
-        return;
-      }
-      const internalPort = uWS.us_socket_local_port(token);
-
-      const server = net.createServer((client) => {
-        const sniffer = new HttpUpgradeSniffer();
-        const buffered: Buffer[] = [];
-        let routed = false;
-        /** 是否已把缓冲字节写出并建立 pipe（写出前到达的字节必须继续缓冲） */
-        let piped = false;
-
-        /** 分流：决定连接去向（直通后端 或 内部 uWS） */
-        const route = (isUpgrade: boolean, headBytes: Buffer): void => {
-          routed = true;
-          service._state!.lastAccessTime = Date.now();
-
-          /** 将缓冲字节写出并建立双向 pipe，之后到达的字节由 socket 流直接承载 */
-          const flushAndPipe = (socket: net.Socket, onDestroyed: () => void): void => {
-            if (headBytes.length > 0) socket.write(headBytes);
-            for (const b of buffered) socket.write(b);
-            buffered.length = 0;
-            piped = true;
-            pipeTcpSockets(client, socket, onDestroyed);
-          };
-
-          if (!isUpgrade) {
-            /** 普通 HTTP：连同已读头字节一起交给内部 uWS（保证字节流不丢不重） */
-            const upstream = net.connect({ host: '127.0.0.1', port: internalPort }, () => {
-              flushAndPipe(upstream, () => {});
-            });
-            upstream.on('error', (err: Error) => {
-              this.logger.error({ msg: `❌ [${service.name}] passthrough 内部 uWS 连接失败`, error: err.message });
-              client.destroy();
-            });
-            return;
-          }
-
-          /** WS upgrade：按需启动 + 就绪等待 + TCP 直通 */
-          void (async () => {
-            try {
-              if (service._state!.status === 'offline' || service._state!.status === 'stopping') {
-                await this.ensureServiceOnline(service, mapping);
-              }
-
-              const backend = net.connect({ host: targetHost, port: targetPort }, () => {
-                if (this.logging.enableWebSocketLog) {
-                  this.logger.info({ msg: `⚡ [${service.name}] passthrough WS 直通已建立 -> ${targetHost}:${targetPort}` });
-                }
-                service._state!.activeConnections++;
-                flushAndPipe(backend, () => {
-                  service._state!.activeConnections--;
-                });
-              });
-              backend.on('error', (err: Error) => {
-                this.logger.error({ msg: `❌ [${service.name}] passthrough 后端连接失败`, error: err.message });
-                client.destroy();
-              });
-            } catch (error: unknown) {
-              const message = error instanceof Error ? error.message : String(error);
-              this.logger.error({ msg: `❌ [${service.name}] passthrough 服务启动失败`, error: message });
-              client.destroy();
-            }
-          })();
-        };
-
-        client.on('data', (chunk: Buffer) => {
-          if (routed) {
-            /** 已分流但 pipe 尚未建立（启动/连接进行中）：继续缓冲，flushAndPipe 时统一写出 */
-            if (!piped) buffered.push(chunk);
-            return;
-          }
-          const rest = sniffer.feed(chunk);
-          if (!sniffer.parsed) {
-            /** 头未完整：先缓冲已读字节，等分片补齐 */
-            buffered.push(chunk);
-            return;
-          }
-          const headBytes = Buffer.concat([chunk.subarray(0, chunk.length - rest.length)]);
-          buffered.length = 0;
-          /** 头结束符之后的剩余字节（body/后续协议帧）也必须原样转发，不能丢弃 */
-          if (rest.length > 0) buffered.push(rest);
-          route(sniffer.result!.isUpgrade, headBytes);
-        });
-
-        client.on('error', (err: Error) => {
-          this.logger.error({ msg: `❌ [${service.name}] passthrough 客户端连接错误`, error: err.message });
-        });
-      });
-
-      server.on('error', (err: Error) => {
-        this.logger.error({ msg: `❌ passthrough 端口监听失败: ${portNum}`, error: err.message });
-      });
-
-      server.listen(portNum, host, () => {
-        this.logger.info({ msg: `⚡ passthrough 端口绑定已启动: ${host}:${portNum} -> ${service.name} (WS 直通 / HTTP 经内部网关)` });
-      });
-    });
-  }
-
-  /**
-   * 确保服务在线：offline/stopping 时执行启动命令并等待就绪
-   * 复用 startServiceAndProxy 的状态机语义（startingPromises、状态复位），
-   * 但不代理任何请求——供 passthrough 直通路径在建立 TCP 连接前调用
+   * 确保服务在线（供启动/等待路径共用）
+   * @throws 启动失败或超时时抛出错误
    */
   private async ensureServiceOnline(service: ServiceConfig, mapping: RouteMapping): Promise<void> {
     if (service.proxyOnly || service._state!.status === 'online') return;
@@ -1740,9 +535,9 @@ export class Gateway {
       await this.serviceManager.start(service);
       const isReady = await this.waitForBackendReady(
         service,
-        mapping.targetUrl!.hostname,
+        mapping.targetUrl.hostname,
         mapping.targetPort,
-        GatewayConstants.BACKEND_READY_CHECK_DELAY,
+        0,
       );
       if (!isReady) {
         service._state!.status = 'offline';
@@ -1764,34 +559,569 @@ export class Gateway {
   }
 
   /**
-   * 为指定端口创建监听器
+   * hostname 路由的 HTTP 处理入口（含按需启动状态机）
    */
-  private createPortBindingListener(host: string, portNum: number, mapping: RouteMapping): void {
-    const { service, target } = mapping;
+  private async handleRequest(req: Request, hostname: string): Promise<Response> {
+    const startTime = Date.now();
+    const mapping = this.hostnameRoutes.get(hostname);
 
-    if (service.passthrough) {
-      this.createPassthroughPortListener(host, portNum, mapping);
-      return;
+    if (!mapping) {
+      this.logger.info({ msg: `❌ [${hostname}] ${req.method} - 404` });
+      return new Response(`Service not found: ${hostname}`, { status: 404 });
     }
 
-    const app = uWS.App();
+    const service = mapping.service;
+    service._state!.lastAccessTime = startTime;
+    const status = service._state!.status;
 
-    // WebSocket 处理器（端口路由：upgrade 时目标已由端口绑定确定）
-    app.ws('/*', this.createWsProxyBehavior({
-      resolveContext: () => ({ service, target }),
-    }));
+    /** 413：content-length 声明超限直接拒绝（流式计数超限在 proxyRequest 内拦截） */
+    const declared = parseInt(req.headers.get('content-length') ?? '0');
+    if (declared > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
+      this.logger.warn({ msg: `⚠️ [${service.name}] 请求体超过 ${GatewayConstants.MAX_REQUEST_BODY_SIZE} 字节，返回 413` });
+      return new Response('Payload Too Large', { status: 413 });
+    }
 
-    app.any('/*', (res: HttpResponse, req: HttpRequest) => {
-      this.handlePortBindingRequest(res, req, mapping);
-    });
-
-    app.listen(host, portNum, (token: unknown) => {
-      if (token) {
-        this.logger.info({ msg: `🔌 端口绑定已启动: http://${host}:${portNum} -> ${service.name}` });
-      } else {
-        this.logger.error({ msg: `❌ 端口绑定启动失败: ${host}:${portNum}` });
+    const service_ = mapping;
+    try {
+      if (status === 'starting') {
+        const startPromise = this.startingPromises.get(service.name);
+        if (startPromise) {
+          await startPromise;
+        }
+      } else if (status === 'stopping') {
+        /** 等待服务停止完成（与 Node 版 handleServiceWithWait 语义一致） */
+        this.logger.info({ msg: `⏳ [${service.name}] ${req.method} - 等待服务停止完成...` });
+        const maxWaitTime = this.stopWaitMs;
+        const waitStartTime = Date.now();
+        while (service._state!.status === 'stopping') {
+          if (Date.now() - waitStartTime > maxWaitTime) {
+            this.logger.error({ msg: `❌ [${service.name}] 等待服务停止超时` });
+            return new Response('Service stopping timeout', { status: 503 });
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
       }
+
+      if (service._state!.status === 'offline') {
+        this.logger.info({ msg: `🚀 [${service.name}] ${req.method} - 启动服务...` });
+        await this.ensureServiceOnline(service, service_);
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: message });
+      return new Response('Service Unavailable', { status: 503 });
+    }
+
+    return this.proxyRequest(req, mapping, startTime);
+  }
+
+  /**
+   * 端口路由的 HTTP 处理入口
+   */
+  private async handlePortRequest(req: Request, mapping: RouteMapping): Promise<Response> {
+    const startTime = Date.now();
+    const service = mapping.service;
+    service._state!.lastAccessTime = startTime;
+    const status = service._state!.status;
+
+    const declared = parseInt(req.headers.get('content-length') ?? '0');
+    if (declared > GatewayConstants.MAX_REQUEST_BODY_SIZE) {
+      return new Response('Payload Too Large', { status: 413 });
+    }
+
+    try {
+      if (status === 'starting') {
+        const startPromise = this.startingPromises.get(service.name);
+        if (startPromise) {
+          await startPromise;
+        }
+      } else if (status === 'stopping') {
+        const waitStartTime = Date.now();
+        while (service._state!.status === 'stopping') {
+          if (Date.now() - waitStartTime > this.stopWaitMs) {
+            return new Response('Service stopping timeout', { status: 503 });
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+
+      if (service._state!.status === 'offline') {
+        await this.ensureServiceOnline(service, mapping);
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error({ msg: `❌ [${service.name}] 启动失败`, error: message });
+      return new Response('Service Unavailable', { status: 503 });
+    }
+
+    return this.proxyRequest(req, mapping, startTime);
+  }
+
+  /**
+   * 启动网关
+   */
+  async start(): Promise<void> {
+    const host = this.config.host || '127.0.0.1';
+    const port = this.config.port || 3000;
+
+    /** 主监听：hostname 路由 + WS 代理 */
+    const mainServer = Bun.serve({
+      hostname: host,
+      port,
+      /** 连接空闲兜底（秒）：Bun 无 per-request 断开 API，慢客户端靠此最终回收 */
+      idleTimeout: 10,
+      /**
+       * HTTP 入口：hostname 路由分发
+       */
+      fetch: (req, server) => {
+        const hostHeader = req.headers.get('host') ?? '';
+        const hostname = hostHeader.split(':')[0];
+
+        /** WS 升级嗅探：Upgrade 头存在时解析路由并完成升级 */
+        if ((req.headers.get('upgrade') || '').toLowerCase() === 'websocket') {
+          const prepared = prepareWsUpgrade(req, (r) => {
+            const hn = (r.headers.get('host') ?? '').split(':')[0];
+            const m = this.hostnameRoutes.get(hn);
+            return m ? { service: m.service, target: m.target } : null;
+          });
+          if (!prepared) {
+            return new Response(`Service not found: ${hostname}`, { status: 404 });
+          }
+          server.upgrade(req, {
+            data: prepared as unknown as WsUserData,
+          });
+          return undefined;
+        }
+
+        return this.handleRequest(req, hostname);
+      },
+      websocket: this.createWsHandlers({
+        /**
+         * upgrade 时按 Host 头解析路由目标
+         */
+        resolveTarget: (req) => {
+          const hostHeader = req.headers.get('host') ?? '';
+          const hostname = hostHeader.split(':')[0];
+          const mapping = this.hostnameRoutes.get(hostname);
+          if (!mapping) return null;
+          return { service: mapping.service, target: mapping.target };
+        },
+      }),
     });
+    this.servers.push(mainServer);
+    this.logger.info({ msg: `DynaPM-Bun 网关已启动: http://${host}:${port}` });
+
+    for (const [portNum, mapping] of this.portRoutes) {
+      if (mapping.service.passthrough) {
+        this.createPassthroughPortListener(host, portNum, mapping);
+      } else {
+        this.createPortBindingListener(host, portNum, mapping);
+      }
+    }
+
+    const adminApiConfig = this.config.adminApi;
+    if (adminApiConfig && adminApiConfig.enabled !== false && adminApiConfig.port) {
+      this.createAdminApiListener(host, adminApiConfig.port);
+    }
+  }
+
+  /**
+   * 为管理 API 创建监听器
+   */
+  private createAdminApiListener(host: string, port: number): void {
+    const server = Bun.serve({
+      hostname: host,
+      port,
+      /** 连接空闲兜底（秒），与主监听器一致 */
+      idleTimeout: 10,
+      fetch: (req, srv) => this.adminApi.handleAdminApi(req, srv.requestIP(req)),
+    });
+    this.servers.push(server);
+    this.logger.info({ msg: `🔌 管理 API 已启动: http://${host}:${port}` });
+  }
+
+  /**
+   * 为非 passthrough 端口路由创建监听器（HTTP 代理 + WS 代理）
+   */
+  private createPortBindingListener(host: string, portNum: number, mapping: RouteMapping): void {
+    const server = Bun.serve({
+      hostname: host,
+      port: portNum,
+      /** 连接空闲兜底（秒），与主监听器一致 */
+      idleTimeout: 10,
+      fetch: (req, srv) => {
+        if ((req.headers.get('upgrade') || '').toLowerCase() === 'websocket') {
+          const prepared = prepareWsUpgrade(req, () => ({ service: mapping.service, target: mapping.target }));
+          if (!prepared) {
+            return new Response('Not Found', { status: 404 });
+          }
+          srv.upgrade(req, { data: prepared as unknown as WsUserData });
+          return undefined;
+        }
+        return this.handlePortRequest(req, mapping);
+      },
+      websocket: this.createWsHandlers({
+        resolveTarget: () => ({ service: mapping.service, target: mapping.target }),
+      }),
+    });
+    this.servers.push(server);
+    this.logger.info({ msg: `🔌 端口绑定已启动: http://${host}:${portNum} -> ${mapping.service.name}` });
+  }
+
+  /**
+   * 为 passthrough 服务创建端口监听器（Bun.listen 纯 TCP 层）
+   * 架构与 Node 版一致：
+   *  - 外层 Bun.listen 监听配置端口，嗅探每个连接的首个 HTTP 请求头
+   *  - WS upgrade 连接：按需启动服务、等就绪后整条连接 TCP 直通
+   *  - 非 upgrade 的普通 HTTP 连接：pipe 到内部 Bun.serve（动态 loopback 端口）
+   */
+  private createPassthroughPortListener(host: string, portNum: number, mapping: RouteMapping): void {
+    const { service, target } = mapping;
+    const targetUrl = new URL(target);
+    const targetHost = targetUrl.hostname;
+    const targetPort = mapping.targetPort;
+
+    /** 内部 HTTP app：承接普通 HTTP 连接（passthrough 下 WS upgrade 全部走直通，不会到这） */
+    const internalServer = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      /** 连接空闲兜底（秒），仅承接 loopback 内部流量 */
+      idleTimeout: 10,
+      fetch: (req) => this.handlePortRequest(req, mapping),
+    });
+    this.servers.push(internalServer);
+    const internalPort = internalServer.port;
+
+    /**
+     * Bun Socket.write 是「部分写」语义：单次写入超过发送缓冲（约 110KB）时
+     * 只写入返回值指示的字节数，剩余数据被静默丢弃。因此直通路径的所有写入
+     * 必须经此泵：按返回值切分剩余部分，1ms 间隔重试直至队列排空。
+     */
+    /** 泵内部运行态（挂在 socket.data 上的扩展字段） */
+    type PumpState = { writeQueue?: Uint8Array[]; pumping?: boolean };
+    const pumpWrite = (socket: Bun.Socket<unknown>, data: Uint8Array): void => {
+      /** Bun Socket.data 实际可写但类型标 undefined，这里做安全扩展 */
+      const state = (socket.data ??= {} as unknown) as PtSocketState & PumpState;
+      const queue: Uint8Array[] = (state.writeQueue ??= []);
+      queue.push(data);
+      if (state.pumping) return;
+      state.pumping = true;
+      void (async () => {
+        while (queue.length > 0) {
+          const chunk = queue[0];
+          const written = socket.write(chunk);
+          if (written === chunk.length) {
+            queue.shift();
+            continue;
+          }
+          if (written > 0) queue[0] = chunk.subarray(written);
+          await Bun.sleep(1);
+        }
+        state.pumping = false;
+      })();
+    };
+
+    const listener = Bun.listen<PtSocketState>({
+      hostname: host,
+      port: portNum,
+      socket: {
+        open: (socket) => {
+          /** 连接级嗅探状态（Bun socket 对象可直接挂 data） */
+          socket.data = {
+            sniffer: new HttpUpgradeSniffer(),
+            buffered: [] as Buffer[],
+            routed: false,
+            piped: false,
+            peer: undefined,
+          };
+        },
+        data: (socket, data) => {
+          const state = socket.data;
+          if (!state) return;
+          const chunk = Buffer.from(data);
+
+          if (state.routed) {
+            /** 已建立管道：客户端→后端方向直接转发 */
+            if (state.piped) state.forward?.(chunk);
+            /** 已分流但管道尚未建立（启动/连接进行中）：继续缓冲，flushAndPipe 时统一写出 */
+            else state.buffered.push(chunk);
+            return;
+          }
+
+          const rest = state.sniffer.feed(chunk);
+          if (!state.sniffer.parsed) {
+            /** 头未完整：先缓冲已读字节，等分片补齐 */
+            state.buffered.push(chunk);
+            return;
+          }
+          const headEnd = chunk.length - rest.length;
+          const headBytes = Buffer.concat([...state.buffered, chunk.subarray(0, headEnd)]);
+          state.buffered = rest.length > 0 ? [Buffer.from(rest)] : [];
+          state.routed = true;
+
+          const isUpgrade = state.sniffer.result!.isUpgrade;
+          service._state!.lastAccessTime = Date.now();
+
+          void (async () => {
+            try {
+              let peer: Bun.Socket;
+              if (!isUpgrade) {
+                /** 普通 HTTP：连同头字节一起交给内部 Bun.serve（字节流不丢不重） */
+                peer = await Bun.connect({
+                  hostname: '127.0.0.1',
+                  port: internalPort as number,
+                  socket: {
+                    data(_s, d) { pumpWrite(socket, d); },
+                    close() { socket.end(); },
+                    error() { socket.end(); },
+                  },
+                });
+              } else {
+                /** WS upgrade：按需启动 + 就绪等待 + TCP 直通 */
+                if (service._state!.status === 'offline' || service._state!.status === 'stopping') {
+                  await this.ensureServiceOnline(service, mapping);
+                }
+                peer = await Bun.connect({
+                  hostname: targetHost,
+                  port: targetPort,
+                  socket: {
+                    data(_s, d) { pumpWrite(socket, d); },
+                    close() {
+                      service._state!.activeConnections--;
+                      socket.end();
+                    },
+                    error() { socket.end(); },
+                  },
+                });
+                service._state!.activeConnections++;
+                if (this.logging.enableWebSocketLog) {
+                  this.logger.info({ msg: `⚡ [${service.name}] passthrough WS 直通已建立 -> ${targetHost}:${targetPort}` });
+                }
+              }
+              state.peer = peer;
+              state.piped = true;
+              if (headBytes.length > 0) pumpWrite(peer, headBytes);
+              for (const b of state.buffered) pumpWrite(peer, b);
+              state.buffered = [];
+              /** 客户端→后端方向转发：piped 后续到达的客户端数据经背压泵写给 peer
+               *  （后端→客户端方向由 Bun.connect 的 socket.data 回调承担） */
+              socket.data!.forward = (chunk: Uint8Array) => { pumpWrite(peer, chunk); };
+            } catch (error: unknown) {
+              const message = error instanceof Error ? error.message : String(error);
+              this.logger.error({ msg: `❌ [${service.name}] passthrough 连接失败`, error: message });
+              socket.end();
+            }
+          })();
+        },
+        close: (socket) => {
+          socket.data?.peer?.end();
+        },
+        error: (socket) => {
+          socket.data?.peer?.end();
+        },
+      },
+    });
+    this.tcpListeners.push(listener);
+    this.logger.info({ msg: `⚡ passthrough 端口绑定已启动: ${host}:${portNum} -> ${service.name} (WS 直通 / HTTP 经内部网关)` });
+  }
+
+
+  /**
+   * 创建 WS 代理 handlers（Bun 原生 WebSocket）
+   * 客户端->后端方向带消息队列；后端->客户端方向透传（背压由 Bun 内部缓冲承担，语义近似）
+   */
+  private createWsHandlers(options: {
+    /**
+     * upgrade 阶段解析路由目标
+     * @returns null 表示路由未命中（拒绝升级）
+     */
+    resolveTarget: (req: Request) => { service: ServiceConfig; target: string } | null;
+  }): {
+    open: (ws: Bun.ServerWebSocket<WsUserData>) => void;
+    message: (ws: Bun.ServerWebSocket<WsUserData>, message: string | Buffer<ArrayBuffer>) => void;
+    close: (ws: Bun.ServerWebSocket<WsUserData>) => void;
+  } {
+    return {
+      open: (ws) => {
+        const userData = ws.data;
+        const service = userData.service;
+        service._state!.activeConnections++;
+
+        if (this.logging.enableWebSocketLog) {
+          this.logger.info({ msg: `🔌 [${service.name}] WebSocket 连接已建立` });
+        }
+
+        const wsState = {
+          backendReady: false,
+          messageQueue: [] as { data: Uint8Array; isBinary: boolean }[],
+          backendWs: undefined as WebSocket | undefined,
+          closing: false,
+        };
+        userData.wsState = wsState;
+
+        void (async () => {
+          try {
+            const target = userData.target;
+            const targetUrl = new URL(target);
+            const targetPort = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'));
+
+            const needsStart = service._state!.status === 'offline';
+            if (needsStart) {
+              this.logger.info({ msg: `🚀 [${service.name}] WebSocket - 启动服务...` });
+              service._state!.status = 'starting';
+              await this.serviceManager.start(service);
+              const isReady = await this.waitForBackendReady(service, targetUrl.hostname, targetPort, GatewayConstants.BACKEND_READY_CHECK_DELAY);
+              if (!isReady) {
+                service._state!.status = 'offline';
+                this.logger.error({ msg: `❌ [${service.name}] WebSocket 服务启动超时` });
+                ws.close();
+                return;
+              }
+              service._state!.status = 'online';
+              service._state!.startTime = Date.now();
+              service._state!.startCount++;
+            }
+
+            const wsUrl = `${targetUrl.protocol === 'https:' ? 'wss:' : 'ws:'}//${targetUrl.host}${userData.clientPath}`;
+
+            /** 透传鉴权等自定义头（Bun 客户端 WS 支持 headers 选项，升级阶段抓取的原始头已存 userData） */
+            const backendHeaders: Record<string, string> = {};
+            for (const [key, value] of Object.entries(userData.clientHeaders)) {
+              if (!GatewayConstants.WS_SKIP_HEADERS.has(key)) {
+                backendHeaders[key] = value;
+              }
+            }
+            backendHeaders['Host'] = targetUrl.host;
+
+            const clientProtocols = userData.clientProtocols;
+            /** Bun 客户端 WebSocket 支持非标 headers 选项（运行时可用，类型上需扩展） */
+            const backendWs = new WebSocket(wsUrl, {
+              protocols: clientProtocols && clientProtocols.length > 0 ? clientProtocols : undefined,
+              headers: backendHeaders,
+            } as unknown as string[]);
+            wsState.backendWs = backendWs;
+            backendWs.binaryType = 'arraybuffer';
+
+            backendWs.onopen = () => {
+              if (this.logging.enableWebSocketLog) {
+                this.logger.info({ msg: `✅ [${service.name}] 后端 WebSocket 连接已建立` });
+              }
+              wsState.backendReady = true;
+              while (wsState.messageQueue.length > 0 && backendWs.readyState === WebSocket.OPEN) {
+                const queued = wsState.messageQueue.shift();
+                if (queued) {
+                  backendWs.send(queued.isBinary ? queued.data : new TextDecoder().decode(queued.data));
+                }
+              }
+            };
+
+            backendWs.onmessage = (event) => {
+              const data = event.data;
+              if (typeof data === 'string') {
+                ws.send(data);
+              } else {
+                ws.send(new Uint8Array(data as ArrayBuffer), true);
+              }
+              service._state!.lastAccessTime = Date.now();
+            };
+
+            backendWs.onclose = (event) => {
+              const code = event.code;
+              if (this.logging.enableWebSocketLog) {
+                this.logger.info({ msg: `🔌 [${service.name}] 后端 WebSocket 连接关闭 code=${code}` });
+              }
+              if (!wsState.closing) {
+                wsState.closing = true;
+                if (code && code !== 1000 && code !== 1005) {
+                  ws.close(code, (event.reason || '').slice(0, 123));
+                } else {
+                  ws.close();
+                }
+              }
+            };
+
+            /** 后端协议层 ping 转发为客户端侧 ping。
+             *  Bun 客户端 WebSocket 的 ping 感知走 addEventListener('ping')
+             *  （onping 属性在 Bun 1.4 客户端不触发） */
+            (backendWs as unknown as { addEventListener: (ev: string, cb: (e: unknown) => void) => void }).addEventListener('ping', (event: unknown) => {
+              try {
+                const data = (event as { data?: unknown }).data;
+                if (data instanceof ArrayBuffer) {
+                  ws.ping(new Uint8Array(data));
+                } else if (Buffer.isBuffer(data)) {
+                  ws.ping(new Uint8Array(data));
+                } else {
+                  ws.ping();
+                }
+              } catch {
+                // ping 参数受限，忽略
+              }
+            });
+
+            backendWs.onerror = () => {
+              this.logger.error({ msg: `❌ [${service.name}] 后端 WebSocket 错误` });
+              wsState.closing = true;
+              ws.close();
+            };
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.logger.error({ msg: `❌ [${service.name}] WebSocket 连接失败`, error: message });
+            ws.close();
+          }
+        })();
+      },
+
+      message: (ws, message) => {
+        const userData = ws.data;
+        const service = userData.service;
+        const wsState = userData.wsState!;
+        /** 文本消息 Buffer 类型为 string；二进制为 Buffer（默认 binaryType: nodebuffer） */
+        const isBinary = typeof message !== 'string';
+
+        /** Bun 的 message ArrayBuffer 同样是复用缓冲，必须拷贝 */
+        const msgBytes = typeof message === 'string'
+          ? new TextEncoder().encode(message)
+          : new Uint8Array(message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength) as ArrayBuffer);
+        service._state!.lastAccessTime = Date.now();
+
+        if (wsState.backendReady && wsState.backendWs && wsState.backendWs.readyState === WebSocket.OPEN) {
+          if (this.logging.enableWebSocketLog) {
+            this.logger.info({ msg: `📨 [${service.name}] 转发消息到后端: ${msgBytes.length} 字节 binary=${isBinary}` });
+          }
+          wsState.backendWs.send(isBinary ? msgBytes : new TextDecoder().decode(msgBytes));
+        } else {
+          if (this.logging.enableWebSocketLog) {
+            this.logger.info({ msg: `📦 [${service.name}] 消息加入队列` });
+          }
+          if (wsState.messageQueue.length < GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE) {
+            wsState.messageQueue.push({ data: msgBytes, isBinary });
+          } else {
+            this.logger.warn({
+              msg: `⚠️ [${service.name}] WebSocket 消息队列超过 ${GatewayConstants.MAX_WS_MESSAGE_QUEUE_SIZE} 条，主动关闭连接`,
+              service: service.name,
+            });
+            wsState.closing = true;
+            ws.close();
+          }
+        }
+      },
+
+      close: (ws) => {
+        const userData = ws.data;
+        const service = userData.service;
+        service._state!.activeConnections--;
+
+        if (this.logging.enableWebSocketLog) {
+          this.logger.info({ msg: `🔌 [${service.name}] 客户端 WebSocket 连接关闭` });
+        }
+
+        const wsState = userData.wsState;
+        if (wsState?.backendWs && wsState.backendWs.readyState === WebSocket.OPEN) {
+          wsState.closing = true;
+          wsState.backendWs.close();
+        }
+      },
+    };
   }
 
   /**
@@ -1800,8 +1130,9 @@ export class Gateway {
   async cleanup(): Promise<void> {
     this.logger.info({ msg: '🧹 正在清理所有服务...' });
 
-    const cleanedServices = new Set<ServiceConfig>();
+    if (this.idleTimer) clearInterval(this.idleTimer);
 
+    const cleanedServices = new Set<ServiceConfig>();
     for (const mapping of this.hostnameRoutes.values()) {
       cleanedServices.add(mapping.service);
     }
@@ -1811,7 +1142,6 @@ export class Gateway {
 
     const stopPromises: Promise<void>[] = [];
     for (const service of cleanedServices) {
-      /** 无论服务是否在运行都清理 Agent 池，避免泄漏 */
       this.cleanupAgent(service.name);
       if (service._state!.status === 'online' || service._state!.status === 'starting') {
         stopPromises.push(
@@ -1821,9 +1151,84 @@ export class Gateway {
         );
       }
     }
-
     await Promise.all(stopPromises);
+
+    for (const server of this.servers) {
+      try { server.stop(false); } catch { /* 已停止 */ }
+    }
+    for (const listener of this.tcpListeners) {
+      try { listener.stop(true); } catch { /* 已停止 */ }
+    }
+    this.servers = [];
+    this.tcpListeners = [];
 
     this.logger.info({ msg: `✅ 已清理 ${cleanedServices.size} 个服务` });
   }
+}
+
+/**
+ * passthrough 连接级状态（挂在 Bun Socket.data 上）
+ */
+interface PtSocketState {
+  /** 首个 HTTP 请求头嗅探器 */
+  sniffer: HttpUpgradeSniffer;
+  /** 分流前缓冲的字节（头未完整/管道未建立期间到达） */
+  buffered: Buffer[];
+  /** 是否已完成分流决策 */
+  routed: boolean;
+  /** 是否已建立双向管道（写出缓冲字节） */
+  piped: boolean;
+  /** 对端（后端/内部网关）连接 */
+  peer?: { write: (data: Uint8Array | string) => number | undefined; end: () => void };
+  /** 客户端→后端方向转发函数（piped 后由 socket.data 回调调用） */
+  forward?: (chunk: Uint8Array) => void;
+}
+
+/**
+ * WS 升级上下文数据（挂在 ServerWebSocket.data 上）
+ */
+interface WsUserData {
+  /** 服务配置 */
+  service: ServiceConfig;
+  /** 目标后端地址 */
+  target: string;
+  /** 客户端原始请求路径（含查询串） */
+  clientPath: string;
+  /** 客户端升级请求头（原样保留供透传） */
+  clientHeaders: Record<string, string>;
+  /** 客户端请求的子协议列表 */
+  clientProtocols: string[] | undefined;
+  /** 运行时状态 */
+  wsState?: {
+    backendReady: boolean;
+    messageQueue: { data: Uint8Array; isBinary: boolean }[];
+    backendWs?: WebSocket;
+    closing: boolean;
+  };
+}
+
+/** 供主监听器 fetch 完成升级嗅探的辅助：把升级请求头转存（在 fetch 内调用） */
+export function prepareWsUpgrade(
+  req: Request,
+  resolveTarget: (req: Request) => { service: ServiceConfig; target: string } | null,
+): { service: ServiceConfig; target: string; clientPath: string; clientHeaders: Record<string, string>; clientProtocols: string[] | undefined } | null {
+  const resolved = resolveTarget(req);
+  if (!resolved) return null;
+
+  const url = new URL(req.url);
+  const clientHeaders: Record<string, string> = {};
+  req.headers.forEach((value, key) => {
+    clientHeaders[key] = (value.includes('\r') || value.includes('\n')) ? value.replace(/[\r\n]/g, '') : value;
+  });
+  const protocolsHeader = req.headers.get('sec-websocket-protocol');
+  const clientProtocols = protocolsHeader
+    ? protocolsHeader.split(',').map((p) => p.trim()).filter(Boolean)
+    : undefined;
+
+  return {
+    ...resolved,
+    clientPath: url.pathname + url.search,
+    clientHeaders,
+    clientProtocols,
+  };
 }

@@ -52,7 +52,7 @@ const config: DynaPMConfig = {
       startTimeout: 10 * 1000,
 
       commands: {
-        start: `nohup node --experimental-strip-types ${process.cwd()}/test/services/echo-server.ts >> ${logDir}/echo-correctness-test.log 2>&1 &`,
+        start: `nohup bun run ${process.cwd()}/test/services/echo-server.ts >> ${logDir}/echo-correctness-test.log 2>&1 &`,
         stop: 'lsof -i:3099 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
         check: 'lsof -i:3099 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
@@ -71,7 +71,7 @@ const config: DynaPMConfig = {
       startTimeout: 15 * 1000,
 
       commands: {
-        start: `sleep 2 && nohup node --experimental-strip-types ${process.cwd()}/test/server-ws.ts 3111 >> ${logDir}/ws-slow-test.log 2>&1 &`,
+        start: `sleep 2 && nohup bun run ${process.cwd()}/test/services/server-ws.ts 3111 >> ${logDir}/ws-slow-test.log 2>&1 &`,
         stop: 'lsof -i:3111 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
         check: 'lsof -i:3111 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },

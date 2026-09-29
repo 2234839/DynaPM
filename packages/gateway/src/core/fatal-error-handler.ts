@@ -1,4 +1,8 @@
-import type { Logger } from 'pino';
+/** 与 pino Logger 兼容的最小日志接口（Bun 版不依赖 pino 类型包） */
+interface FatalLogger {
+  /** 错误日志 */
+  error: (obj: { msg: string; error?: unknown }) => void;
+}
 
 /**
  * 致命错误处理器
@@ -13,7 +17,7 @@ import type { Logger } from 'pino';
  */
 export function createFatalErrorHandler(
   /** 日志记录器 */
-  logger: Pick<Logger, 'error'>,
+  logger: FatalLogger,
   /** 网关清理函数（尽力执行，失败不阻断退出） */
   cleanup: () => Promise<void>,
   /** 进程退出函数（注入以便测试） */

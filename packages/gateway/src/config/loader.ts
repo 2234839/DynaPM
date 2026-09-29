@@ -1,8 +1,24 @@
-import { loadConfig } from 'c12';
 import type { DynaPMConfig } from './types.js';
 
 /**
- * 加载 DynaPM配置（宽松模式）
+ * c12 动态加载：bun build --compile 时不追踪其内部可选 peer 依赖（chokidar 等），
+ * 运行时（bun run / 二进制内动态 require）均可正常加载
+ */
+async function loadC12Config(options: {
+  name: string;
+  configFile?: string;
+  defaultConfig: unknown;
+}): Promise<{ config: DynaPMConfig }> {
+  const c12 = (await import('c12')) as unknown as {
+    loadConfig: (opts: Record<string, unknown>) => Promise<{ config: DynaPMConfig }>;
+  };
+  return c12.loadConfig(options);
+}
+
+/**
+ * 加载 DynaPM配置（宽松模式）—— Bun 版
+ * 加载语义：DYNAPM_CONFIG 优先、
+ * timeouts/adminApi 默认值兜底、路由生成与冲突校验。
  * @returns DynaPM 配置对象
  * @throws 当配置文件中至少需要一个服务时抛出错误
  */
@@ -10,7 +26,7 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
   /** 支持通过环境变量指定配置文件路径：DYNAPM_CONFIG 环境变量指定配置文件路径 */
   const configFile = process.env.DYNAPM_CONFIG || undefined;
 
-  const { config } = await loadConfig<DynaPMConfig>({
+  const { config } = await loadC12Config({
     name: 'dynapm',
     configFile,
     defaultConfig: {
@@ -20,137 +36,100 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
       adminApi: {
         enabled: true,
         port: 4000,
-        /** 注意：allowedIps 不放这里——c12 会把默认值数组合并进用户配置，
-         *  导致用户显式白名单被追加 127.0.0.1/::1 而失效。
-         *  默认值改为下方代码兜底。 */
       },
     },
   });
 
-  /** timeouts 默认值兜底：与硬编码默认值一致，保证向后兼容 */
+  /** timeouts 默认值兜底：与硬编码默认值一致 */
   config.timeouts = config.timeouts ?? {};
   config.timeouts.stopWaitMs = config.timeouts.stopWaitMs || 30 * 1000;
   config.timeouts.stopTimeoutMs = config.timeouts.stopTimeoutMs || 30 * 1000;
   config.timeouts.proxyTimeoutMs = config.timeouts.proxyTimeoutMs || 30 * 1000;
 
-  /** adminApi 白名单兜底：仅在用户未配置时使用（精确语义，用户配置的列表不追加） */
+  /** adminApi 白名单兜底：仅在用户未配置时使用 */
   config.adminApi = config.adminApi ?? {};
   if (!config.adminApi.allowedIps) {
     config.adminApi.allowedIps = ['127.0.0.1', '::1'];
   }
 
-  // 宽松验证：至少需要一个服务
   if (!config.services || Object.keys(config.services).length === 0) {
     throw new Error('配置文件中至少需要一个服务');
   }
 
   const mainPort = config.port || 3000;
 
-  // 检查管理 API 端口与主端口冲突
   if (config.adminApi?.enabled && config.adminApi.port === mainPort) {
     throw new Error(`管理 API 端口 ${mainPort} 与主端口冲突`);
   }
-  const portMap = new Map<number, string>(); // 端口 -> 服务名称
-  const hostnameMap = new Map<string, string>(); // hostname -> 服务名称
+  const portMap = new Map<number, string>();
+  const hostnameMap = new Map<string, string>();
 
-  // 处理所有服务配置
   for (const [key, service] of Object.entries(config.services)) {
-    // 设置服务名称
     service.name = service.name || key;
-
-    // 设置默认超时
-    service.idleTimeout = service.idleTimeout || 5 * 60 * 1000; // 5分钟
-    service.startTimeout = service.startTimeout || 30 * 1000; // 30秒
-    /** 注入全局超时配置（stopTimeoutMs 等供 service-manager 消费） */
+    service.idleTimeout = service.idleTimeout || 5 * 60 * 1000;
+    service.startTimeout = service.startTimeout || 30 * 1000;
     service._timeouts = config.timeouts;
 
-    /** Agent 池参数默认值兜底 */
     if (service.agent) {
       service.agent.maxSockets = service.agent.maxSockets || 256;
       service.agent.maxFreeSockets = service.agent.maxFreeSockets || 32;
       service.agent.keepAliveMsecs = service.agent.keepAliveMsecs || 30 * 1000;
     }
-    /** keepWarm 服务：独立闲置回收阈值兑底（默认 30s） */
     if (service.keepWarm) {
       service.warmIdleTimeout = service.warmIdleTimeout || 30 * 1000;
     }
-    // 默认使用TCP端口连通性检查（无需服务修改代码）
     service.healthCheck = service.healthCheck || { type: 'tcp' };
 
-    // 如果配置了HTTP检查但没指定URL，使用服务base地址
     if (service.healthCheck.type === 'http' && !service.healthCheck.url) {
       service.healthCheck.url = service.base;
     }
 
-    // 处理路由配置
     let routes = service.routes;
-
-    // 如果没有配置 routes，则根据 host 和 port 生成简化配置
     if (!routes || routes.length === 0) {
       routes = [];
-
-      // 添加 host 配置（使用 service.base 作为目标）
       if (service.host) {
         routes.push({ type: 'host', value: service.host, target: service.base });
       }
-
-      // 添加 port 配置（使用 service.base 作为目标）
       if (service.port) {
         routes.push({ type: 'port', value: service.port, target: service.base });
       }
-
-      // 如果既没有 host 也没有 port，则使用 key 作为默认 hostname
       if (routes.length === 0) {
         routes.push({ type: 'host', value: key, target: service.base });
       }
-
-      // 保存生成的 routes
       service.routes = routes;
     }
 
-    // 验证路由配置必须有 target 字段
     for (const route of routes) {
       if (!route.target) {
         throw new Error(`服务 [${service.name}] 的路由配置缺少 target 字段`);
       }
     }
 
-    // 验证和检查路由配置
     for (const route of routes) {
       if (route.type === 'port') {
         const port = route.value as number;
-
-        // 检查是否与主端口冲突
         if (port === mainPort) {
           throw new Error(`服务 [${service.name}] 的路由端口 ${port} 与主端口冲突`);
         }
-
-        // 检查是否与管理 API 端口冲突
         const adminApiPort = config.adminApi?.enabled ? config.adminApi.port : undefined;
         if (adminApiPort && port === adminApiPort) {
           throw new Error(`服务 [${service.name}] 的路由端口 ${port} 与管理 API 端口冲突`);
         }
-
-        // 检查是否与其他服务的端口冲突
         const existingService = portMap.get(port);
         if (existingService) {
           throw new Error(
             `端口冲突: 服务 [${service.name}] 和 [${existingService}] 都配置了端口 ${port}`
           );
         }
-
         portMap.set(port, service.name);
       } else if (route.type === 'host') {
         const hostname = route.value as string;
-
-        // 检查 hostname 冲突
         const existingService = hostnameMap.get(hostname);
         if (existingService && existingService !== service.name) {
           throw new Error(
             `Hostname 冲突: 服务 [${service.name}] 和 [${existingService}] 都配置了 hostname ${hostname}`
           );
         }
-
         hostnameMap.set(hostname, service.name);
       }
     }

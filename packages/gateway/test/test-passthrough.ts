@@ -1,39 +1,18 @@
 /**
- * passthrough 直通模式 WS 测试（复用 test-ws-siyuan.ts 的场景思路，独立端口段 3160-3162）
- *
- * 场景（passthrough 开启，WS upgrade 走 TCP 直通、HTTP 走现有流式代理）：
- * 1. HTTP 混合请求仍正常（鉴权头透传）
- * 2. WS 升级 Authorization 头透传（原始头字节原样转发）
- * 3. WS Origin 头透传
- * 4. WS 子协议 sec-websocket-protocol 透传
- * 5. echo 小消息
- * 6. 大消息 2MB 双向转发
- * 7. 协议层 ping 透传
- * 8. 后端 4001 关闭码透传
- * 9. 活跃 WS 连接期间服务不被闲置回收（activeConnections 计数正确）
- *
- * 运行：npx tsx test/test-passthrough.ts
+ * DynaPM-Bun passthrough 直通模式 WS 场景对拍测试
+ * （契约 = packages/gateway/test/test-passthrough.ts，9 场景不变）
+ * 端口：后端 3160 / 代理 3161 / 管理 3162
  */
 
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
 import * as http from 'node:http';
-import { createConnection } from 'node:net';
 import { WebSocket as WS, WebSocketServer } from 'ws';
-
-const execAsync = promisify(exec);
-
-const C = { reset: '\x1b[0m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m' };
-function log(msg: string, color = C.reset) { console.log(`${color}${msg}${C.reset}`); }
-function section(msg: string) { log(`\n${'='.repeat(60)}`, C.cyan); log(msg, C.cyan); log('='.repeat(60), C.cyan); }
-function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
+import { checkPort, waitForPort, section, log, C, sleep, startBunGateway } from './helpers.js';
 
 const MOCK_BACKEND_PORT = 3160;
 const PROXY_PORT = 3161;
 const ADMIN_PORT = 3162;
 
 let lastUpgradeHeaders: Record<string, string> = {};
-let backendOpenCount = 0;
 
 /** 模拟后端：HTTP + WS 同端口（与思源形态一致） */
 function startMockBackend(): Promise<void> {
@@ -50,7 +29,6 @@ function startMockBackend(): Promise<void> {
 
   const wss = new WebSocketServer({ noServer: true });
   wss.on('connection', (ws, req) => {
-    backendOpenCount++;
     lastUpgradeHeaders = req.headers as Record<string, string>;
 
     ws.on('message', (data: Buffer, isBinary: boolean) => {
@@ -68,7 +46,7 @@ function startMockBackend(): Promise<void> {
           type: 'whoami',
           auth: lastUpgradeHeaders['authorization'] ?? null,
           origin: lastUpgradeHeaders['origin'] ?? null,
-          protocol: (req.headers['sec-websocket-protocol'] ?? null),
+          protocol: (lastUpgradeHeaders['sec-websocket-protocol'] ?? null),
         }));
       } else if (msg.type === 'ping-frame') {
         ws.ping('hb');
@@ -93,24 +71,8 @@ function startMockBackend(): Promise<void> {
   });
 }
 
-function checkPort(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = createConnection({ host: '127.0.0.1', port, timeout: 200 }, () => { socket.destroy(); resolve(true); });
-    socket.on('error', () => { socket.destroy(); resolve(false); });
-    socket.on('timeout', () => { socket.destroy(); resolve(false); });
-  });
-}
-
 async function killPort(port: number) {
-  try {
-    await execAsync(`lsof -ti:${port} -sTCP:LISTEN | xargs -r kill -9 2>/dev/null`);
-  } catch {}
-}
-
-async function waitForPort(port: number, timeout = 8000): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) { if (await checkPort(port)) return true; await sleep(100); }
-  return false;
+  try { await (await import('node:child_process')).exec(`lsof -ti:${port} -sTCP:LISTEN | xargs -r kill -9 2>/dev/null`); } catch {}
 }
 
 function httpRequest(path: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
@@ -164,16 +126,14 @@ async function runTest(name: string, fn: () => Promise<void>) {
 }
 
 async function main() {
+  log('\n🧵 DynaPM-Bun passthrough 直通模式对拍测试', C.cyan);
   section('环境清理与启动');
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, ADMIN_PORT]) await killPort(p);
   await sleep(300);
 
   await startMockBackend();
 
-  const gateway = exec(`DYNAPM_CONFIG=dynapm.config.passthrough-test.ts npx tsx src/index.ts`);
-  gateway.stdout?.on('data', () => {});
-  gateway.stderr?.on('data', (d) => process.stderr.write(`[gateway] ${d}`));
-
+  const gateway = startBunGateway(process.cwd() + '/dynapm.config.passthrough-test.ts');
   if (!await waitForPort(PROXY_PORT)) throw new Error('网关 passthrough 端口启动失败');
   log(`网关已启动: passthrough ${PROXY_PORT} -> ${MOCK_BACKEND_PORT}`, C.yellow);
 
@@ -265,13 +225,13 @@ async function main() {
   }
   log(`\n结果: ${passed}/${results.length} passed`, passed === results.length ? C.green : C.red);
 
-  gateway.kill();
+  gateway.kill('SIGKILL');
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, ADMIN_PORT]) await killPort(p);
   process.exit(passed === results.length ? 0 : 1);
 }
 
 main().catch(async (err) => {
-  log(`致命错误: ${err.message}`, C.red);
+  log(`致命错误: ${err instanceof Error ? err.message : String(err)}`, C.red);
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, ADMIN_PORT]) await killPort(p);
   process.exit(1);
 });

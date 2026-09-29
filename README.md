@@ -34,7 +34,7 @@ You have many side projects or internal tools that:
 
 | Feature | DynaPM | Sablier | traefik-lazyload | Knative |
 |---------|--------|---------|------------------|---------|
-| **Technology** | Node.js + **uWS** | Go | Go | Go + K8s |
+| **Technology** | **Bun** (Bun.serve) | Go | Go | Go + K8s |
 | **Scope** | ⭐ **Universal** (any process) | Docker only | Docker only | K8s only |
 | **Setup Complexity** | ⭐ **Simple** | ⭐⭐⭐ Medium | ⭐⭐⭐ Medium | ⭐⭐⭐⭐⭐ Complex |
 | **Infrastructure** | Single server | Docker/K8s | Docker + Traefik | K8s cluster |
@@ -68,7 +68,7 @@ When services are running, proxy latency is only **1-2ms**:
 📤 [myapp] POST /api/data - 200 - 2ms
 ```
 
-True streaming with **uWebSockets.js** - zero buffering, 10x+ performance vs Fastify!
+True streaming with **Bun.serve** - zero buffering for maximum throughput!
 
 ### 🌐 **SSE & WebSocket Support**
 
@@ -153,7 +153,7 @@ Test Environment: Node.js HTTP Server (autocannon benchmark)
 ✅ Load test:        Low latency even under high concurrency
 ✅ Memory overhead:  ~50MB (Node.js runtime)
 ✅ Bundle size:      21.7KB (minified)
-✅ Logging:          Structured JSON logging (Pino)
+✅ Logging:          Structured JSON logging (built-in)
 ```
 
 ---
@@ -360,7 +360,7 @@ Throughput Test (autocannon)
 
 ### Test Requirements
 
-- **Node.js**: Run DynaPM gateway
+- **Bun** (>= 1.4): Run DynaPM gateway and tests
 - **curl**: Basic functionality testing
 - **autocannon** (optional): Throughput load testing
 
@@ -393,12 +393,12 @@ Check out [dynapm.config.example.ts](./dynapm.config.example.ts) for complete ex
                    │
                    ▼
 ┌─────────────────────────────────────────────────┐
-│      DynaPM Gateway (uWebSockets.js)             │
+│      DynaPM Gateway (Bun.serve)                  │
 │  - Check service status (memory cached)          │
 │  - Execute start command if needed (8ms)         │
 │  - Fast TCP port polling (17ms, zero-delay retry)│
 │  - Stream proxy request (1-2ms)                  │
-│  - Structured logging (Pino, async)              │
+│  - Structured logging (JSON lines, built-in)     │
 └──────────────────┬──────────────────────────────┘
                    │
                    ▼
@@ -467,7 +467,7 @@ Runtime resource usage:
 ├─ CPU:             <1% when idle
 ├─ Disk:            21.7KB (bundle size, minified)
 ├─ Network:         Proxy traffic only, no overhead
-└─ Logging:         Async structured logging (Pino)
+└─ Logging:         Structured JSON logging (built-in)
 ```
 
 ---
@@ -491,8 +491,8 @@ Runtime resource usage:
 - [ ] 🔄 **Multi-instance Support** - Distributed locking and state sync
 - [ ] 🔌 **Plugin System** - Custom integrations and extensions
 - [ ] 🌐 **More Health Checks** - gRPC, Redis, etc.
-- [x] ⚡ **uWebSockets.js Migration** - Completed (10x+ performance improvement)
-- [x] 📊 **Structured Logging** - Completed (Pino async logging)
+- [x] ⚡ **Bun migration** - Completed (single-runtime, bun --compile single binary)
+- [x] 📊 **Structured Logging** - Completed (JSON-line logging)
 
 ---
 
@@ -587,8 +587,7 @@ ISC
 ## 🙏 Acknowledgments
 
 Built with amazing open-source tools:
-- [uWebSockets.js](https://github.com/uNetworking/uWebSockets.js) - Highest performance web server for Node.js (10x+ faster than Fastify)
-- [Pino](https://getpino.io/) - Extreme fast structured logger
+- [Bun](https://bun.sh/) - All-in-one JavaScript runtime & toolkit (Bun.serve, bun --compile single-file binary)
 - [c12](https://github.com/unjs/c12) - Configuration loader
 
 ---

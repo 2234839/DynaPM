@@ -1,5 +1,5 @@
 /**
- * 对拍测试共享工具（复刻 Node 版测试辅助函数，行为契约保持一致）
+ * 测试共享工具
  */
 
 import { exec } from 'node:child_process';
@@ -106,10 +106,10 @@ export function summarizeAndExit(results: TestResult[]) {
 }
 
 /**
- * 以 Bun 启动 gateway-bun 网关（DYNAPM_CONFIG 指向配置，与 Node 版测试启动方式对齐）
+ * 以 Bun 启动网关（DYNAPM_CONFIG 指向配置）
  * @returns 子进程
  */
-export function startBunGateway(configPath: string, logTag = '[gw-bun]'): ReturnType<typeof exec> {
+export function startBunGateway(configPath: string, logTag = '[gw]'): ReturnType<typeof exec> {
   const child = exec(`DYNAPM_CONFIG=${configPath} bun run ${process.cwd()}/src/index.ts`);
   child.stdout?.on('data', () => {});
   child.stderr?.on('data', (d) => process.stderr.write(`${logTag} ${d}`));

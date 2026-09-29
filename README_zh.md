@@ -37,7 +37,7 @@ DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替�
 
 | 特性 | DynaPM | Sablier | traefik-lazyload | Knative |
 |------|--------|---------|------------------|---------|
-| **技术栈** | Node.js + **uWS** | Go | Go | Go + K8s |
+| **技术栈** | **Bun** (Bun.serve) | Go | Go | Go + K8s |
 | **适用范围** | ⭐ **通用**（任意进程） | 仅 Docker | 仅 Docker | 仅 K8s |
 | **部署复杂度** | ⭐ **简单** | ⭐⭐⭐ 中等 | ⭐⭐⭐ 中等 | ⭐⭐⭐⭐⭐ 复杂 |
 | **基础设施** | 单台服务器 | Docker/K8s | Docker + Traefik | K8s 集群 |
@@ -71,7 +71,7 @@ DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替�
 📤 [myapp] POST /api/data - 200 - 2ms
 ```
 
-使用 **uWebSockets.js** 实现真正的流式转发，零缓冲，性能比 Fastify 提升 **10 倍以上**！
+使用 **Bun.serve** 实现真正的流式转发，零缓冲，吞吐最大化！
 
 ### 🌐 **SSE 和 WebSocket 支持**
 
@@ -153,9 +153,9 @@ DynaPM 原生支持现代实时通信协议：
 ✅ 流式代理延迟：  平均 10.3ms (范围: 9-12ms)
 ✅ 吞吐量：       5,942 req/s (多服务, 150 并发)
 ✅ 压测延迟：     高并发下保持低延迟
-✅ 内存开销：     ~50MB (Node.js 运行时)
+✅ 内存开销：     ~50MB (Bun 运行时)
 ✅ 代码体积：     21.7KB (压缩后)
-✅ 日志系统：     结构化 JSON 日志 (Pino)
+✅ 日志系统：     结构化 JSON 日志 (内置日志)
 ```
 
 ---
@@ -165,7 +165,7 @@ DynaPM 原生支持现代实时通信协议：
 ### 安装
 
 ```bash
-# 全局安装
+# 全局安装（需 Bun >= 1.4 运行时）
 npm install -g dynapm
 
 # 或使用 pnpm
@@ -361,7 +361,7 @@ pnpm benchmark
 
 ### 测试要求
 
-- **Node.js**: 运行 DynaPM 网关
+- **Bun** (>= 1.4)：运行 DynaPM 网关与测试
 - **curl**: 测试基本功能
 - **autocannon** (可选): 运行吞吐量压测
 
@@ -394,12 +394,12 @@ npm install -g autocannon
                    │
                    ▼
 ┌─────────────────────────────────────────────────┐
-│      DynaPM 网关 (uWebSockets.js)                │
+│      DynaPM 网关 (Bun.serve)                     │
 │  - 检查服务状态（内存缓存）                       │
 │  - 需要时执行启动命令（8ms）                      │
 │  - 快速轮询 TCP 端口（17ms，无延迟重试）          │
 │  - 流式代理请求（1-2ms）                         │
-│  - 结构化日志记录（Pino，异步）                   │
+│  - 结构化日志记录（内置日志，异步）                   │
 └──────────────────┬──────────────────────────────┘
                    │
                    ▼
@@ -547,8 +547,8 @@ services: {
 - [ ] 🔄 **多实例支持** - 分布式锁和状态同步
 - [ ] 🔌 **插件系统** - 自定义集成和扩展
 - [ ] 🌐 **更多健康检查** - gRPC、Redis 等
-- [x] ⚡ **uWebSockets.js 迁移** - 已完成（性能提升 10 倍以上）
-- [x] 📊 **结构化日志** - 已完成（Pino 异步日志）
+- [x] ⚡ **Bun 迁移** - 已完成（单运行时，bun --compile 单文件二进制）
+- [x] 📊 **结构化日志** - 已完成（内置日志 异步日志）
 
 ---
 
@@ -643,8 +643,7 @@ ISC
 ## 🙏 致谢
 
 基于优秀的开源工具构建：
-- [uWebSockets.js](https://github.com/uNetworking/uWebSockets.js) - Node.js 最高性能 Web 服务器（比 Fastify 快 10 倍以上）
-- [Pino](https://getpino.io/) - 极速结构化日志记录器
+- [Bun](https://bun.sh/) - 一体化 JavaScript 运行时与工具链（Bun.serve、bun --compile 单文件二进制）
 - [c12](https://github.com/unjs/c12) - 配置加载器
 
 ---

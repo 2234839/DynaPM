@@ -1,7 +1,7 @@
 /**
  * HttpUpgradeSniffer 解析器单元测试
  * 覆盖：完整头/分片/非 upgrade/无 Host/裸 LF/头后 body 字节/超限
- * 运行：npx tsx test/test-upgrade-sniffer.ts
+ * 运行：bun run test/test-upgrade-sniffer.ts（升级嗅探测试）
  */
 
 import { HttpUpgradeSniffer, type SniffResult } from '../src/core/upgrade-sniffer.js';

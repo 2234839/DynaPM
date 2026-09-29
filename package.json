@@ -2,7 +2,7 @@
   "name": "dynapm-monorepo",
   "private": true,
   "version": "1.0.15",
-  "description": "DynaPM (formerly DynaPM) monorepo: 智能网关 + 管理前端",
+  "description": "DynaPM (formerly DynaPM) monorepo: 智能网关（Bun 运行时） + 管理前端",
   "scripts": {
     "build": "pnpm --filter @dynapm/gateway build",
     "test": "pnpm --filter @dynapm/gateway test"

@@ -9,8 +9,8 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as http from 'node:http';
 import net from 'node:net';
-import pino from 'pino';
-import { Gateway } from '../src/core/gateway.js';
+const pino = (_opts: unknown) => ({ info() {}, warn() {}, error() {}, debug() {} });
+import { BunGateway as Gateway } from '../src/core/gateway.js';
 import type { DynaPMConfig } from '../src/config/types.js';
 
 const execAsync = promisify(exec);
@@ -20,9 +20,9 @@ function log(msg: string, color = C.reset) { console.log(`${color}${msg}${C.rese
 function assert(condition: boolean, message: string): asserts condition { if (!condition) throw new Error(message); }
 function sleep(ms: number) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-const GW_PORT = 3158;
-const ADMIN_PORT = 3159;
-const BACKEND_PORT = 3199;
+const GW_PORT = 3278;
+const ADMIN_PORT = 3279;
+const BACKEND_PORT = 3280;
 
 /** keepWarm 独立回收阈值（短） */
 const WARM_IDLE_MS = 2000;
@@ -67,7 +67,7 @@ function buildConfig(): DynaPMConfig {
         keepWarm: true,
         startTimeout: 15 * 1000,
         commands: {
-          start: `nohup node --experimental-strip-types ${cwd}/test/services/fast-server.ts ${BACKEND_PORT} >> logs/keepwarm-backend.log 2>&1 &`,
+          start: `nohup bun run ${cwd}/test/services/fast-server.ts ${BACKEND_PORT} >> logs/keepwarm-backend.log 2>&1 &`,
           stop: `lsof -i:${BACKEND_PORT} -P -n 2>/dev/null | grep LISTEN | awk '{print $2}' | sort -u | xargs -r kill -9`,
           check: `lsof -i:${BACKEND_PORT} -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1`,
         },

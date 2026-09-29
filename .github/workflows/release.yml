@@ -17,7 +17,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js（npm OIDC 发布需要 Node 自带 npm）
         uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -30,15 +35,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Build package
+      - name: Run test suites
+        run: pnpm --filter @dynapm/gateway test
+
+      - name: Build binary（bun --compile 单文件二进制）
         run: pnpm --filter @dynapm/gateway build
 
       - name: Verify build output
         run: |
           echo "📦 检查打包输出..."
-          ls -la packages/gateway/dist/src/
-          if [ ! -f packages/gateway/dist/src/index.js ]; then
-            echo "❌ 主入口文件不存在"
+          ls -la packages/gateway/dist/
+          if [ ! -f packages/gateway/dist/dynapm ]; then
+            echo "❌ 二进制不存在"
             exit 1
           fi
           echo "✅ 打包输出正常"

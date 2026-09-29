@@ -1,38 +1,20 @@
 /**
- * DynaPM 代理思源笔记特征 WS 场景测试
+ * DynaPM-Bun 模拟思源笔记特征 WS 场景对拍测试
+ * （契约 = packages/gateway/test/test-ws-siyuan.ts，9 场景不变）
  *
- * 模拟后端复现思源笔记 WS 特征：
- * 1. Authorization/token 鉴权头透传
- * 2. Origin/Host 头处理
- * 3. sec-websocket-protocol 子协议透传
- * 4. 大消息（2MB 同步数据块）双向传输
- * 5. 心跳 ping/pong（WS 协议层帧）
- * 6. 关闭码透传（后端主动 4001 关闭）
- * 7. HTTP API 混合调用（/check-auth）
- * 8. 活跃 WS 连接阻止服务回收
- *
- * 运行方式：
- *   npx tsx test/test-ws-siyuan.ts
- * （测试脚本自行启动网关与模拟后端，端口 3150/3151/3140/3152）
+ * 后端：ws 库 WebSocketServer 内嵌于本测试进程（bun 可解析 ws 依赖）
+ * 网关：startBunGateway + dynapm.config.ws-siyuan-test.ts
+ * 端口：后端 3140 / 代理 3151 / 网关 3150 / 管理 3152
  */
 
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
-import * as http from 'node:http';
-import * as crypto from 'node:crypto';
 import { createConnection } from 'node:net';
+import * as http from 'node:http';
 import { WebSocket as WS, WebSocketServer } from 'ws';
-
-const execAsync = promisify(exec);
-
-const C = { reset: '\x1b[0m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m' };
-function log(msg: string, color = C.reset) { console.log(`${color}${msg}${C.reset}`); }
-function section(msg: string) { log(`\n${'='.repeat(60)}`, C.cyan); log(msg, C.cyan); log('='.repeat(60), C.cyan); }
-function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
+import { checkPort, killPort, waitForPort, section, log, C, sleep, startBunGateway } from './helpers.js';
 
 /** 模拟思源后端端口 */
 const MOCK_BACKEND_PORT = 3140;
-/** 网关代理端口（配置中 siyuan-mock.service.port） */
+/** 网关代理端口 */
 const PROXY_PORT = 3151;
 /** 网关主端口 */
 const GATEWAY_PORT = 3150;
@@ -41,65 +23,13 @@ const ADMIN_PORT = 3152;
 
 /** 后端记录的最近一次 upgrade 请求头 */
 let lastUpgradeHeaders: Record<string, string> = {};
-/** 后端最近发送的关闭码 */
-let lastBackendClose: { code: number; reason: string } | null = null;
-/** 每个连接的 open 计数 */
-let backendOpenCount = 0;
 
 /**
- * 启动模拟思源后端：WS + HTTP 混合服务
- * - WS /ws：校验 Authorization 头，echo 大消息，支持 protocol 子协议回显，可发送协议层 ping，可主动 4001 关闭
- * - HTTP /check-auth：校验 Authorization 头返回 JSON
+ * 启动模拟思源后端：HTTP + WS 同端口混合服务
  */
 function startMockBackend(): Promise<void> {
-  const wss = new WebSocketServer({ port: MOCK_BACKEND_PORT });
-
-  wss.on('connection', (ws, req) => {
-    backendOpenCount++;
-    lastUpgradeHeaders = req.headers as Record<string, string>;
-
-    ws.on('message', (data: Buffer, isBinary: boolean) => {
-      if (isBinary) {
-        /** 二进制：直接回显（模拟同步数据块） */
-        ws.send(data, { binary: true });
-        return;
-      }
-      const msg = JSON.parse(data.toString());
-      if (msg.type === 'echo') {
-        ws.send(JSON.stringify({ type: 'echo', data: msg.data }));
-      } else if (msg.type === 'big') {
-        /** 回显大消息（模拟思源同步大块数据） */
-        ws.send(JSON.stringify({ type: 'big', data: msg.data }));
-      } else if (msg.type === 'whoami') {
-        /** 告知后端看到的鉴权头（验证透传） */
-        ws.send(JSON.stringify({ type: 'whoami', auth: lastUpgradeHeaders['authorization'] ?? null }));
-      } else if (msg.type === 'close-4001') {
-        ws.close(4001, 'siyuan-custom-close');
-      }
-    });
-  });
-
-  /** 协议层 ping 帧：用底层 socket 发送 */
-  (wss as unknown as { on: (ev: string, cb: (socket: import('node:net').Socket & { ping?: () => void }) => void) => void });
-  wss.on('ws:connect' as never, () => {});
-
-  /** HTTP 处理：ws 库的 server 上挂 http server */
-  const httpServer = http.createServer((req, res) => {
-    if (req.url === '/check-auth') {
-      const auth = req.headers['authorization'] ?? '';
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ code: auth === 'token-siyuan-test' ? 0 : -1, auth: auth || null }));
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('siyuan-mock');
-  });
-
-  /** 把 WS 升级挂到同一个 http server 上（思源是 HTTP+WS 同端口） */
-  wss.close();
   const wss2 = new WebSocketServer({ noServer: true });
   wss2.on('connection', (ws, req) => {
-    backendOpenCount++;
     lastUpgradeHeaders = req.headers as Record<string, string>;
 
     ws.on('message', (data: Buffer, isBinary: boolean) => {
@@ -117,15 +47,25 @@ function startMockBackend(): Promise<void> {
           type: 'whoami',
           auth: lastUpgradeHeaders['authorization'] ?? null,
           origin: lastUpgradeHeaders['origin'] ?? null,
-          protocol: (req.headers['sec-websocket-protocol'] ?? null),
+          protocol: (lastUpgradeHeaders['sec-websocket-protocol'] ?? null),
         }));
       } else if (msg.type === 'ping-frame') {
-        /** 发送协议层 ping 帧 */
         ws.ping('hb');
       } else if (msg.type === 'close-4001') {
         ws.close(4001, 'siyuan-custom-close');
       }
     });
+  });
+
+  const httpServer = http.createServer((req, res) => {
+    if (req.url === '/check-auth') {
+      const auth = req.headers['authorization'] ?? '';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: auth === 'token-siyuan-test' ? 0 : -1, auth: auth || null }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('siyuan-mock');
   });
 
   httpServer.on('upgrade', (req, socket, head) => {
@@ -143,25 +83,8 @@ function startMockBackend(): Promise<void> {
   });
 }
 
-function checkPort(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = createConnection({ host: '127.0.0.1', port, timeout: 200 }, () => { socket.destroy(); resolve(true); });
-    socket.on('error', () => { socket.destroy(); resolve(false); });
-    socket.on('timeout', () => { socket.destroy(); resolve(false); });
-  });
-}
-
 async function killPort(port: number) {
-  try {
-    /** 排除测试进程自身 pid：mock backend 在测试进程内 listen，否则 kill -9 自杀（exit 137） */
-    await execAsync(`lsof -ti:${port} -sTCP:LISTEN | grep -v -w ${process.pid} | xargs -r kill -9 2>/dev/null`);
-  } catch {}
-}
-
-async function waitForPort(port: number, timeout = 8000): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) { if (await checkPort(port)) return true; await sleep(100); }
-  return false;
+  try { await (await import('node:child_process')).exec(`lsof -ti:${port} -sTCP:LISTEN | xargs -r kill -9 2>/dev/null`); } catch {}
 }
 
 function httpRequest(path: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
@@ -217,17 +140,14 @@ async function runTest(name: string, fn: () => Promise<void>) {
 }
 
 async function main() {
+  log('\n📣 DynaPM-Bun 思源特征 WS 场景对拍测试', C.cyan);
   section('环境清理与启动');
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, GATEWAY_PORT, ADMIN_PORT]) await killPort(p);
   await sleep(300);
 
   await startMockBackend();
 
-  /** 启动网关 */
-  const gateway = exec(`DYNAPM_CONFIG=dynapm.config.ws-siyuan-test.ts npx tsx src/index.ts`);
-  gateway.stdout?.on('data', () => {});
-  gateway.stderr?.on('data', (d) => process.stderr.write(`[gateway] ${d}`));
-
+  const gateway = startBunGateway(process.cwd() + '/dynapm.config.ws-siyuan-test.ts');
   if (!await waitForPort(PROXY_PORT)) throw new Error('网关代理端口启动失败');
   log(`网关已启动: 代理 ${PROXY_PORT} -> ${MOCK_BACKEND_PORT}`, C.yellow);
 
@@ -270,7 +190,6 @@ async function main() {
 
   await runTest('6. 大消息 2MB 双向转发', async () => {
     const ws = await connectWs('/ws', {});
-    /** 2MB 字符串（模拟思源同步数据块） */
     const big = 'x'.repeat(2 * 1024 * 1024);
     const reply = await rpc<{ type: string; data: string }>(ws, { type: 'big', data: big }, 15000);
     ws.close();
@@ -279,10 +198,6 @@ async function main() {
 
   await runTest('7. 协议层 ping/pong 心跳', async () => {
     const ws = await connectWs('/ws', {});
-    /**
-     * uWS 网关无主动发送 pong 控制帧的 API（send 仅发数据帧），故心跳感知契约
-     * 以客户端收到协议层 ping 帧为准（客户端 ws 库收到 ping 会自动回 pong 维持链路）
-     */
     const pingPromise = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('未收到协议层 ping 帧')), 8000);
       ws.once('ping', () => { clearTimeout(timer); resolve(); });
@@ -305,12 +220,10 @@ async function main() {
 
   await runTest('9. 活跃 WS 连接期间服务不被闲置回收', async () => {
     const ws = await connectWs('/ws', {});
-    /** 持续发消息保持活跃，超过 idle 检查周期（3s）数倍 */
     for (let i = 0; i < 6; i++) {
       await rpc(ws, { type: 'echo', data: `keep-${i}` });
       await sleep(1000);
     }
-    /** 服务应仍在线（proxyOnly 不回收，且 activeConnections>0） */
     const ws2 = await connectWs('/ws', {});
     const reply = await rpc<{ type: string }>(ws2, { type: 'echo', data: 'still-alive' });
     ws.close();
@@ -326,13 +239,13 @@ async function main() {
   }
   log(`\n结果: ${passed}/${results.length} passed`, passed === results.length ? C.green : C.red);
 
-  gateway.kill();
+  gateway.kill('SIGKILL');
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, GATEWAY_PORT, ADMIN_PORT]) await killPort(p);
   process.exit(passed === results.length ? 0 : 1);
 }
 
 main().catch(async (err) => {
-  log(`致命错误: ${err.message}`, C.red);
+  log(`致命错误: ${err instanceof Error ? err.message : String(err)}`, C.red);
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, GATEWAY_PORT, ADMIN_PORT]) await killPort(p);
   process.exit(1);
 });

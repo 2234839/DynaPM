@@ -18,3 +18,6 @@ To eliminate this warning, add "type": "module" to /home/gs/opensource_code/Dyna
 Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
 To eliminate this warning, add "type": "module" to /home/gs/opensource_code/DynaPM/packages/gateway/package.json.
 (Use `node --trace-warnings ...` to show where the warning was created)
+bun echo-server listening on 3099
+bun echo-server listening on 3099
+bun echo-server listening on 3099

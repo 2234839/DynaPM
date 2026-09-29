@@ -1,13 +1,11 @@
-import type { ServiceConfig } from '../config/types.js';
-import type { HttpResponse, HttpRequest } from 'uWebSockets.js';
-import type { Logger } from 'pino';
+import type { ServiceConfig, ServiceState } from '../config/types.js';
 import type { ServiceManager } from './service-manager.js';
-import type { Gateway } from './gateway.js';
-import net from 'node:net';
+import type { BunGateway } from './gateway.js';
 import { URL } from 'node:url';
+import net from 'node:net';
 
 /**
- * 路由映射信息
+ * 路由映射信息（与 gateway.ts 内部定义结构一致）
  */
 interface RouteMapping {
   /** 服务配置 */
@@ -17,25 +15,36 @@ interface RouteMapping {
 }
 
 /**
- * 管理处理器
- * 处理所有管理 API 请求
+ * 日志接口（pino 兼容最小集）
+ */
+interface LoggerLike {
+  /** 信息日志 */
+  info: (obj: { msg: string; error?: unknown }) => void;
+  /** 警告日志 */
+  warn: (obj: { msg: string; error?: unknown }) => void;
+  /** 错误日志 */
+  error: (obj: { msg: string; error?: unknown }) => void;
+}
+
+/**
+ * 管理处理器 Bun 版：Request/Response 风格 API
+ * 路由与语义与 Node 版 admin-api.ts 对齐（/_dynapm/*）
  */
 export class AdminApiHandler {
-  /** 按服务名称索引的服务配置（懒初始化，因为构造时路由表可能尚未填充） */
+  /** 按服务名称索引的服务配置（懒初始化） */
   private _serviceMap: Map<string, ServiceConfig> | undefined;
   /** 按服务名称索引的路由映射（懒初始化） */
   private _routeMap: Map<string, RouteMapping> | undefined;
-
-  /** 网关引用（可选，用于停止服务后清理 keep-alive Agent 池） */
-  private gateway?: Pick<Gateway, 'cleanupAgent'>;
+  /** 网关引用（用于停止服务后清理连接池登记） */
+  private gateway?: Pick<BunGateway, 'cleanupAgent'>;
 
   constructor(
-    private config: DynaPMConfig,
-    private logger: Logger,
+    private config: { adminApi?: { enabled?: boolean; authToken?: string; allowedIps?: string[] } },
+    private logger: LoggerLike,
     private hostnameRoutes: Map<string, RouteMapping>,
     private portRoutes: Map<number, RouteMapping>,
     private serviceManager: ServiceManager,
-    gateway?: Pick<Gateway, 'cleanupAgent'>
+    gateway?: Pick<BunGateway, 'cleanupAgent'>,
   ) {
     this.gateway = gateway;
   }
@@ -89,7 +98,7 @@ export class AdminApiHandler {
   /**
    * 检查认证令牌是否有效
    */
-  private isAuthenticated(authHeader: string | undefined): boolean {
+  private isAuthenticated(authHeader: string | null): boolean {
     if (!this.config.adminApi?.authToken) {
       return true;
     }
@@ -118,73 +127,55 @@ export class AdminApiHandler {
   }
 
   /**
-   * 处理管理 API 请求
+   * 处理管理 API 请求（Bun 版入口）
    */
-  handleAdminApi(res: HttpResponse, req: HttpRequest): void {
-    /** 使用 uWS 提供的真实远端地址，不信任可伪造的 x-forwarded-for 等请求头 */
-    const remoteAddressBuf = res.getRemoteAddress();
-    const remoteBytes = remoteAddressBuf ? Buffer.from(remoteAddressBuf) : Buffer.alloc(0);
-    const ip = remoteBytes.byteLength === 4
-      ? `${remoteBytes[0]}.${remoteBytes[1]}.${remoteBytes[2]}.${remoteBytes[3]}`
-      : remoteBytes.byteLength === 16
-        ? Array.from({ length: 8 }, (_, i) => remoteBytes.readUInt16BE(i * 2).toString(16)).join(':')
-        : 'unknown';
+  async handleAdminApi(req: Request, remoteAddress?: { address: string } | null): Promise<Response> {
+    /** 使用 Bun 提供的真实远端地址，不信任可伪造的 x-forwarded-for 头 */
+    const ip = remoteAddress?.address ?? 'unknown';
 
-    // IP 白名单检查
     if (!this.isIpAllowed(ip)) {
-      res.cork(() => {
-        res.writeStatus('403 Forbidden');
-        res.end('Forbidden');
-      });
       this.logger.warn({ msg: `🚫 [Admin API] 拒绝访问: ${ip}` });
-      return;
+      return new Response('Forbidden', { status: 403 });
     }
 
-    // 认证检查
-    const authHeader = req.getHeader('authorization');
-    if (!this.isAuthenticated(authHeader)) {
-      res.cork(() => {
-        res.writeStatus('401 Unauthorized');
-        res.writeHeader('WWW-Authenticate', 'Bearer');
-        res.end('Unauthorized');
+    if (!this.isAuthenticated(req.headers.get('authorization'))) {
+      return new Response('Unauthorized', {
+        status: 401,
+        headers: { 'WWW-Authenticate': 'Bearer' },
       });
-      return;
     }
 
-    const url = req.getUrl();
-    const method = req.getMethod();
+    const url = new URL(req.url);
+    const method = req.method.toLowerCase();
 
-    const apiPath = url;
+    const apiPath = url.pathname;
 
-    // 路由分发（uWS getMethod() 返回小写方法名，无需 toLowerCase）
     if (apiPath === '/_dynapm/api/services' && method === 'get') {
-      this.getServicesList(res);
-    } else if (apiPath.startsWith('/_dynapm/api/services/') && method === 'get') {
-      const serviceName = apiPath.split('/')[4];
-      this.getServiceDetail(res, serviceName);
-    } else if (apiPath.endsWith('/stop') && method === 'post') {
-      const parts = apiPath.split('/');
-      const serviceName = parts[4];
-      this.stopService(res, serviceName);
-    } else if (apiPath.endsWith('/start') && method === 'post') {
-      const parts = apiPath.split('/');
-      const serviceName = parts[4];
-      this.startService(res, serviceName);
-    } else if (apiPath === '/_dynapm/api/events' && method === 'get') {
-      this.handleEventStream(res);
-    } else {
-      res.cork(() => {
-        res.writeStatus('404 Not Found');
-        res.end('Not Found');
-      });
+      return this.getServicesList();
     }
+    if (apiPath.startsWith('/_dynapm/api/services/') && method === 'get') {
+      const serviceName = apiPath.split('/')[4];
+      return this.getServiceDetail(serviceName);
+    }
+    if (apiPath.endsWith('/stop') && method === 'post') {
+      const serviceName = apiPath.split('/')[4];
+      return this.stopService(serviceName);
+    }
+    if (apiPath.endsWith('/start') && method === 'post') {
+      const serviceName = apiPath.split('/')[4];
+      return this.startService(serviceName);
+    }
+    if (apiPath === '/_dynapm/api/events' && method === 'get') {
+      return this.handleEventStream();
+    }
+    return new Response('Not Found', { status: 404 });
   }
 
   /**
    * 获取服务列表
    */
-  private getServicesList(res: HttpResponse): void {
-    const services = Array.from(this.getServiceMap().values()).map((service: ServiceConfig) => {
+  private getServicesList(): Response {
+    const services = Array.from(this.getServiceMap().values()).map((service) => {
       return {
         name: service.name,
         base: service.base,
@@ -197,27 +188,18 @@ export class AdminApiHandler {
         pid: service._state!.pid,
       };
     });
-
-    res.cork(() => {
-      res.writeHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ services }));
-    });
+    return Response.json({ services });
   }
 
   /**
    * 获取服务详情
    */
-  private getServiceDetail(res: HttpResponse, serviceName: string): void {
+  private getServiceDetail(serviceName: string): Response {
     const mapping = this.findServiceMapping(serviceName);
-
     this.logger.info({ msg: `🔍 [Admin API] 查找服务: ${serviceName}, 找到: ${mapping?.service.name || 'null'}` });
 
     if (!mapping) {
-      res.cork(() => {
-        res.writeStatus('404 Not Found');
-        res.end(JSON.stringify({ error: 'Service not found' }));
-      });
-      return;
+      return Response.json({ error: 'Service not found' }, { status: 404 });
     }
 
     const service = mapping.service;
@@ -236,118 +218,60 @@ export class AdminApiHandler {
       startCount: service._state!.startCount,
       totalUptime: service._state!.totalUptime,
     };
-
-    res.cork(() => {
-      res.writeHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify(detail));
-    });
+    return Response.json(detail);
   }
 
   /**
    * 停止服务
    */
-  async stopService(res: HttpResponse, serviceName: string): Promise<void> {
-    let aborted = false;
-    res.onAborted(() => { aborted = true; });
-
+  private async stopService(serviceName: string): Promise<Response> {
     const mapping = this.findServiceMapping(serviceName);
-
     if (!mapping) {
-      if (!aborted) {
-        res.cork(() => {
-          res.writeStatus('404 Not Found');
-          res.end(JSON.stringify({ error: 'Service not found' }));
-        });
-      }
-      return;
+      return Response.json({ error: 'Service not found' }, { status: 404 });
     }
 
     const service = mapping.service;
-
     if (service._state!.status !== 'online') {
-      if (!aborted) {
-        res.cork(() => {
-          res.writeStatus('400 Bad Request');
-          res.end(JSON.stringify({ error: 'Service is not online' }));
-        });
-      }
-      return;
+      return Response.json({ error: 'Service is not online' }, { status: 400 });
     }
 
     try {
       service._state!.status = 'stopping';
-
       if (service._state!.startTime) {
         service._state!.totalUptime += Date.now() - service._state!.startTime;
         service._state!.startTime = undefined;
       }
 
       await this.serviceManager.stop(service);
-
-      /** 停止后清理该服务的 keep-alive Agent 池（销毁空闲 socket，防 FD 泄漏） */
       this.gateway?.cleanupAgent(service.name);
-
       service._state!.status = 'offline';
 
-      if (!aborted) {
-        res.cork(() => {
-          res.writeHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({
-            success: true,
-            message: `服务 ${service.name} 已停止`,
-          }));
-        });
-      }
+      return Response.json({ success: true, message: `服务 ${service.name} 已停止` });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       service._state!.status = 'online';
-      if (!aborted) {
-        res.cork(() => {
-          res.writeStatus('500 Internal Server Error');
-          res.end(JSON.stringify({ error: message }));
-        });
-      }
+      return Response.json({ error: message }, { status: 500 });
     }
   }
 
   /**
    * 启动服务
    */
-  async startService(res: HttpResponse, serviceName: string): Promise<void> {
-    let aborted = false;
-    res.onAborted(() => { aborted = true; });
-
+  private async startService(serviceName: string): Promise<Response> {
     const mapping = this.findServiceMapping(serviceName);
-
     if (!mapping) {
-      if (!aborted) {
-        res.cork(() => {
-          res.writeStatus('404 Not Found');
-          res.end(JSON.stringify({ error: 'Service not found' }));
-        });
-      }
-      return;
+      return Response.json({ error: 'Service not found' }, { status: 404 });
     }
 
     const service = mapping.service;
-
     if (service._state!.status === 'online' || service._state!.status === 'starting') {
-      if (!aborted) {
-        res.cork(() => {
-          res.writeStatus('400 Bad Request');
-          res.end(JSON.stringify({ error: 'Service is already running or starting' }));
-        });
-      }
-      return;
+      return Response.json({ error: 'Service is already running or starting' }, { status: 400 });
     }
 
     try {
       service._state!.status = 'starting';
-
-      /** 先等待启动命令执行完成，再检查端口就绪（避免 fire-and-forget 竞态） */
       await this.serviceManager.start(service);
 
-      /** 预解析 URL，避免循环内重复 new URL() */
       const targetUrl = new URL(service.base);
       const targetHost = targetUrl.hostname;
       const targetPort = parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'));
@@ -363,74 +287,38 @@ export class AdminApiHandler {
           socket.on('error', () => { socket.destroy(); resolve(false); });
           socket.on('timeout', () => { socket.destroy(); resolve(false); });
         });
-        if (isReady) {
-          break;
-        }
+        if (isReady) break;
         await new Promise(resolve => setTimeout(resolve, 100));
       }
 
       if (!isReady) {
         service._state!.status = 'offline';
-        if (!aborted) {
-          res.cork(() => {
-            res.writeStatus('503 Service Unavailable');
-            res.end(JSON.stringify({ error: 'Service start timeout' }));
-          });
-        }
-        return;
+        return Response.json({ error: 'Service start timeout' }, { status: 503 });
       }
 
       service._state!.status = 'online';
       service._state!.startTime = Date.now();
       service._state!.startCount++;
-
-      if (!aborted) {
-        res.cork(() => {
-          res.writeHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({
-            success: true,
-            message: `服务 ${service.name} 已启动`,
-          }));
-        });
-      }
+      return Response.json({ success: true, message: `服务 ${service.name} 已启动` });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       service._state!.status = 'offline';
-      if (!aborted) {
-        res.cork(() => {
-          res.writeStatus('500 Internal Server Error');
-          res.end(JSON.stringify({ error: message }));
-        });
-      }
+      return Response.json({ error: message }, { status: 500 });
     }
   }
 
   /**
-   * 处理事件流（SSE）
+   * 处理事件流（SSE）：一次性发送连接成功事件后结束（与 Node 版行为一致）
    */
-  private handleEventStream(res: HttpResponse): void {
-    res.cork(() => {
-      res.writeStatus('200 OK');
-      res.writeHeader('Content-Type', 'text/event-stream');
-      res.writeHeader('Cache-Control', 'no-cache');
-      res.writeHeader('Connection', 'keep-alive');
-      res.writeHeader('X-Accel-Buffering', 'no');
-    });
-
-    // 发送初始连接成功事件
-    res.cork(() => {
-      res.end(`event: connected\ndata: {"timestamp":${Date.now()}}\n\n`);
+  private handleEventStream(): Response {
+    return new Response(`event: connected\ndata: {"timestamp":${Date.now()}}\n\n`, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
     });
   }
-}
-
-/**
- * DynaPM配置类型导入
- */
-interface DynaPMConfig {
-  adminApi?: {
-    enabled?: boolean;
-    authToken?: string;
-    allowedIps?: string[];
-  };
 }
