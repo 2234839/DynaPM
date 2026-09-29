@@ -3,9 +3,9 @@
   "version": "1.0.15",
   "description": "DynaPM (formerly DynaPM) gateway: 智能网关 + 按需启动服务管理（Bun 运行时）。DynaPM is a dynamic start-stop application management tool with serverless-like features.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/dynapm.mjs",
   "bin": {
-    "dynapm": "src/index.ts"
+    "dynapm": "dist/dynapm.mjs"
   },
   "scripts": {
     "start": "bun run src/index.ts",
@@ -18,14 +18,16 @@
     "test:keepwarm": "bun run test/test-keepwarm.ts",
     "test:sniffer": "bun run test/test-upgrade-sniffer.ts",
     "test:agent": "bun run test/test-agent-cleanup-bun.ts",
-    "build": "bun build --compile --external giget --external jiti --external chokidar --external dotenv src/index.ts --outfile dist/dynapm",
-    "publish2npm": "bun run ./script/updateVersion.ts && npm publish --registry=https://registry.npmjs.org",
+    "build": "bun run script/build-bundle.ts",
+    "build:binary": "bun build --compile --external giget --external jiti --external chokidar --external dotenv src/index.ts --outfile dist/dynapm",
+    "publish2npm": "bun run ./script/updateVersion.ts && bun run build && npm publish --registry=https://registry.npmjs.org",
     "runTestServer": "bun run ./test/services/echo-server.ts",
     "prebuild": "bun run script/patch-c12-runtime.ts"
   },
   "files": [
-    "src/",
-    "*.md",
+    "dist/",
+    "README.md",
+    "README_zh.md",
     "CHANGELOG.md"
   ],
   "keywords": [
@@ -43,13 +45,12 @@
   "engines": {
     "bun": ">=1.4.0"
   },
-  "dependencies": {
-    "bun-types": "^1.4.2",
-    "c12": "4.0.0-beta.4"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/ws": "^8.18.1",
+    "bun-types": "^1.4.2",
     "chokidar": "^5.0.0",
+    "c12": "4.0.0-beta.4",
     "ws": "^8.19.0"
   }
 }
