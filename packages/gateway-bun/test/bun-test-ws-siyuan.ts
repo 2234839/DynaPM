@@ -1,5 +1,5 @@
 /**
- * ModelRep-Bun 模拟思源笔记特征 WS 场景对拍测试
+ * DynaPM-Bun 模拟思源笔记特征 WS 场景对拍测试
  * （契约 = packages/gateway/test/test-ws-siyuan.ts，9 场景不变）
  *
  * 后端：ws 库 WebSocketServer 内嵌于本测试进程（bun 可解析 ws 依赖）
@@ -140,7 +140,7 @@ async function runTest(name: string, fn: () => Promise<void>) {
 }
 
 async function main() {
-  log('\n📣 ModelRep-Bun 思源特征 WS 场景对拍测试', C.cyan);
+  log('\n📣 DynaPM-Bun 思源特征 WS 场景对拍测试', C.cyan);
   section('环境清理与启动');
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, GATEWAY_PORT, ADMIN_PORT]) await killPort(p);
   await sleep(300);

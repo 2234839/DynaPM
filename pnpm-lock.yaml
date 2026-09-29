@@ -70,7 +70,7 @@ importers:
 
   packages/gateway-bun:
     dependencies:
-      '@modelrep/gateway':
+      '@dynapm/gateway':
         specifier: workspace:*
         version: link:../gateway
       bun-types:

@@ -31,7 +31,7 @@ jobs:
         run: pnpm install
 
       - name: Build package
-        run: pnpm --filter @modelrep/gateway build
+        run: pnpm --filter @dynapm/gateway build
 
       - name: Verify build output
         run: |

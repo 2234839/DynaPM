@@ -5,7 +5,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
- * 简单结构化日志（Bun 版不依赖 pino：输出 [ModelRep-Bun] 前缀 JSON 行到 stdout，
+ * 简单结构化日志（Bun 版不依赖 pino：输出 [DynaPM-Bun] 前缀 JSON 行到 stdout，
  * 兼容 pino 风格的 { msg } 调用）
  */
 function createLogger() {
@@ -32,7 +32,7 @@ function createLogger() {
 }
 
 /**
- * ModelRep（原 DynaPM）Bun 版主函数
+ * DynaPMBun 版主函数
  */
 async function main() {
   const logger = createLogger();
@@ -52,7 +52,7 @@ async function main() {
   process.on('uncaughtException', (err: Error) => fatalHandler(err, 'uncaughtException'));
   process.on('unhandledRejection', (reason: unknown) => fatalHandler(reason, 'unhandledRejection'));
 
-  logger.info({ msg: 'ModelRep-Bun 网关启动中...' });
+  logger.info({ msg: 'DynaPM-Bun 网关启动中...' });
 
   try {
     const config = await loadDynaPMConfig();
@@ -60,7 +60,7 @@ async function main() {
     gatewayRef.current = gateway;
     await gateway.start();
 
-    logger.info({ msg: 'ModelRep-Bun 网关已启动', service: String(config.port || 3000) });
+    logger.info({ msg: 'DynaPM-Bun 网关已启动', service: String(config.port || 3000) });
 
     const cleanup = async (signal: string) => {
       logger.info({ msg: `⚠️ 收到 ${signal} 信号，正在清理...` });
@@ -71,7 +71,7 @@ async function main() {
     process.on('SIGINT', () => cleanup('SIGINT'));
     process.on('SIGTERM', () => cleanup('SIGTERM'));
     process.on('exit', () => {
-      logger.info({ msg: '👋 ModelRep-Bun 网关已退出' });
+      logger.info({ msg: '👋 DynaPM-Bun 网关已退出' });
     });
   } catch (error) {
     logger.error({ msg: '启动失败', error });

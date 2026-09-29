@@ -62,7 +62,7 @@ interface RouteMapping {
 }
 
 /**
- * ModelRep 网关 Bun 版
+ * DynaPM 网关 Bun 版
  * Bun.serve + 原生 fetch 实现，行为与 Node+uWS 版对齐
  */
 export class BunGateway {
@@ -171,8 +171,8 @@ export class BunGateway {
     if (!this.config.services) {
       return;
     }
-    console.log('[ModelRep-Bun] 初始化服务...');
-    console.log('[ModelRep-Bun] 服务数量:', Object.keys(this.config.services).length);
+    console.log('[DynaPM-Bun] 初始化服务...');
+    console.log('[DynaPM-Bun] 服务数量:', Object.keys(this.config.services).length);
 
     for (const service of Object.values(this.config.services)) {
       service._state = {
@@ -185,11 +185,11 @@ export class BunGateway {
 
       const routes = service.routes || [];
       if (routes.length === 0) {
-        console.warn(`[ModelRep-Bun] ⚠️  [${service.name}] 没有配置路由`);
+        console.warn(`[DynaPM-Bun] ⚠️  [${service.name}] 没有配置路由`);
         continue;
       }
 
-      console.log(`[ModelRep-Bun] ✅ [${service.name}] 配置了 ${routes.length} 个路由:`);
+      console.log(`[DynaPM-Bun] ✅ [${service.name}] 配置了 ${routes.length} 个路由:`);
 
       for (const route of routes) {
         const targetUrl = new URL(route.target);
@@ -202,18 +202,18 @@ export class BunGateway {
         if (route.type === 'host') {
           const hostname = route.value as string;
           this.hostnameRoutes.set(hostname, mapping);
-          console.log(`[ModelRep-Bun]   └─ hostname: ${hostname} -> ${route.target}`);
+          console.log(`[DynaPM-Bun]   └─ hostname: ${hostname} -> ${route.target}`);
         } else if (route.type === 'port') {
           const port = route.value as number;
           this.portRoutes.set(port, mapping);
-          console.log(`[ModelRep-Bun]   └─ port: ${port} -> ${route.target}`);
+          console.log(`[DynaPM-Bun]   └─ port: ${port} -> ${route.target}`);
         }
       }
     }
 
     const hostnameCount = this.hostnameRoutes.size;
     const portCount = this.portRoutes.size;
-    console.log(`[ModelRep-Bun] 📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定`);
+    console.log(`[DynaPM-Bun] 📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定`);
     this.logger.info({ msg: `📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定` });
   }
 
@@ -702,7 +702,7 @@ export class BunGateway {
       }),
     });
     this.servers.push(mainServer);
-    this.logger.info({ msg: `ModelRep-Bun 网关已启动: http://${host}:${port}` });
+    this.logger.info({ msg: `DynaPM-Bun 网关已启动: http://${host}:${port}` });
 
     for (const [portNum, mapping] of this.portRoutes) {
       if (mapping.service.passthrough) {

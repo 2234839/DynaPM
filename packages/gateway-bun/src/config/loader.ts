@@ -16,15 +16,15 @@ async function loadC12Config(options: {
 }
 
 /**
- * 加载 ModelRep（原 DynaPM）配置（宽松模式）—— Bun 版
- * 与 Node 版 loader 语义对齐：MODELREP_CONFIG 优先、DYNAPM_CONFIG 兼容、
+ * 加载 DynaPM配置（宽松模式）—— Bun 版
+ * 与 Node 版 loader 语义对齐：DYNAPM_CONFIG 优先、
  * timeouts/adminApi 默认值兜底、路由生成与冲突校验。
- * @returns ModelRep 配置对象
+ * @returns DynaPM 配置对象
  * @throws 当配置文件中至少需要一个服务时抛出错误
  */
 export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
-  /** 支持通过环境变量指定配置文件路径：MODELREP_CONFIG 优先，DYNAPM_CONFIG 向后兼容保留 */
-  const configFile = process.env.MODELREP_CONFIG || process.env.DYNAPM_CONFIG || undefined;
+  /** 支持通过环境变量指定配置文件路径：DYNAPM_CONFIG 环境变量指定配置文件路径 */
+  const configFile = process.env.DYNAPM_CONFIG || undefined;
 
   const { config } = await loadC12Config({
     name: 'dynapm',

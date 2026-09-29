@@ -97,7 +97,7 @@ onMounted(() => {
 <template>
   <div class="container">
     <header class="header">
-      <h1>ModelRep 管理界面</h1>
+      <h1>DynaPM 管理界面</h1>
       <button class="btn" :disabled="loading" @click="refresh">
         {{ loading ? '刷新中…' : '手动刷新' }}
       </button>

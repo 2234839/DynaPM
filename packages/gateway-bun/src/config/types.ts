@@ -13,4 +13,4 @@ export type {
   AdminApiConfig,
   TimeoutsConfig,
   LoggingConfig,
-} from '@modelrep/gateway/src/config/types.js';
+} from '@dynapm/gateway/src/config/types.js';

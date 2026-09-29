@@ -1,8 +1,8 @@
-{"level":30,"time":"2026-09-29T01:14:55.083Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T01:14:55.083Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T01:14:55.162Z","msg":"📊 共配置 2 个 hostname 映射, 0 个端口绑定"}
-{"level":30,"time":"2026-09-29T01:14:55.175Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3130"}
+{"level":30,"time":"2026-09-29T01:14:55.175Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3130"}
 {"level":30,"time":"2026-09-29T01:14:55.199Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3131"}
-{"level":30,"time":"2026-09-29T01:14:55.199Z","msg":"ModelRep 网关已启动","port":3130}
+{"level":30,"time":"2026-09-29T01:14:55.199Z","msg":"DynaPM 网关已启动","port":3130}
 {"level":30,"time":"2026-09-29T01:14:55.580Z","msg":"🚀 [echo-host] POST /echo?echo=ok - 启动服务..."}
 {"level":30,"time":"2026-09-29T01:14:55.987Z","msg":"✅ [echo-host] 服务就绪 (等待208ms)"}
 {"level":40,"time":"2026-09-29T01:14:56.103Z","msg":"⚠️ [echo-host] 请求体超过 10485760 字节，返回 413"}
@@ -11,11 +11,11 @@
 {"level":40,"time":"2026-09-29T01:14:56.107Z","msg":"🚫 [Admin API] 拒绝访问: 127.0.0.1"}
 {"level":30,"time":"2026-09-29T01:14:56.253Z","msg":"🚀 [ws-slow] WebSocket - 启动服务..."}
 {"level":40,"time":"2026-09-29T01:14:56.267Z","msg":"⚠️ [ws-slow] WebSocket 消息队列超过 1000 条，主动关闭连接","service":"ws-slow"}
-{"level":30,"time":"2026-09-29T01:15:05.073Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T01:15:05.073Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T01:15:05.114Z","msg":"📊 共配置 3 个 hostname 映射, 0 个端口绑定"}
-{"level":30,"time":"2026-09-29T01:15:05.128Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3140"}
+{"level":30,"time":"2026-09-29T01:15:05.128Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3140"}
 {"level":30,"time":"2026-09-29T01:15:05.150Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3141"}
-{"level":30,"time":"2026-09-29T01:15:05.150Z","msg":"ModelRep 网关已启动","port":3140}
+{"level":30,"time":"2026-09-29T01:15:05.150Z","msg":"DynaPM 网关已启动","port":3140}
 {"level":30,"time":"2026-09-29T01:15:05.613Z","msg":"🚀 [timeout-start.test] GET / - 启动服务..."}
 {"level":50,"time":"2026-09-29T01:15:06.035Z","msg":"❌ [timeout-start.test] 启动失败","error":"服务启动超时: 端口 http://127.0.0.1:3150 不可用"}
 {"level":30,"time":"2026-09-29T01:15:06.139Z","msg":"🔍 [Admin API] 查找服务: timeout-start.test, 找到: timeout-start.test"}
@@ -29,11 +29,11 @@
 {"level":30,"time":"2026-09-29T01:15:07.474Z","msg":"🔍 [Admin API] 查找服务: timeout-stop.test, 找到: timeout-stop.test"}
 {"level":30,"time":"2026-09-29T01:15:07.476Z","msg":"⏳ [timeout-stop.test] GET / - 等待服务停止完成..."}
 {"level":50,"time":"2026-09-29T01:15:08.278Z","msg":"❌ [timeout-stop.test] 等待服务停止超时"}
-{"level":30,"time":"2026-09-29T01:15:11.649Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T01:15:11.649Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T01:15:11.661Z","msg":"📊 共配置 0 个 hostname 映射, 1 个端口绑定"}
-{"level":30,"time":"2026-09-29T01:15:11.674Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3163"}
+{"level":30,"time":"2026-09-29T01:15:11.674Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3163"}
 {"level":30,"time":"2026-09-29T01:15:11.728Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3162"}
-{"level":30,"time":"2026-09-29T01:15:11.728Z","msg":"ModelRep 网关已启动","port":3163}
+{"level":30,"time":"2026-09-29T01:15:11.728Z","msg":"DynaPM 网关已启动","port":3163}
 {"level":30,"time":"2026-09-29T01:15:11.750Z","msg":"⚡ passthrough 端口绑定已启动: 127.0.0.1:3161 -> pt-mock (WS 直通 / HTTP 经内部网关)"}
 {"level":30,"time":"2026-09-29T01:15:18.096Z","msg":"⚠️ 收到 SIGTERM 信号，正在清理..."}
 {"level":30,"time":"2026-09-29T01:15:18.096Z","msg":"🧹 正在清理所有服务..."}
@@ -45,12 +45,12 @@
 {"level":50,"time":"2026-09-29T01:15:18.132Z","msg":"❌ 致命错误 (uncaughtException)，进程将退出","error":"write EPIPE\nError: write EPIPE\n    at afterWriteDispatched (node:internal/stream_base_commons:159:15)\n    at writeGeneric (node:internal/stream_base_commons:150:3)\n    at Socket._writeGeneric (node:net:966:11)\n    at Socket._write (node:net:978:8)\n    at writeOrBuffer (node:internal/streams/writable:570:12)\n    at _write (node:internal/streams/writable:499:10)\n    at Writable.write (node:internal/streams/writable:508:10)\n    at console.value (node:internal/console/constructor:298:16)\n    at console.log (node:internal/console/constructor:384:26)\n    at ServiceManager.stop (/home/gs/opensource_code/DynaPM/packages/gateway/src/core/service-manager.ts:139:13)"}
 {"level":30,"time":"2026-09-29T01:15:18.132Z","msg":"🧹 正在清理所有服务..."}
 {"level":50,"time":"2026-09-29T01:15:18.135Z","msg":"❌ 致命错误 (uncaughtException)，进程将退出","error":"write EPIPE\nError: write EPIPE\n    at afterWriteDispatched (node:internal/stream_base_commons:159:15)\n    at writeGeneric (node:internal/stream_base_commons:150:3)\n    at Socket._writeGeneric (node:net:966:11)\n    at Socket._write (node:net:978:8)\n    at writeOrBuffer (node:internal/streams/writable:570:12)\n    at _write (node:internal/streams/writable:499:10)\n    at Writable.write (node:internal/streams/writable:508:10)\n    at console.value (node:internal/console/constructor:298:16)\n    at console.log (node:internal/console/constructor:384:26)\n    at ServiceManager.stop (/home/gs/opensource_code/DynaPM/packages/gateway/src/core/service-manager.ts:139:13)"}
-{"level":30,"time":"2026-09-29T01:22:35.587Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T01:22:35.587Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T01:22:35.685Z","msg":"📊 共配置 0 个 hostname 映射, 1 个端口绑定"}
-{"level":30,"time":"2026-09-29T01:22:35.697Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3150"}
+{"level":30,"time":"2026-09-29T01:22:35.697Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3150"}
 {"level":30,"time":"2026-09-29T01:22:35.719Z","msg":"🔌 端口绑定已启动: http://127.0.0.1:3151 -> siyuan-mock"}
 {"level":30,"time":"2026-09-29T01:22:35.742Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3152"}
-{"level":30,"time":"2026-09-29T01:22:35.742Z","msg":"ModelRep 网关已启动","port":3150}
+{"level":30,"time":"2026-09-29T01:22:35.742Z","msg":"DynaPM 网关已启动","port":3150}
 {"level":30,"time":"2026-09-29T01:22:42.068Z","msg":"⚠️ 收到 SIGTERM 信号，正在清理..."}
 {"level":30,"time":"2026-09-29T01:22:42.068Z","msg":"🧹 正在清理所有服务..."}
 {"level":30,"time":"2026-09-29T01:22:42.068Z","msg":"♻️ [siyuan-mock] Agent 池已清理"}
@@ -3901,27 +3901,27 @@
 {"level":50,"time":"2026-09-29T01:22:48.579Z","msg":"❌ 致命错误 (uncaughtException)，进程将退出","error":"write EPIPE\nError: write EPIPE\n    at afterWriteDispatched (node:internal/stream_base_commons:159:15)\n    at writeGeneric (node:internal/stream_base_commons:150:3)\n    at Socket._writeGeneric (node:net:966:11)\n    at Socket._write (node:net:978:8)\n    at writeOrBuffer (node:internal/streams/writable:570:12)\n    at _write (node:internal/streams/writable:499:10)\n    at Writable.write (node:internal/streams/writable:508:10)\n    at console.value (node:internal/console/constructor:298:16)\n    at console.log (node:internal/console/constructor:384:26)\n    at ServiceManager.stop (/home/gs/opensource_code/DynaPM/packages/gateway/src/core/service-manager.ts:139:13)"}
 {"level":30,"time":"2026-09-29T01:22:48.579Z","msg":"🧹 正在清理所有服务..."}
 {"level":30,"time":"2026-09-29T01:22:48.585Z","msg":"✅ 已清理 1 个服务"}
-{"level":30,"time":"2026-09-29T01:22:49.683Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T01:22:49.683Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T01:22:49.690Z","msg":"📊 共配置 0 个 hostname 映射, 1 个端口绑定"}
-{"level":30,"time":"2026-09-29T01:22:49.704Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3150"}
+{"level":30,"time":"2026-09-29T01:22:49.704Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3150"}
 {"level":30,"time":"2026-09-29T01:22:49.725Z","msg":"🔌 端口绑定已启动: http://127.0.0.1:3151 -> siyuan-mock"}
 {"level":30,"time":"2026-09-29T01:22:49.748Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3152"}
-{"level":30,"time":"2026-09-29T01:22:49.748Z","msg":"ModelRep 网关已启动","port":3150}
+{"level":30,"time":"2026-09-29T01:22:49.748Z","msg":"DynaPM 网关已启动","port":3150}
 {"level":30,"time":"2026-09-29T01:22:55.752Z","msg":"⚠️ 收到 SIGINT 信号，正在清理..."}
 {"level":30,"time":"2026-09-29T01:22:55.752Z","msg":"🧹 正在清理所有服务..."}
 {"level":30,"time":"2026-09-29T01:22:55.753Z","msg":"♻️ [siyuan-mock] Agent 池已清理"}
 {"level":30,"time":"2026-09-29T01:22:55.759Z","msg":"✅ 已清理 1 个服务"}
-{"level":30,"time":"2026-09-29T01:23:24.222Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T01:23:24.222Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T01:23:24.228Z","msg":"📊 共配置 0 个 hostname 映射, 1 个端口绑定"}
-{"level":30,"time":"2026-09-29T01:23:24.242Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3150"}
+{"level":30,"time":"2026-09-29T01:23:24.242Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3150"}
 {"level":30,"time":"2026-09-29T01:23:24.264Z","msg":"🔌 端口绑定已启动: http://127.0.0.1:3151 -> siyuan-mock"}
 {"level":30,"time":"2026-09-29T01:23:24.286Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3152"}
-{"level":30,"time":"2026-09-29T01:23:24.286Z","msg":"ModelRep 网关已启动","port":3150}
-{"level":30,"time":"2026-09-29T05:00:06.227Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T01:23:24.286Z","msg":"DynaPM 网关已启动","port":3150}
+{"level":30,"time":"2026-09-29T05:00:06.227Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T05:00:06.293Z","msg":"📊 共配置 2 个 hostname 映射, 0 个端口绑定"}
-{"level":30,"time":"2026-09-29T05:00:06.306Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3130"}
+{"level":30,"time":"2026-09-29T05:00:06.306Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3130"}
 {"level":30,"time":"2026-09-29T05:00:06.329Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3131"}
-{"level":30,"time":"2026-09-29T05:00:06.329Z","msg":"ModelRep 网关已启动","port":3130}
+{"level":30,"time":"2026-09-29T05:00:06.329Z","msg":"DynaPM 网关已启动","port":3130}
 {"level":30,"time":"2026-09-29T05:00:06.760Z","msg":"🚀 [echo-host] POST /echo?echo=ok - 启动服务..."}
 {"level":30,"time":"2026-09-29T05:00:07.080Z","msg":"✅ [echo-host] 服务就绪 (等待113ms)"}
 {"level":40,"time":"2026-09-29T05:00:07.107Z","msg":"⚠️ [echo-host] 请求体超过 10485760 字节，返回 413"}
@@ -3930,9 +3930,28 @@
 {"level":40,"time":"2026-09-29T05:00:07.110Z","msg":"🚫 [Admin API] 拒绝访问: 127.0.0.1"}
 {"level":30,"time":"2026-09-29T05:00:07.118Z","msg":"🚀 [ws-slow] WebSocket - 启动服务..."}
 {"level":40,"time":"2026-09-29T05:00:07.127Z","msg":"⚠️ [ws-slow] WebSocket 消息队列超过 1000 条，主动关闭连接","service":"ws-slow"}
-{"level":30,"time":"2026-09-29T05:00:13.534Z","msg":"ModelRep 网关启动中..."}
+{"level":30,"time":"2026-09-29T05:00:13.534Z","msg":"DynaPM 网关启动中..."}
 {"level":30,"time":"2026-09-29T05:00:13.540Z","msg":"📊 共配置 0 个 hostname 映射, 1 个端口绑定"}
-{"level":30,"time":"2026-09-29T05:00:13.552Z","msg":"ModelRep 网关已启动: http://127.0.0.1:3150"}
+{"level":30,"time":"2026-09-29T05:00:13.552Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3150"}
 {"level":30,"time":"2026-09-29T05:00:13.573Z","msg":"🔌 端口绑定已启动: http://127.0.0.1:3151 -> siyuan-mock"}
 {"level":30,"time":"2026-09-29T05:00:13.595Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3152"}
-{"level":30,"time":"2026-09-29T05:00:13.595Z","msg":"ModelRep 网关已启动","port":3150}
+{"level":30,"time":"2026-09-29T05:00:13.595Z","msg":"DynaPM 网关已启动","port":3150}
+{"level":30,"time":"2026-09-29T05:06:56.889Z","msg":"DynaPM 网关启动中..."}
+{"level":30,"time":"2026-09-29T05:06:56.943Z","msg":"📊 共配置 2 个 hostname 映射, 0 个端口绑定"}
+{"level":30,"time":"2026-09-29T05:06:56.956Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3130"}
+{"level":30,"time":"2026-09-29T05:06:56.980Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3131"}
+{"level":30,"time":"2026-09-29T05:06:56.980Z","msg":"DynaPM 网关已启动","port":3130}
+{"level":30,"time":"2026-09-29T05:06:57.426Z","msg":"🚀 [echo-host] POST /echo?echo=ok - 启动服务..."}
+{"level":30,"time":"2026-09-29T05:06:57.732Z","msg":"✅ [echo-host] 服务就绪 (等待104ms)"}
+{"level":40,"time":"2026-09-29T05:06:57.760Z","msg":"⚠️ [echo-host] 请求体超过 10485760 字节，返回 413"}
+{"level":50,"time":"2026-09-29T05:06:57.761Z","msg":"❌ [echo-host] 代理请求错误","error":"socket hang up"}
+{"level":30,"time":"2026-09-29T05:06:57.761Z","msg":"🔄 [echo-host] 后端不可达，重置状态为 offline"}
+{"level":40,"time":"2026-09-29T05:06:57.762Z","msg":"🚫 [Admin API] 拒绝访问: 127.0.0.1"}
+{"level":30,"time":"2026-09-29T05:06:57.770Z","msg":"🚀 [ws-slow] WebSocket - 启动服务..."}
+{"level":40,"time":"2026-09-29T05:06:57.784Z","msg":"⚠️ [ws-slow] WebSocket 消息队列超过 1000 条，主动关闭连接","service":"ws-slow"}
+{"level":30,"time":"2026-09-29T05:06:59.968Z","msg":"DynaPM 网关启动中..."}
+{"level":30,"time":"2026-09-29T05:06:59.973Z","msg":"📊 共配置 0 个 hostname 映射, 1 个端口绑定"}
+{"level":30,"time":"2026-09-29T05:06:59.985Z","msg":"DynaPM 网关已启动: http://127.0.0.1:3150"}
+{"level":30,"time":"2026-09-29T05:07:00.007Z","msg":"🔌 端口绑定已启动: http://127.0.0.1:3151 -> siyuan-mock"}
+{"level":30,"time":"2026-09-29T05:07:00.028Z","msg":"🔌 管理 API 已启动: http://127.0.0.1:3152"}
+{"level":30,"time":"2026-09-29T05:07:00.028Z","msg":"DynaPM 网关已启动","port":3150}

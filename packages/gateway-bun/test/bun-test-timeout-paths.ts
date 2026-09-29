@@ -1,5 +1,5 @@
 /**
- * ModelRep-Bun 超时路径对拍测试（契约 = packages/gateway/test/test-timeout-paths.ts）
+ * DynaPM-Bun 超时路径对拍测试（契约 = packages/gateway/test/test-timeout-paths.ts）
  *
  * 1. 启动超时：startTimeout=300ms + 后端永不监听 → 客户端收到 503，服务状态复位 offline
  * 2. 代理超时：后端 hang 住不响应 + proxyTimeoutMs=800 → 客户端收到 504
@@ -71,7 +71,7 @@ async function test_stopping_wait_timeout_503() {
 // ==================== 主流程 ====================
 
 async function main() {
-  log('\n⏱️  ModelRep-Bun 超时路径对拍测试', C.cyan);
+  log('\n⏱️  DynaPM-Bun 超时路径对拍测试', C.cyan);
 
   section('环境准备');
   for (const port of [3140, 3141, 3150, 3151, 3152]) {

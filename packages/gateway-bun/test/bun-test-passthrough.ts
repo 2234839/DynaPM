@@ -1,5 +1,5 @@
 /**
- * ModelRep-Bun passthrough 直通模式 WS 场景对拍测试
+ * DynaPM-Bun passthrough 直通模式 WS 场景对拍测试
  * （契约 = packages/gateway/test/test-passthrough.ts，9 场景不变）
  * 端口：后端 3160 / 代理 3161 / 管理 3162
  */
@@ -126,7 +126,7 @@ async function runTest(name: string, fn: () => Promise<void>) {
 }
 
 async function main() {
-  log('\n🧵 ModelRep-Bun passthrough 直通模式对拍测试', C.cyan);
+  log('\n🧵 DynaPM-Bun passthrough 直通模式对拍测试', C.cyan);
   section('环境清理与启动');
   for (const p of [MOCK_BACKEND_PORT, PROXY_PORT, ADMIN_PORT]) await killPort(p);
   await sleep(300);

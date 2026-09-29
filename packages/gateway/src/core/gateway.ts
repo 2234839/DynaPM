@@ -186,7 +186,7 @@ interface RouteMapping {
 }
 
 /**
- * ModelRep 网关（原 DynaPM）
+ * DynaPM 网关
  * 负责请求拦截、服务启动和反向代理
  */
 export class Gateway {
@@ -333,8 +333,8 @@ export class Gateway {
       return;
     }
 
-    console.log('[ModelRep] 初始化服务...');
-    console.log('[ModelRep] 服务数量:', Object.keys(this.config.services).length);
+    console.log('[DynaPM] 初始化服务...');
+    console.log('[DynaPM] 服务数量:', Object.keys(this.config.services).length);
 
     for (const service of Object.values(this.config.services)) {
       // 登记该服务的 Agent 池参数（供 getAgent 建池时消费）
@@ -353,11 +353,11 @@ export class Gateway {
       // 处理路由配置
       const routes = service.routes || [];
       if (routes.length === 0) {
-        console.warn(`[ModelRep] ⚠️  [${service.name}] 没有配置路由`);
+        console.warn(`[DynaPM] ⚠️  [${service.name}] 没有配置路由`);
         continue;
       }
 
-      console.log(`[ModelRep] ✅ [${service.name}] 配置了 ${routes.length} 个路由:`);
+      console.log(`[DynaPM] ✅ [${service.name}] 配置了 ${routes.length} 个路由:`);
 
       // 遍历路由配置
       for (const route of routes) {
@@ -371,18 +371,18 @@ export class Gateway {
         if (route.type === 'host') {
           const hostname = route.value as string;
           this.hostnameRoutes.set(hostname, mapping);
-          console.log(`[ModelRep]   └─ hostname: ${hostname} -> ${route.target}`);
+          console.log(`[DynaPM]   └─ hostname: ${hostname} -> ${route.target}`);
         } else if (route.type === 'port') {
           const port = route.value as number;
           this.portRoutes.set(port, mapping);
-          console.log(`[ModelRep]   └─ port: ${port} -> ${route.target}`);
+          console.log(`[DynaPM]   └─ port: ${port} -> ${route.target}`);
         }
       }
     }
 
     const hostnameCount = this.hostnameRoutes.size;
     const portCount = this.portRoutes.size;
-    console.log(`[ModelRep] 📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定`);
+    console.log(`[DynaPM] 📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定`);
     this.logger.info({ msg: `📊 共配置 ${hostnameCount} 个 hostname 映射, ${portCount} 个端口绑定` });
   }
 
@@ -1265,9 +1265,9 @@ export class Gateway {
 
     app.listen(host, port, (token: unknown) => {
       if (token) {
-        this.logger.info({ msg: `ModelRep 网关已启动: http://${host}:${port}` });
+        this.logger.info({ msg: `DynaPM 网关已启动: http://${host}:${port}` });
       } else {
-        this.logger.error({ msg: `❌ ModelRep 网关启动失败: ${host}:${port}` });
+        this.logger.error({ msg: `❌ DynaPM 网关启动失败: ${host}:${port}` });
       }
     });
 

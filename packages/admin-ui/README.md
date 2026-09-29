@@ -1,6 +1,6 @@
-# @modelrep/admin-ui
+# @dynapm/admin-ui
 
-ModelRep（原 DynaPM）管理前端：Vite + Vue3 + TypeScript。
+DynaPM（原 DynaPM）管理前端：Vite + Vue3 + TypeScript。
 
 ## 功能
 
@@ -13,7 +13,7 @@ ModelRep（原 DynaPM）管理前端：Vite + Vue3 + TypeScript。
 
 ```bash
 pnpm install        # 安装依赖（也可用 bun install）
-pnpm dev            # 开发服务器 http://localhost:5173（/_dynapm、/_modelrep 代理到 127.0.0.1:4000）
+pnpm dev            # 开发服务器 http://localhost:5173（/_dynapm、/_dynapm 代理到 127.0.0.1:4000）
 pnpm build          # 类型检查 + 构建产物到 dist/
 pnpm preview        # 预览构建产物
 ```

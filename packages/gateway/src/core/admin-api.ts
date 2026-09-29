@@ -154,13 +154,7 @@ export class AdminApiHandler {
     const url = req.getUrl();
     const method = req.getMethod();
 
-    /**
-     * 路径归一化：/_modelrep/* 别名映射回 /_dynapm/*（旧路径保持兼容不动）
-     * 品牌迁移只加不改，前端与既有约定不受影响
-     */
-    const apiPath = url.startsWith('/_modelrep/')
-      ? '/_dynapm' + url.slice('/_modelrep'.length)
-      : url;
+    const apiPath = url;
 
     // 路由分发（uWS getMethod() 返回小写方法名，无需 toLowerCase）
     if (apiPath === '/_dynapm/api/services' && method === 'get') {
@@ -431,7 +425,7 @@ export class AdminApiHandler {
 }
 
 /**
- * ModelRep（原 DynaPM）配置类型导入
+ * DynaPM配置类型导入
  */
 interface DynaPMConfig {
   adminApi?: {

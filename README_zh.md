@@ -8,7 +8,6 @@
 
 DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替代方案**，专为私有化部署设计。它通过按需启动和闲置自动停止的方式，帮助你在资源受限的服务器上管理数百个低频访问的服务。
 
-> ℹ️ **品牌说明**：本项目正在逐步更名为 **ModelRep**。npm 包名仍为 `dynapm` 不变（避免破坏现有用户）；代码内部命名、日志前缀与管理 API 别名已支持 ModelRep（如环境变量 `MODELREP_CONFIG` 优先于 `DYNAPM_CONFIG`，admin API `/_modelrep/*` 与 `/_dynapm/*` 均可用）。
 
 > 🤖 **AI 时代的最佳拍档**：DynaPM 是 [MCP Server](#-ai-agent-时代的新场景mcp-server-按需启动) 弹性托管的理想底座——AI Agent 的工具服务天然是「低频 + 按需」的，详见文末[专章](#-ai-agent-时代的新场景mcp-server-按需启动)。
 

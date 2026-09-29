@@ -107,7 +107,7 @@ async function test_ws_message_queue_overflow_closes() {
 }
 
 async function main() {
-  log('\n🛡️  ModelRep-Bun 正确性修复对拍测试', C.cyan);
+  log('\n🛡️  DynaPM-Bun 正确性修复对拍测试', C.cyan);
 
   section('环境准备');
   for (const port of [3130, 3131, 3111, 3099]) {

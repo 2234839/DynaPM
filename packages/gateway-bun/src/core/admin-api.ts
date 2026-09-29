@@ -28,7 +28,7 @@ interface LoggerLike {
 
 /**
  * 管理处理器 Bun 版：Request/Response 风格 API
- * 路由与语义与 Node 版 admin-api.ts 对齐（/_modelrep/* 与 /_dynapm/* 双路径）
+ * 路由与语义与 Node 版 admin-api.ts 对齐（/_dynapm/*）
  */
 export class AdminApiHandler {
   /** 按服务名称索引的服务配置（懒初始化） */
@@ -148,12 +148,7 @@ export class AdminApiHandler {
     const url = new URL(req.url);
     const method = req.method.toLowerCase();
 
-    /**
-     * 路径归一化：/_modelrep/* 别名映射回 /_dynapm/*（品牌迁移只加不改）
-     */
-    const apiPath = url.pathname.startsWith('/_modelrep/')
-      ? '/_dynapm' + url.pathname.slice('/_modelrep'.length)
-      : url.pathname;
+    const apiPath = url.pathname;
 
     if (apiPath === '/_dynapm/api/services' && method === 'get') {
       return this.getServicesList();

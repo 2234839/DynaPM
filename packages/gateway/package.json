@@ -1,7 +1,7 @@
 {
-  "name": "@modelrep/gateway",
+  "name": "@dynapm/gateway",
   "version": "1.0.15",
-  "description": "ModelRep (formerly DynaPM) gateway: 智能网关 + 按需启动服务管理。DynaPM is a dynamic start-stop application management tool with serverless-like features.",
+  "description": "DynaPM (formerly DynaPM) gateway: 智能网关 + 按需启动服务管理。DynaPM is a dynamic start-stop application management tool with serverless-like features.",
   "main": "index.js",
   "bin": {
     "dynapm": "dist/src/index.js"
