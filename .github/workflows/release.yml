@@ -31,13 +31,13 @@ jobs:
         run: pnpm install
 
       - name: Build package
-        run: pnpm build
+        run: pnpm --filter @modelrep/gateway build
 
       - name: Verify build output
         run: |
           echo "📦 检查打包输出..."
-          ls -la dist/src/
-          if [ ! -f dist/src/index.js ]; then
+          ls -la packages/gateway/dist/src/
+          if [ ! -f packages/gateway/dist/src/index.js ]; then
             echo "❌ 主入口文件不存在"
             exit 1
           fi
@@ -51,6 +51,7 @@ jobs:
 
       - name: Publish to npm
         run: npm publish --provenance
+        working-directory: packages/gateway
         # 使用 OIDC，不需要 NPM_TOKEN
         # --provenance 标志启用包溯源（npm 推荐的安全实践）
 

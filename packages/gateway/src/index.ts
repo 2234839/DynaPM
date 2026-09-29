@@ -41,7 +41,7 @@ function createLogger() {
 }
 
 /**
- * DynaPM主函数
+ * ModelRep（原 DynaPM）主函数
  * 加载配置并启动网关
  */
 async function main() {
@@ -65,7 +65,7 @@ async function main() {
   process.on('unhandledRejection', (reason: unknown) => fatalHandler(reason, 'unhandledRejection'));
 
   // 启动日志
-  logger.info({ msg: 'DynaPM 网关启动中...' });
+  logger.info({ msg: 'ModelRep 网关启动中...' });
 
   try {
     // 加载配置
@@ -76,7 +76,7 @@ async function main() {
     gatewayRef.current = gateway;
     await gateway.start();
 
-    logger.info({ msg: 'DynaPM 网关已启动', port: config.port || 3000 });
+    logger.info({ msg: 'ModelRep 网关已启动', port: config.port || 3000 });
 
     // 注册退出处理
     const cleanup = async (signal: string) => {
@@ -88,7 +88,7 @@ async function main() {
     process.on('SIGINT', () => cleanup('SIGINT'));
     process.on('SIGTERM', () => cleanup('SIGTERM'));
     process.on('exit', () => {
-      logger.info({ msg: '👋 DynaPM 网关已退出' });
+      logger.info({ msg: '👋 ModelRep 网关已退出' });
     });
   } catch (error) {
     logger.error({ msg: '启动失败', error });

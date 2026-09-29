@@ -1,0 +1,139 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #f5f6f8;
+  color: #1f2328;
+}
+
+.container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+h1 {
+  font-size: 20px;
+  margin: 0;
+}
+
+.btn {
+  padding: 4px 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  margin-right: 6px;
+}
+
+.btn:hover:not(:disabled) {
+  background: #f0f2f5;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-danger {
+  color: #c0392b;
+  border-color: #e3b7b2;
+}
+
+.link {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  color: #0969da;
+  padding: 0;
+}
+
+.service-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  font-size: 13px;
+}
+
+.service-table th,
+.service-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid #eceef1;
+  text-align: left;
+}
+
+.service-table th {
+  background: #f6f8fa;
+  font-weight: 600;
+}
+
+.badge {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.status-running {
+  background: #dafbe1;
+  color: #1a7f37;
+}
+
+.status-stopped {
+  background: #e8e8e8;
+  color: #666;
+}
+
+.status-starting {
+  background: #fff3cd;
+  color: #9a6700;
+}
+
+.status-unknown {
+  background: #ffebe9;
+  color: #cf222e;
+}
+
+.mono {
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+.error {
+  background: #ffebe9;
+  color: #cf222e;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.empty {
+  text-align: center;
+  color: #888;
+  padding: 24px !important;
+}
+
+.detail-cell {
+  background: #f6f8fa;
+}
+
+.detail {
+  margin: 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

@@ -1,0 +1,15 @@
+(node:1715676) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///home/gs/opensource_code/DynaPM/packages/gateway/test/services/stream-server.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to /home/gs/opensource_code/DynaPM/packages/gateway/package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+Stream test server listening on port 3198
+(node:1715821) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///home/gs/opensource_code/DynaPM/packages/gateway/test/services/stream-server.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to /home/gs/opensource_code/DynaPM/packages/gateway/package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+Stream test server listening on port 3198
+(node:1716208) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///home/gs/opensource_code/DynaPM/packages/gateway/test/services/stream-server.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to /home/gs/opensource_code/DynaPM/packages/gateway/package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+Stream test server listening on port 3198

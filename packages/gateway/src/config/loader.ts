@@ -2,13 +2,13 @@ import { loadConfig } from 'c12';
 import type { DynaPMConfig } from './types.js';
 
 /**
- * 加载DynaPM配置（宽松模式）
- * @returns DynaPM配置对象
+ * 加载 ModelRep（原 DynaPM）配置（宽松模式）
+ * @returns ModelRep 配置对象
  * @throws 当配置文件中至少需要一个服务时抛出错误
  */
 export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
-  /** 支持通过环境变量 DYNAPM_CONFIG 指定配置文件路径 */
-  const configFile = process.env.DYNAPM_CONFIG || undefined;
+  /** 支持通过环境变量指定配置文件路径：MODELREP_CONFIG 优先，DYNAPM_CONFIG 向后兼容保留 */
+  const configFile = process.env.MODELREP_CONFIG || process.env.DYNAPM_CONFIG || undefined;
 
   const { config } = await loadConfig<DynaPMConfig>({
     name: 'dynapm',

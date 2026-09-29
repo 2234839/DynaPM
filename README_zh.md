@@ -8,6 +8,10 @@
 
 DynaPM 是**复杂容器编排平台（如 Knative、Sablier）的轻量级替代方案**，专为私有化部署设计。它通过按需启动和闲置自动停止的方式，帮助你在资源受限的服务器上管理数百个低频访问的服务。
 
+> ℹ️ **品牌说明**：本项目正在逐步更名为 **ModelRep**。npm 包名仍为 `dynapm` 不变（避免破坏现有用户）；代码内部命名、日志前缀与管理 API 别名已支持 ModelRep（如环境变量 `MODELREP_CONFIG` 优先于 `DYNAPM_CONFIG`，admin API `/_modelrep/*` 与 `/_dynapm/*` 均可用）。
+
+> 🤖 **AI 时代的最佳拍档**：DynaPM 是 [MCP Server](#-ai-agent-时代的新场景mcp-server-按需启动) 弹性托管的理想底座——AI Agent 的工具服务天然是「低频 + 按需」的，详见文末[专章](#-ai-agent-时代的新场景mcp-server-按需启动)。
+
 ---
 
 ## 🎯 为什么选择 DynaPM？
@@ -473,9 +477,66 @@ npm install -g autocannon
 - **👨‍💻 个人项目**：保持数十个副业项目随时待命，不占用内存
 - **🛠️ 内部工具**：按需访问开发/测试环境
 - **🔧 微服务**：小规模部署的 Kubernetes 轻量级替代方案
+- **🤖 AI Agent / MCP Server 托管**：让上百个工具服务随 Agent 的调用弹性启停（见下文专章）
 - **💰 资源优化**：通过停止闲置服务最大化服务器利用率
 - **📦 节省成本**：在更小的 VPS 实例上运行更多服务
 - **🎓 学习实验**：轻松管理多个测试项目
+
+---
+
+## 🤖 AI Agent 时代的新场景：MCP Server 按需启动
+
+[MCP（Model Context Protocol）](https://modelcontextprotocol.io) 已经成为 AI Agent 连接工具与数据源的事实标准。一个中度使用的 AI 工作流背后，往往挂着**几十个 MCP Server**——文件系统、数据库查询、浏览器自动化、GitHub、各类 API 封装……
+
+### 这恰好是 DynaPM 的甜蜜点
+
+MCP Server 的负载特征与「副业项目」惊人地一致，甚至更极端：
+
+| 特征 | MCP Server | 传统低频服务 |
+|---|---|---|
+| 访问模式 | **只在 Agent 调用工具的瞬间活跃** | 低频但有规律 |
+| 闲置比例 | **>99%**（一次对话可能只调用几次工具） | 90%+ |
+| 单实例成本 | Node/Python 进程，50-200MB | 50-200MB |
+| 数量 | 每个工作流/Agent 一套，**极易上百** | 数十 |
+| 长连接 | SSE / Streamable HTTP（原生支持 ✅） | 部分 |
+
+挂 50 个 MCP Server ≈ **5-10GB 内存常驻浪费**，其中绝大部分在两次工具调用之间完全空闲。而它们 99% 的空闲时间里，你只需要一个端口占位符。
+
+### 用 DynaPM 托管 MCP Server
+
+```typescript
+services: {
+  // 每个用户/工作流一个 MCP Server 实例，按需弹性伸缩
+  'mcp-user-a.example.com': {
+    name: 'mcp-filesystem-a',
+    base: 'http://127.0.0.1:9101',
+    idleTimeout: 60 * 1000,        // Agent 工具调用间隔通常很短，1 分钟即可回收
+    keepWarm: true,                // 高频使用的核心工具保持热备（独立 30s 预热阈值）
+    commands: {
+      start: 'nohup npx -y @modelcontextprotocol/server-filesystem /data/user-a --port 9101 > logs/mcp-a.log 2>&1 &',
+      stop: 'lsof -ti:9101 | xargs -r kill -9',
+      check: 'lsof -ti:9101 >/dev/null 2>&1',
+    },
+  },
+}
+```
+
+**实际效果**：
+
+```
+🤖 Agent: "帮我看下这个目录里有什么"
+   → MCP 调用到达网关 → 服务离线 → 自动启动（~25ms 网关开销）
+   → Streamable HTTP/SSE 流式代理，工具结果流回 Agent
+   → 对话结束，60s 后服务自动停止，内存归还
+   → 下次调用再冷启，或 keepWarm 热备直取
+```
+
+- 💰 **内存从 5-10GB 常驻 → 按需几十 MB 峰值**，一台小 VPS 承载上百个 MCP Server
+- 🌐 **原生 SSE / Streamable HTTP 长连接支持**，智能连接追踪保证活跃会话期间不被误回收
+- 🎛️ **多租户天然成型**：`mcp-user-a` / `mcp-user-b` 各自独立实例、独立回收策略、互不干扰
+- ⚡ 对延迟不敏感的 Agent 场景，冷启动的 ~200ms 完全无感——**Agent 等待 LLM 推理的秒级延迟面前，这点开销可忽略**
+
+> 💡 **思路延伸**：MCP 只是一个例子。任何「由 AI 按需触发、调用稀疏、实例轻量」的服务（Agent 的浏览器实例、临时计算 worker、Per-user 沙箱 API）都适用同一模型——DynaPM 让「为每个 AI 任务动态准备一套工具」的成本趋近于零。
 
 ---
 

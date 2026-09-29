@@ -1,48 +1,13 @@
 {
-  "name": "dynapm",
+  "name": "modelrep-monorepo",
+  "private": true,
   "version": "1.0.15",
-  "description": "DynaPM is a dynamic start-stop application management tool with serverless-like features designed for resource-constrained environments. It starts and stops programs on demand, optimizes resource usage, and is suitable for private deployments. ",
-  "main": "index.js",
-  "bin": {
-    "dynapm": "dist/src/index.js"
-  },
+  "description": "ModelRep (formerly DynaPM) monorepo: 智能网关 + 管理前端",
   "scripts": {
-    "test": "tsx test/test-all.ts",
-    "test:watch": "nodemon --watch src --exec 'pnpm test'",
-    "benchmark": "tsx test/benchmark.ts",
-    "build": "rslib build",
-    "publish2npm": "pnpm build && pnpm tsx ./script/updateVersion.ts &&  npm publish --registry=https://registry.npmjs.org",
-    "runTestServer": "pnpm tsx ./test/server1.ts"
-  },
-  "files": [
-    "dist/src/",
-    "*.md",
-    "CHANGELOG.md"
-  ],
-  "keywords": [
-    "serverless",
-    "pm2",
-    "self-host"
-  ],
-  "author": "崮生",
-  "license": "ISC",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/2234839/DynaPM.git"
-  },
-  "dependencies": {
-    "c12": "4.0.0-beta.4",
-    "pino": "^10.3.1",
-    "pino-pretty": "^13.1.3",
-    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.57.0"
+    "build": "pnpm --filter @modelrep/gateway build",
+    "test": "pnpm --filter @modelrep/gateway test"
   },
   "devDependencies": {
-    "@rslib/core": "^0.20.0",
-    "@types/node": "^25.5.0",
-    "@types/ws": "^8.18.1",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "undici": "^7.24.5",
-    "ws": "^8.19.0"
+    "typescript": "^5.9.3"
   }
 }

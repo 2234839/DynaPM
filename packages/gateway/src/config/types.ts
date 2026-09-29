@@ -145,7 +145,7 @@ export interface LoggingConfig {
   enablePerformanceLog?: boolean;
 }
 
-/** DynaPM全局配置 */
+/** ModelRep（原 DynaPM）全局配置 */
 export interface DynaPMConfig {
   /** 监听端口 */
   port?: number;

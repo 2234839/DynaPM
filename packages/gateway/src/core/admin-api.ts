@@ -154,21 +154,29 @@ export class AdminApiHandler {
     const url = req.getUrl();
     const method = req.getMethod();
 
+    /**
+     * 路径归一化：/_modelrep/* 别名映射回 /_dynapm/*（旧路径保持兼容不动）
+     * 品牌迁移只加不改，前端与既有约定不受影响
+     */
+    const apiPath = url.startsWith('/_modelrep/')
+      ? '/_dynapm' + url.slice('/_modelrep'.length)
+      : url;
+
     // 路由分发（uWS getMethod() 返回小写方法名，无需 toLowerCase）
-    if (url === '/_dynapm/api/services' && method === 'get') {
+    if (apiPath === '/_dynapm/api/services' && method === 'get') {
       this.getServicesList(res);
-    } else if (url.startsWith('/_dynapm/api/services/') && method === 'get') {
-      const serviceName = url.split('/')[4];
+    } else if (apiPath.startsWith('/_dynapm/api/services/') && method === 'get') {
+      const serviceName = apiPath.split('/')[4];
       this.getServiceDetail(res, serviceName);
-    } else if (url.endsWith('/stop') && method === 'post') {
-      const parts = url.split('/');
+    } else if (apiPath.endsWith('/stop') && method === 'post') {
+      const parts = apiPath.split('/');
       const serviceName = parts[4];
       this.stopService(res, serviceName);
-    } else if (url.endsWith('/start') && method === 'post') {
-      const parts = url.split('/');
+    } else if (apiPath.endsWith('/start') && method === 'post') {
+      const parts = apiPath.split('/');
       const serviceName = parts[4];
       this.startService(res, serviceName);
-    } else if (url === '/_dynapm/api/events' && method === 'get') {
+    } else if (apiPath === '/_dynapm/api/events' && method === 'get') {
       this.handleEventStream(res);
     } else {
       res.cork(() => {
@@ -423,7 +431,7 @@ export class AdminApiHandler {
 }
 
 /**
- * DynaPM 配置类型导入
+ * ModelRep（原 DynaPM）配置类型导入
  */
 interface DynaPMConfig {
   adminApi?: {
