@@ -1,11 +1,11 @@
-import type { DynaPMConfig } from './src/config/types';
+import type { DynaPMConfigInput } from './src/config/types';
 
 /**
  * 模拟思源笔记场景的测试配置
  * 后端为 test-ws-siyuan.ts 内嵌启动的模拟服务（127.0.0.1:3140）
  * proxyOnly 纯代理模式，与用户当年代理思源的方式一致
  */
-const config: DynaPMConfig = {
+const config: DynaPMConfigInput = {
   port: 3150,
   host: '127.0.0.1',
 

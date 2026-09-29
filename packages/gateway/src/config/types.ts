@@ -160,3 +160,23 @@ export interface DynaPMConfig {
   /** 日志配置 */
   logging?: LoggingConfig;
 }
+
+/** 用户可写的服务配置：name/idleTimeout/startTimeout 可省略，由 loader 按 key 和默认值兜底 */
+export type ServiceConfigInput = Partial<Pick<ServiceConfig, 'name' | 'idleTimeout' | 'startTimeout'>> &
+  Omit<ServiceConfig, 'name' | 'idleTimeout' | 'startTimeout'>;
+
+/** DynaPM 配置文件（用户输入形态）：loader 规范化后即 DynaPMConfig */
+export interface DynaPMConfigInput {
+  /** 监听端口 */
+  port?: number;
+  /** 监听主机 */
+  host?: string;
+  /** 服务映射：hostname -> 服务配置 */
+  services: Record<string, ServiceConfigInput>;
+  /** 管理 API 配置 */
+  adminApi?: AdminApiConfig;
+  /** 超时配置 */
+  timeouts?: TimeoutsConfig;
+  /** 日志配置 */
+  logging?: LoggingConfig;
+}

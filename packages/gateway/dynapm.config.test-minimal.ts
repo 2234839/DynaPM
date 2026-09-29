@@ -1,6 +1,6 @@
 
-import type { DynaPMConfig } from './src/config/types';
-const config: DynaPMConfig = {
+import type { DynaPMConfigInput } from './src/config/types';
+const config: DynaPMConfigInput = {
   port: 3090,
   host: '127.0.0.1',
   adminApi: { enabled: true, port: 3091 },

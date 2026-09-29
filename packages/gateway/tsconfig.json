@@ -2,7 +2,10 @@
   "compilerOptions": {
     "target": "esnext",
     "module": "esnext",
-    "lib": ["esnext", "dom"],
+    "lib": [
+      "esnext",
+      "dom"
+    ],
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,
@@ -16,9 +19,18 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "types": ["bun-types"],
+    "types": [
+      "bun-types"
+    ],
     "noEmit": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "test/**/*"]
+  "include": [
+    "src/**/*",
+    "dynapm.config*.ts",
+    "script/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "test/**/*"
+  ]
 }

@@ -1,4 +1,4 @@
-import type { DynaPMConfig } from './src/config/types';
+import type { DynaPMConfigInput } from './src/config/types';
 
 /**
  * DynaPM配置示例
@@ -9,7 +9,7 @@ import type { DynaPMConfig } from './src/config/types';
  * 启动方式：tsx src/index.ts
  * 访问管理界面：http://127.0.0.1:4001/
  */
-const config: DynaPMConfig = {
+const config: DynaPMConfigInput = {
   // 网关监听配置
   port: 3000,
   host: '127.0.0.1',
@@ -245,10 +245,9 @@ const config: DynaPMConfig = {
 
       commands: {
         start: 'nohup node /path/to/universal.js > logs/universal.log 2>&1 &',
-        stop: 'lsof -i:5001 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\'' | sort -u | xargs -r kill -9',
+        stop: 'lsof -i:5001 -P -n 2>/dev/null | grep LISTEN | awk \'{print $2}\' | sort -u | xargs -r kill -9',
         check: 'lsof -i:5001 -P -n 2>/dev/null | grep LISTEN >/dev/null 2>&1',
       },
-
       healthCheck: {
         type: 'tcp',
       },

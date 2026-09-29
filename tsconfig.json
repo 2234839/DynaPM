@@ -5,11 +5,12 @@
     "lib": ["esnext", "dom"],
     "strict": true,
     "skipLibCheck": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "types": ["bun-types"]
   },
-  "references": [
-    { "path": "packages/gateway" }
-  ]
+  "include": ["*.ts"],
+  "exclude": ["node_modules", "packages", "logs"]
 }

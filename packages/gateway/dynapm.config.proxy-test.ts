@@ -1,4 +1,4 @@
-import type { DynaPMConfig } from './src/config/types';
+import type { DynaPMConfigInput } from './src/config/types';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -10,7 +10,7 @@ try {
   // 目录可能已存在
 }
 
-const config: DynaPMConfig = {
+const config: DynaPMConfigInput = {
   port: 3090,
   host: '127.0.0.1',
 

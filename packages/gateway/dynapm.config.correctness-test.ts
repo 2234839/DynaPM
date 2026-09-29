@@ -1,4 +1,4 @@
-import type { DynaPMConfig } from './src/config/types';
+import type { DynaPMConfigInput } from './src/config/types';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -14,7 +14,7 @@ try {
  * 正确性修复测试专用配置
  * 端口独立（3130/3131），避免与其他测试冲突
  */
-const config: DynaPMConfig = {
+const config: DynaPMConfigInput = {
   port: 3130,
   host: '127.0.0.1',
 

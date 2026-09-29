@@ -1,4 +1,4 @@
-import type { DynaPMConfig } from './src/config/types';
+import type { DynaPMConfig } from './packages/gateway/src/config/types';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 

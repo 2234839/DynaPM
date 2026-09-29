@@ -1,10 +1,10 @@
-import type { DynaPMConfig } from './src/config/types';
+import type { DynaPMConfigInput } from './src/config/types';
 
 /**
  * 本地思源笔记转发网关配置（验证用）
  * 网关监听 3180，转发到本机思源 6806
  */
-const config: DynaPMConfig = {
+const config: DynaPMConfigInput = {
   port: 3180,
   host: '127.0.0.1',
 

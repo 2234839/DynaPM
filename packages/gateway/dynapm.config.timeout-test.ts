@@ -1,4 +1,4 @@
-import type { DynaPMConfig } from './src/config/types.js';
+import type { DynaPMConfigInput } from './src/config/types';
 
 /**
  * 超时路径测试配置（独立端口 3140/3141，后端 3150-3152）
@@ -57,4 +57,4 @@ export default {
       },
     },
   },
-} as DynaPMConfig;
+} satisfies DynaPMConfigInput;

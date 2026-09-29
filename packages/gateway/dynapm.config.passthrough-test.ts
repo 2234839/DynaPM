@@ -1,11 +1,11 @@
-import type { DynaPMConfig } from './src/config/types';
+import type { DynaPMConfigInput } from './src/config/types';
 
 /**
  * passthrough 直通模式测试配置
  * 端口独立（3160/3161/3162），后端为 test-passthrough.ts 内嵌启动的模拟服务
  * proxyOnly + passthrough：WS upgrade 走 TCP 直通，普通 HTTP 走内部 uWS 流式代理
  */
-const config: DynaPMConfig = {
+const config: DynaPMConfigInput = {
   port: 3163,
   host: '127.0.0.1',
 
