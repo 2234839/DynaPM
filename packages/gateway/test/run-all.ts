@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 
 /** 套件清单（顺序即执行顺序，端口敏感的排前面） */
 const suites = [
+  'test/test-loader-validation.ts',
   'test/test-correctness-fixes.ts',
   'test/test-timeout-paths.ts',
   'test/test-ws-siyuan.ts',

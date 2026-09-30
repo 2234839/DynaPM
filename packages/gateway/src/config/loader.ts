@@ -1,18 +1,28 @@
-import type { DynaPMConfig } from './types.js';
+import type { DynaPMConfig, ServiceConfig } from './types.js';
+
+/** c12 loadConfig 所需的最小选项结构（结构化收窄，避免依赖 c12 泛型内部类型） */
+interface C12LoadOptions {
+  /** 配置名（用于自动发现 dynapm.config.*） */
+  name: string;
+  /** 显式指定的配置文件路径 */
+  configFile?: string;
+  /** 默认配置（最低优先级 layer） */
+  defaultConfig: DynaPMConfig;
+}
+
+/** c12 loadConfig 返回的最小结构 */
+interface C12LoadResult {
+  /** 合并后的配置对象 */
+  config: DynaPMConfig;
+}
 
 /**
  * c12 动态加载：bun build --compile 时不追踪其内部可选 peer 依赖（chokidar 等），
  * 运行时（bun run / 二进制内动态 require）均可正常加载
  */
-async function loadC12Config(options: {
-  name: string;
-  configFile?: string;
-  defaultConfig: unknown;
-}): Promise<{ config: DynaPMConfig }> {
-  const c12 = (await import('c12')) as unknown as {
-    loadConfig: (opts: Record<string, unknown>) => Promise<{ config: DynaPMConfig }>;
-  };
-  return c12.loadConfig(options);
+async function loadC12Config(options: C12LoadOptions): Promise<C12LoadResult> {
+  const c12 = await import('c12');
+  return c12.loadConfig<DynaPMConfig>(options);
 }
 
 /**
@@ -65,6 +75,7 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
   const hostnameMap = new Map<string, string>();
 
   for (const [key, service] of Object.entries(config.services)) {
+    validateCheckCommand(service, key);
     service.name = service.name || key;
     service.idleTimeout = service.idleTimeout || 5 * 60 * 1000;
     service.startTimeout = service.startTimeout || 30 * 1000;
@@ -136,4 +147,19 @@ export async function loadDynaPMConfig(): Promise<DynaPMConfig> {
   }
 
   return config;
+}
+
+/**
+ * 快速失败校验：commands.check 必须存在且为非空字符串
+ * （service-manager 的状态探测依赖该命令，缺失会导致服务无法启动）
+ * @throws 校验失败时抛出包含服务名与字段名的错误
+ */
+function validateCheckCommand(service: ServiceConfig, key: string): void {
+  const name = service.name || key;
+  const check = service.commands?.check;
+  if (typeof check !== 'string' || check.trim().length === 0) {
+    throw new Error(
+      `服务 [${name}] 配置错误：commands.check 必须存在且为非空字符串（用于探测服务运行状态），当前值: ${JSON.stringify(check)}`
+    );
+  }
 }
