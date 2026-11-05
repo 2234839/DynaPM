@@ -83,6 +83,9 @@ pub struct Gateway {
     pub http_client: reqwest::Client,
     /// netns 服务专用 UDS HTTP 客户端（每服务一个连接器实例，见 uds_clients）
     pub uds_clients: Mutex<HashMap<String, crate::netns::UdsClient>>,
+    /// 全局冷启动并发上限：小内存机器上多个服务同时冷启动会把资源打爆
+    /// （docker start + 应用初始化的内存/CPU 峰值叠加），信号量排队避免启动风暴
+    start_concurrency: tokio::sync::Semaphore,
     /// 服务生命周期事件广播（admin SSE 用）
     pub events: broadcast::Sender<String>,
     /// admin API 认证令牌
@@ -145,6 +148,7 @@ impl Gateway {
             stop_timeout_ms,
             http_client,
             uds_clients: Mutex::new(HashMap::new()),
+            start_concurrency: tokio::sync::Semaphore::new(2),
             events,
             admin_auth_token,
         })
@@ -215,6 +219,11 @@ impl Gateway {
         if rt.status() == Status::Online || rt.config.proxy_only {
             return Ok(());
         }
+        // 全局冷启动并发上限：排队等空位，防止小机被同时冷启动打爆（启动风暴）
+        let _start_permit = self.start_concurrency.acquire().await;
+        if rt.status() == Status::Online || rt.config.proxy_only {
+            return Ok(());
+        }
         rt.set_status(Status::Starting);
         let start_begun_ms = now_ms();
         let start_result = crate::state::start(&rt.config).await;
@@ -265,6 +274,12 @@ impl Gateway {
         // 持锁进入：并发请求会在锁上排队，前一个完成后后一个直接命中 online 短路
         let _guard = lock.lock().await;
 
+        if cfg.proxy_only || rt.status() == Status::Online {
+            return Ok(());
+        }
+
+        // 全局冷启动并发上限（与 ensure_service_online 同策略）
+        let _start_permit = self.start_concurrency.acquire().await;
         if cfg.proxy_only || rt.status() == Status::Online {
             return Ok(());
         }
