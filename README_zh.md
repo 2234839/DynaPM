@@ -1,5 +1,7 @@
 # DynaPM
 
+> ⚠️ **当前主实现为 Rust 版 [`packages/gateway-rs`](./packages/gateway-rs)**（单文件原生二进制）。原 Bun/TS 版（packages/gateway）已废弃，仅保留 [README 墓碑](./packages/gateway/README.md)；本文档部分章节描述的是旧版行为。
+
 [English Documentation](./README.md)
 
 > **动态进程管理器** - 具有类 serverless 特性的轻量级通用服务管理系统

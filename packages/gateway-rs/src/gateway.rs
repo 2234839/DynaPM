@@ -327,7 +327,18 @@ impl Gateway {
     }
 
     /// 停止服务（状态机：online -> stopping -> offline）
+    /// 与冷启动共用同一把 start 锁串行化：否则 stop 可能在冷启动的 docker start 与
+    /// 就绪判定之间杀掉后端，ensure 随后把状态设为 Online（实际已死），
+    /// 用户会先吃一次 502 才走「后端已死」自愈路径
     pub async fn stop_service(&self, rt: Arc<ServiceRuntime>) -> Result<(), String> {
+        let lock = self
+            .start_locks
+            .lock()
+            .unwrap()
+            .get(&rt.config.name)
+            .cloned()
+            .expect("启动锁缺失");
+        let _guard = lock.lock().await;
         if rt.status() == Status::Offline {
             return Ok(());
         }
@@ -374,7 +385,16 @@ impl Gateway {
                         let gw2 = Arc::clone(&gw);
                         let rt2 = Arc::clone(&rt);
                         tokio::spawn(async move {
-                        if let Err(e) = gw2.stop_service(Arc::clone(&rt2)).await {
+                            // 复查：判定（上面 clone runtimes 时）与真正执行 stop 之间可能有新请求到达，
+                            // 此时杀后端会把在飞请求打成 502；复查不满足 idle 则放弃本次回收
+                            let still_idle = rt2.active_connections.load(Ordering::Relaxed) == 0
+                                && now_ms() as i64 - rt2.last_access_ms.load(Ordering::Relaxed)
+                                    > idle_threshold as i64;
+                            if !still_idle {
+                                logger::info(&format!("↩️ [{}] 回收前复查发现新请求，跳过本次闲置停止", rt2.config.name));
+                                return;
+                            }
+                            if let Err(e) = gw2.stop_service(Arc::clone(&rt2)).await {
                                 logger::error(&format!("❌ [{}] 停止失败", rt2.config.name), Some(&e));
                             }
                         });

@@ -2,6 +2,8 @@
 
 [中文文档](./README_zh.md)
 
+> ⚠️ **当前主实现为 Rust 版 [`packages/gateway-rs`](./packages/gateway-rs)**（单文件原生二进制）。原 Bun/TS 版（packages/gateway）已废弃，仅保留 [README 墓碑](./packages/gateway/README.md)；本文档部分章节描述的是旧版行为。
+
 > **Dynamic Process Manager** - A lightweight, universal service management system with serverless-like features.
 
 [![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm) ![Tests](https://img.shields.io/badge/tests-81%2F81%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
