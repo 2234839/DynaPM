@@ -5,58 +5,47 @@ DynaPM 是一个智能网关(类似nginx)/进程管理工具(类似pm2)，通过
 **核心特性：**
 - ⚡ 极速冷启动
 - 🚀 双向流式转发代理实现极低的请求延迟：将请求体流式给代理服务，将代理服务的响应流式给请求者 所以不需要缓冲请求或者响应，唯一的需要缓冲的时机就是请求到达网关，但是需要被网关唤起的程序还没有启动成功的时候
-- 🌐 支持 SSE 和 WebSocket
+- 🌐 支持 SSE 和 WebSocket（任意路径 WS 升级嗅探接管）
 - 🎛️ 基于bash的通用服务管理（可用于管理PM2、Docker、systemd 等任意服务）
 - 🔄 闲置自动回收资源
 
 ## 技术栈
 
-- **运行时**: Bun 1.4+（Bun.serve + bun --compile 单文件二进制）
-- **Web 框架**: uWebSockets.js（最佳性能）
-- **日志**: 内置 JSON-line 结构化日志
-- **配置**: c12（支持 TypeScript）
-- **包管理**: pnpm
-- **测试**: bun run test/run-all.ts（8 个套件串行）
+- **唯一实现**: Rust（packages/gateway-rs）：tokio + axum 0.8 + reqwest 0.12 + tokio-tungstenite，~4000 行，`cargo build --release` 产出单文件二进制 `target/release/dynapm`
+- **管理面板**: packages/admin-ui（Vue3 + ECharts）
+- **测试**: packages/gateway-rs/test/（Bun 1.4+ 原生 fetch/WebSocket），`bun test/run-all.ts` 串行 5 套件；跑前先 pkill 残留网关/backend 进程（WSL 残留进程占端口会 TCP 黑洞）
 
 ## 项目结构
 
 ```
 DynaPM/
-├── src/
-│   ├── core/
-│   │   ├── gateway.ts          # 核心网关实现（HTTP/WebSocket代理）
-│   │   ├── service-manager.ts  # 服务启动/停止管理
-│   │   ├── health-checker.ts    # 健康检查（TCP/HTTP/命令）
-│   │   └── command-executor.ts  # Bash 命令执行器
-│   ├── config/
-│   │   ├── types.ts             # TypeScript 类型定义
-│   │   └── loader.ts            # 配置加载器
-│   └── index.ts                 # 主入口
-├── test/
-│   ├── test-all.ts              # 完整测试套件（12个测试）
-│   ├── server-*.ts              # 测试服务器
-│   └── benchmark.js             # 性能测试
-├── .github/workflows/
-│   └── release.yml              # 自动发布到 npm
-├── CHANGELOG.md                  # 版本更新日志
-├── README.md                     # 英文文档
-├── README_zh.md                  # 中文文档
-
+├── packages/
+│   ├── admin-ui/              # Vue3 管理面板
+│   ├── gateway-rs/            # 唯一网关实现（Rust）
+│   │   ├── src/
+│   │   │   ├── gateway.rs     # 核心网关（HTTP/WS 代理、按需启动、停滞超时）
+│   │   │   ├── state.rs       # 服务状态机/启停
+│   │   │   ├── health.rs      # 健康检查（TCP/HTTP/命令）
+│   │   │   ├── executor.rs    # Bash 命令执行器
+│   │   │   ├── admin.rs       # 管理 API + SSE
+│   │   │   ├── config.rs      # 配置类型 + JSON loader
+│   │   │   └── main.rs        # 主入口/路由
+│   │   ├── test/              # 回归测试套件（5 套件）
+│   │   └── dynapm.config.json # 配置示例
+│   └── gateway/               # 已废弃的 Bun 版（仅 README 墓碑）
+├── docs/
+├── CHANGELOG.md
+├── README.md / README_zh.md
 ```
 
 ## 开发指南
 
 ```bash
-# 运行测试
-pnpm test
-
-# 构建项目
-pnpm build
-
-# 性能测试
-pnpm benchmark
+cd packages/gateway-rs
+cargo build --release       # 产物 target/release/dynapm（注意不是 dynapm-rs，那是历史残留名）
+bun test/run-all.ts         # 回归测试（先清残留进程）
 ```
 
 ### 发布新版本
 
-流程 ： CHANGELOG → commit →更新 npm version （git add tag） →git push （github actions 会通过 oicd 发包 npm ）
+待定：musl 静态二进制 + GitHub Release（旧 npm OIDC 流程已随 Bun 版废弃）。流程：CHANGELOG → commit → tag → push → CI 构建发布。

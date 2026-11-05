@@ -22,3 +22,6 @@ target/
 # 本地部署目标配置（不入库）
 .deploy-env
 .deploy-ui-commit
+
+# 网关统计持久化目录（运行时产物）
+packages/gateway-rs/stats/

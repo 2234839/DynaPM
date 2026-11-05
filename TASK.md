@@ -1,16 +1,23 @@
 具有类 serverless 特性的轻量级通用服务管理系统:dynapm
 ## dynapm 开发
 
+当前唯一实现：**packages/gateway-rs**（Rust + tokio + axum + reqwest，单文件原生二进制 `target/release/dynapm`）。原 Bun/TS 版已废弃。
+回归测试：`cd packages/gateway-rs && bun test/run-all.ts`（core / coldstart / ws / limits / admin 共 5 套件，跑前先 pkill 残留网关与 backend 进程）。
+发布策略：musl 静态二进制 + GitHub Release 附件（npm OIDC 自动发包流程已随 Bun 版废弃，待定新流程）。
+
 /loop 先检查 TASK.md 中是否有未完成的任务请逐项完成并在充分test验证再继续下一项，如果没有则请请完善当前项目：监测并优化程序性能,修改完毕后需要进行实际运行测试，请自我完善，不要询问我任何事情，也不要切换其他模式（例如 plan mode）
 作为网关的测试一定要非常严谨，测试各种可能的情况以及极端情况。
-所有文件使用 ts，需要临时运行的使用 node --experimental-strip-types -e xxx.ts 来执行
-这一次主要考虑性能，要在不破坏所有功能的前提下优化性能，但是不要为了优化而优化，必须经过仔细的评估，不要无脑上缓存，缓存很容易出bug，否则可读性更强。然后咱们的网关可能已经到达了一般情况下的上限，所以你可能需要去互联网上查找node的一些大神使用的技巧
+这一次主要考虑性能，要在不破坏所有功能的前提下优化性能，但是不要为了优化而优化，必须经过仔细的评估，不要无脑上缓存，缓存很容易出bug，否则可读性更强。
 
 ## TASKS
 
 [x] 请在各个层面完善一下 serveless host 这个功能，尤其是前端，太low了，至少也得有 https://www.typescriptlang.org/play/ 这种水准的编辑和运行体验吧
 [x] 充分测试当前的代理功能是否正确
 [x] 创建一个实用的dynam能力演示程序：实现一个运行ts/js的 serveless host（并不属于 dynapm，但是可以被 dynapm 运行，然后请求又可以被这个  serveless host 路由到 对应的 ts文件去执行）：支持用户通过网站访问并编写 ts 上传执行和测试执行
+[x] gateway-rs 任意路径 WebSocket 升级（MaybeWs 提取器嗅探 Upgrade 头，主监听 fallback 接管）
+[x] gateway-rs 慢客户端停滞超时（timeouts.stallTimeoutMs，默认 120s，0=禁用；覆盖响应体流与 WS 双向消息）
+[x] gateway-rs 回归测试套件（test/ 5 套件，bun test/run-all.ts 串行）
+[x] proxyTimeoutMs 语义修正：只覆盖「连接→响应头」，不再掐断 SSE/长流式响应体（响应体由 stallTimeoutMs 管理）
 
 ## 已完成的工作
 

@@ -1,8 +1,8 @@
 # DynaPM Gateway — Rust 实现（gateway-rs）
 
-DynaPM 网关的 Rust 并行实现，与 Bun 版（`packages/gateway`）行为对齐，定位是**更高吞吐 / 更低 RSS / 单文件原生二进制**的第二实现。
+DynaPM 网关的 **唯一当前实现**（原 Bun/TS 版已废弃），单文件原生二进制，零运行时依赖。
 
-## 与 Bun 版的对齐矩阵
+## 能力清单
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -13,20 +13,20 @@ DynaPM 网关的 Rust 并行实现，与 Bun 版（`packages/gateway`）行为�
 | 健康检查 | ✅ | tcp（100ms 超时）/ http / command / none |
 | 闲置回收 | ✅ | 3s 扫描，keepWarm 独立 warmIdleTimeout 阈值 |
 | HTTP 流式代理 | ✅ | 请求体/响应体全流式（reqwest + axum Body），无缓冲 |
-| 请求体 10MB 限制 | ✅ | content-length 预检 413 + chunked 流式计数超限中断 413 |
-| 代理超时 504 / 502 | ✅ | proxyTimeoutMs |
-| 后端不可达重置 offline | ✅ | 与 Bun 版一致 |
-| WebSocket 代理 | ✅ | tokio-tungstenite 双向消息桥 |
-| Admin API | ✅ | `/_dynapm/api/services[...]` 路径与响应结构对齐 + SSE events |
-| keep-alive 连接池 | ✅ | reqwest 内置池（pool_max_idle_per_host=32） |
-| 配置格式 | ⚠️ | 字段与 TS 版一致，但为 **JSON**（`dynapm.config.json`），TS 配置需转换 |
+| 请求体 10MB 限制 | ✅ | content-length 预检 413 + chunked 流式计数超限中断 |
+| 代理超时 504 / 502 | ✅ | proxyTimeoutMs 只覆盖「连接→响应头」；响应体时长由 stallTimeoutMs 管理（不会掐断 SSE/长流式响应） |
+| 慢客户端停滞超时 | ✅ | stallTimeoutMs（默认 120s，0=禁用）：响应体/WS 消息两个方向一个 chunk 都不到即断连，防慢客户端占住上游连接 |
+| 后端不可达重置 offline | ✅ | 无 body 请求自动重试冷启动 |
+| WebSocket 代理 | ✅ | tokio-tungstenite 双向消息桥；**任意路径** Upgrade 嗅探接管（主监听 fallback 层 MaybeWs 提取器），`/_dynapm/ws-upgrade` 仅作兼容入口保留 |
+| Admin API | ✅ | `/_dynapm/api/services[...]` + SSE events |
+| keep-alive 连接池 | ✅ | reqwest 内置池（pool_max_idle_per_host=512） |
+| CRLF 防注入 | ✅ | 请求头值剥离 \r\n |
+| 配置格式 | ✅ | JSON（`dynapm.config.json`），字段命名与旧 TS 版一致（camelCase） |
 
-## 已知差异 / 路线图
+## 已知差异 / 语义说明
 
-- **WS 升级入口**：Bun 版靠 socket 级升级嗅探（任意路径）；Rust 版需要客户端把 `Upgrade: websocket` 请求发到 `/_dynapm/ws-upgrade`（网关按 Host 路由桥接），或在 nginx 层重写。后续可引入 hyper service 手动处理 upgrade 以实现任意路径。
-- **慢客户端停滞超时**：Bun 版有背压停滞检测；Rust 版依赖 tokio 流自然背压 + 系统层 socket 缓冲，暂无应用层停滞计时。
-- **CRLF 防注入**：已实现（请求头值剥离 \r\n）。
-- **`handlePortRequest` starting/stopping 等待语义**：已并入统一的 `route_request`。
+- **流式超限语义**：chunked 请求体超过 10MB 时，若上游 200 响应头已返回，网关只能中断 body 传递（无法补发 413）；未收到响应头则回 413。
+- **stopWaitMs 默认 30s**：未配置 stop 命令的服务闲置回收时，需等满 stopWaitMs 后 SIGKILL start 拉起的进程组兑底。
 
 ## 踩坑记录
 
@@ -43,9 +43,17 @@ DynaPM 网关的 Rust 并行实现，与 Bun 版（`packages/gateway`）行为�
 
 ```bash
 cd packages/gateway-rs
-cargo build --release        # 产物：target/release/dynapm-rs
+cargo build --release        # 产物：target/release/dynapm
 
-DYNAPM_CONFIG=./dynapm.config.json ./target/release/dynapm-rs
+DYNAPM_CONFIG=./dynapm.config.json ./target/release/dynapm
+```
+
+## 回归测试
+
+```bash
+cd packages/gateway-rs
+pkill -f 'release/dynapm'; pkill -f 'test/backend.ts'   # 清残留（WSL 下残留进程会导致端口黑洞）
+bun test/run-all.ts        # 5 套件串行：core / coldstart / ws / limits / admin
 ```
 
 ## 配置示例
