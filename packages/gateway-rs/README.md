@@ -28,6 +28,17 @@ DynaPM 网关的 Rust 并行实现，与 Bun 版（`packages/gateway`）行为�
 - **CRLF 防注入**：已实现（请求头值剥离 \r\n）。
 - **`handlePortRequest` starting/stopping 等待语义**：已并入统一的 `route_request`。
 
+## 踩坑记录
+
+### docker 类后端必须用 http 健康检查
+
+`docker start` 返回后，docker-proxy **立即**监听映射端口并 accept 客户端连接，但容器内应用（如 Next.js 需数秒）尚未就绪。此时：
+
+- `tcp` 健康检查 connect 立即成功 → 网关 3ms 误判「服务就绪」→ 转发全部失败 502
+- 502 触发「后端不可达重置 offline」→ 下个请求再探测 → docker-proxy 仍假就绪 → 循环 502 直到应用真正起来
+
+**结论：凡是通过 docker 端口映射暴露的后端，healthCheck 必须用 `{"type": "http"}`**（探测 base URL 状态码），tcp 检查只适用于「监听端口的进程就是服务进程本身」的直启场景。
+
 ## 构建与运行
 
 ```bash
