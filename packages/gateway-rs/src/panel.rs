@@ -53,11 +53,32 @@ fn serve_rel(raw: &str) -> axum::response::Response {
         .or_else(|| (!rel.contains('.')).then_some(PANEL_DIST.get_file("index.html")).flatten())
         .or_else(|| PANEL_DIST.get_file("index.html"));
     match file {
-        Some(f) => axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, mime_by_ext(f.path().to_str().unwrap_or("")))
-            .body(Body::from(f.contents()))
-            .unwrap(),
+        Some(f) => {
+            // 首次访问时把全部面板文件预载为 Bytes（Arc 引用计数），
+            // 后续请求 clone 零拷贝分发，避免每请求全量复制文件内容（Body::from(&[u8]) 会 to_vec）
+            static CACHED: std::sync::OnceLock<std::collections::HashMap<String, bytes::Bytes>> =
+                std::sync::OnceLock::new();
+            let cache = CACHED.get_or_init(|| {
+                PANEL_DIST
+                    .files()
+                    .map(|f| {
+                        (
+                            f.path().to_string_lossy().into_owned(),
+                            bytes::Bytes::copy_from_slice(f.contents()),
+                        )
+                    })
+                    .collect()
+            });
+            let body = cache
+                .get(f.path().to_str().unwrap_or(""))
+                .cloned()
+                .unwrap_or_else(|| bytes::Bytes::copy_from_slice(f.contents()));
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, mime_by_ext(f.path().to_str().unwrap_or("")))
+                .body(Body::from(body))
+                .unwrap()
+        }
         None => axum::response::Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Panel not found"))
