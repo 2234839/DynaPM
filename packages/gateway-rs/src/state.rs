@@ -123,7 +123,10 @@ impl ServiceRuntime {
     /// 结算当前运行会话：累计到 total_uptime 并清空 start_time
     /// （stop、后端不可达重置等一切 online->offline 转换都必须副用，否则历史存活漏计）
     pub fn close_session(&self) {
-        if let Some(t) = *self.start_time_ms.lock().unwrap() {
+        // 先拷贝出 start_time 让 guard 立即释放：if-let 条件里的临时 guard
+        // 会存活到语句结束，块内再锁同一把 Mutex 会自死锁（非重入锁）
+        let start = *self.start_time_ms.lock().unwrap();
+        if let Some(t) = start {
             self.total_uptime_ms
                 .fetch_add(now_ms() as i64 - t, Ordering::Relaxed);
             *self.start_time_ms.lock().unwrap() = None;
@@ -327,13 +330,7 @@ pub async fn stop(
     if service.netns {
         let pgid = *rt.start_pgid.lock().unwrap();
         if let Some(g) = pgid {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg("--")
-                .arg(format!("-{g}"))
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            executor::kill_process_group(g);
         }
         let sock = crate::netns::sock_path(&service.name).display().to_string();
         let kill_pump = format!("pkill -f \"__uds-pump {sock}\" || true");
@@ -374,13 +371,7 @@ pub async fn stop(
                     "[{}] 优雅停止超时，SIGKILL 进程组 {g}",
                     service.name
                 ));
-                let _ = std::process::Command::new("kill")
-                    .arg("-9")
-                    .arg("--")
-                    .arg(format!("-{g}"))
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                executor::kill_process_group(g);
                 // 给内核一点回收时间再复查
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }

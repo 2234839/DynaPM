@@ -1,0 +1,63 @@
+{
+  "port": 15300,
+  "adminApi": {
+    "host": "127.0.0.1",
+    "authToken": "stress-token"
+  },
+  "services": {
+    "echo1": {
+      "name": "echo1",
+      "base": "http://127.0.0.1:15001",
+      "host": "echo1.test",
+      "idleTimeout": 5000,
+      "startTimeout": 8000,
+      "commands": {
+        "startExec": [
+          "bash",
+          "-c",
+          "exec /usr/bin/env bun run /home/gs/opensource_code/DynaPM/packages/gateway/test/services/echo-server.ts 15001"
+        ],
+        "stop": ""
+      },
+      "healthCheck": {
+        "type": "tcp"
+      }
+    },
+    "echo2": {
+      "name": "echo2",
+      "base": "http://127.0.0.1:15002",
+      "host": "echo2.test",
+      "idleTimeout": 5000,
+      "startTimeout": 8000,
+      "commands": {
+        "startExec": [
+          "bash",
+          "-c",
+          "exec /usr/bin/env bun run /home/gs/opensource_code/DynaPM/packages/gateway/test/services/echo-server.ts 15002"
+        ],
+        "stop": ""
+      },
+      "healthCheck": {
+        "type": "tcp"
+      }
+    },
+    "echo3": {
+      "name": "echo3",
+      "base": "http://127.0.0.1:15003",
+      "host": "echo3.test",
+      "idleTimeout": 5000,
+      "startTimeout": 8000,
+      "commands": {
+        "startExec": [
+          "bash",
+          "-c",
+          "exec /usr/bin/env bun run /home/gs/opensource_code/DynaPM/packages/gateway/test/services/echo-server.ts 15003"
+        ],
+        "stop": ""
+      },
+      "healthCheck": {
+        "type": "tcp"
+      }
+    }
+  }
+}

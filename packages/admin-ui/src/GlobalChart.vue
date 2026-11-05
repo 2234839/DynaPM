@@ -65,17 +65,10 @@ const xLabels = computed(() => {
   return labels;
 });
 
-/** 全部服务合计（粗线强调） */
-const totalBuckets = computed(() => {
-  const t = new Array<number>(STEPS).fill(0);
-  for (const s of series.value) s.buckets.forEach((v, i) => (t[i] += v));
-  return t;
-});
-
 /** 24h 总请求数 */
-const total24h = computed(() => totalBuckets.value.reduce((a, b) => a + b, 0));
+const total24h = computed(() => series.value.reduce((acc, s) => acc + s.buckets.reduce((a, b) => a + b, 0), 0));
 
-/** echarts 配置：合计粗线 + 各服务细线，图例点选筛选 */
+/** echarts 配置：各服务细线，图例置于图表下方点选筛选 */
 const option = computed(() => ({
   tooltip: {
     trigger: 'axis',
@@ -87,9 +80,10 @@ const option = computed(() => ({
     icon: 'roundRect',
     itemWidth: 14,
     itemHeight: 4,
+    bottom: 0,
     textStyle: { fontSize: 11, color: '#57606a' },
   },
-  grid: { left: 40, right: 16, top: 32, bottom: 24 },
+  grid: { left: 40, right: 16, top: 12, bottom: 36 },
   xAxis: {
     type: 'category',
     boundaryGap: false,
@@ -104,26 +98,15 @@ const option = computed(() => ({
     axisLabel: { fontSize: 10, color: '#8b949e' },
     splitLine: { lineStyle: { color: '#ebedf0' } },
   },
-  series: [
-    {
-      name: '合计',
-      type: 'line',
-      showSymbol: false,
-      lineStyle: { width: 2.5 },
-      itemStyle: { color: '#57606a' },
-      emphasis: { focus: 'series' },
-      data: totalBuckets.value,
-    },
-    ...series.value.map((s) => ({
-      name: s.name,
-      type: 'line',
-      showSymbol: false,
-      lineStyle: { width: 1.5 },
-      itemStyle: { color: s.color },
-      emphasis: { focus: 'series' },
-      data: s.buckets,
-    })),
-  ],
+  series: series.value.map((s) => ({
+    name: s.name,
+    type: 'line',
+    showSymbol: false,
+    lineStyle: { width: 1.5 },
+    itemStyle: { color: s.color },
+    emphasis: { focus: 'series' },
+    data: s.buckets,
+  })),
 }));
 
 /** 图表容器 */

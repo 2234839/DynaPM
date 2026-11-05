@@ -21,3 +21,4 @@ target/
 
 # 本地部署目标配置（不入库）
 .deploy-env
+.deploy-ui-commit

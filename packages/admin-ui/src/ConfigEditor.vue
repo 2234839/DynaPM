@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { fetchConfig, saveConfig } from './api';
+import { confirmDialog, promptDialog } from './composables/dialog';
 
 /** 编辑模式 */
 const mode = ref<'visual' | 'json'>('visual');
@@ -111,10 +112,11 @@ function switchMode(m: 'visual' | 'json'): void {
 async function save(): Promise<void> {
   const content = mode.value === 'json' ? jsonText.value : (syncJson(), jsonText.value);
   if (mode.value === 'json' && !syncForm()) return; // 校验 JSON 可解析
-  if (externalChange.value && !confirm('磁盘配置已被外部修改，继续保存将覆盖外部改动。确定覆盖？')) {
+  if (externalChange.value
+    && !(await confirmDialog('磁盘配置已被外部修改，继续保存将覆盖外部改动。确定覆盖？', { danger: true, okText: '覆盖保存' }))) {
     return;
   }
-  if (!confirm('保存并重启网关生效？重启期间服务短暂不可用（约 1 秒）。')) return;
+  if (!(await confirmDialog('保存并重启网关生效？重启期间服务短暂不可用（约 1 秒）。', { okText: '保存并重启' }))) return;
   busy.value = true;
   msg.value = '';
   try {
@@ -130,8 +132,8 @@ async function save(): Promise<void> {
 }
 
 /** 新增服务（生成默认骨架） */
-function addService(): void {
-  const name = prompt('服务名（同时作为 services key 与 hostname 路由前缀）')?.trim();
+async function addService(): Promise<void> {
+  const name = (await promptDialog('服务名（同时作为 services key 与 hostname 路由前缀）'))?.trim();
   if (!name || form.services[name]) return;
   form.services[name] = {
     name,
@@ -146,14 +148,14 @@ function addService(): void {
 }
 
 /** 删除服务 */
-function removeService(key: string): void {
-  if (!confirm(`删除服务 ${key}？`)) return;
+async function removeService(key: string): Promise<void> {
+  if (!(await confirmDialog(`删除服务 ${key}？`, { danger: true, okText: '删除' }))) return;
   delete form.services[key];
 }
 
 /** 重命名服务 key（迁移对象保持顺序末尾） */
-function renameService(oldKey: string): void {
-  const name = prompt('新服务名', oldKey)?.trim();
+async function renameService(oldKey: string): Promise<void> {
+  const name = (await promptDialog('新服务名', oldKey))?.trim();
   if (!name || name === oldKey || form.services[name]) return;
   const entry = form.services[oldKey];
   delete form.services[oldKey];

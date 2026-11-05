@@ -27,4 +27,6 @@ libc = "0.2"
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
+# 保留符号表：卡死现场需 gdb 抓用户态栈定位死锁（line-tables 不影响运行性能）
+strip = "none"
+debug = "line-tables-only"

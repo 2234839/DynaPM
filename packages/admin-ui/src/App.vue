@@ -19,6 +19,8 @@ import {
 import StatsCharts from './StatsCharts.vue';
 import GlobalChart from './GlobalChart.vue';
 import ConfigEditor from './ConfigEditor.vue';
+import AppDialog from './components/AppDialog.vue';
+import { confirmDialog } from './composables/dialog';
 
 /** URL hash 中的令牌持久化后清除地址栏 */
 captureTokenFromHash();
@@ -140,7 +142,7 @@ async function onStop(name: string): Promise<void> {
 
 /** 彻底关停（停止并禁止按需拉起） */
 async function onDisable(name: string): Promise<void> {
-  if (!confirm(`彻底关停 ${name}？之后请求到达不会自动拉起，需手动解除。`)) return;
+  if (!(await confirmDialog(`彻底关停 ${name}？之后请求到达不会自动拉起，需手动解除。`, { danger: true, okText: '彻底关停' }))) return;
   busy.value = name;
   try {
     await disableService(name);
@@ -184,6 +186,26 @@ function avgRequestMs(svc: ServiceListItem): string {
   const count = svc.requestCount ?? 0;
   if (!count) return '-';
   return `${((svc.totalRequestMs ?? 0) / count).toFixed(1)}ms`;
+}
+
+/** 闲置回收倒计时文案：null（有连接/不回收）显示 -，<1min 显示秒 */
+function idleText(svc: ServiceListItem): string {
+  const r = svc.idleRemainingMs;
+  if (r == null) return '-';
+  return r <= 60_000 ? `${Math.ceil(r / 1000)}s 后停` : `${formatUptime(r)} 后停`;
+}
+
+/** 倒计时样式：临近回收（<1 分钟）高亮 */
+function idleClass(svc: ServiceListItem): string {
+  const r = svc.idleRemainingMs;
+  return r != null && r <= 60_000 ? 'idle-soon' : 'idle-far';
+}
+
+/** 倒计时悬浮提示 */
+function idleTitle(svc: ServiceListItem): string {
+  const r = svc.idleRemainingMs;
+  if (r == null) return '有活跃连接，不回收';
+  return `闲置 ${formatUptime(svc.idleTimeout)} 后自动停止，剩余 ${formatUptime(r)}`;
 }
 
 /** 拉取历史统计（图表） */
@@ -271,7 +293,7 @@ onMounted(() => {
           <th>名称</th>
           <th>状态</th>
           <th>当前存活</th>
-          <th>历史存活</th>
+          <th>闲置回收</th>
           <th>请求数</th>
           <th>平均耗时</th>
           <th>连接数</th>
@@ -298,20 +320,28 @@ onMounted(() => {
               <span class="badge" :class="svc.paused ? 'status-disabled' : statusClass(svc.status)">{{ svc.paused ? 'disabled' : svc.status }}</span>
             </td>
             <td>{{ svc.status === 'online' ? formatUptime(svc.uptime) : '-' }}</td>
-            <td>{{ svc.totalUptime ? formatUptime(svc.totalUptime) : '-' }}</td>
+            <td>
+              <!-- 在线时显示闲置回收倒计时；已停时回退显示历史累计存活 -->
+              <span v-if="svc.status === 'online'" :class="idleClass(svc)" :title="idleTitle(svc)">{{ idleText(svc) }}</span>
+              <span v-else-if="svc.totalUptime" title="历史累计存活时间">总 {{ formatUptime(svc.totalUptime) }}</span>
+              <span v-else>-</span>
+            </td>
             <td>{{ svc.requestCount ?? 0 }}</td>
             <td>{{ avgRequestMs(svc) }}</td>
             <td>{{ svc.activeConnections }}</td>
             <td>
+              <!-- 启动/停止合二为一：按状态切换文案与样式 -->
               <button
-                class="btn"
-                :disabled="busy === svc.name || !!svc.paused || svc.status === 'online'"
+                v-if="svc.status !== 'online'"
+                class="btn btn-start"
+                :disabled="busy === svc.name || !!svc.paused"
                 @click="onStart(svc.name)"
               >启动</button>
               <button
-                class="btn btn-danger"
-                :disabled="busy === svc.name || svc.status !== 'online'"
+                v-else
+                class="btn btn-stop"
                 title="停止进程，下次请求到达会自动按需拉起"
+                :disabled="busy === svc.name"
                 @click="onStop(svc.name)"
               >停止</button>
               <button
@@ -361,4 +391,5 @@ onMounted(() => {
 
     <GlobalChart :services="globalSeries" />
   </div>
+  <AppDialog />
 </template>

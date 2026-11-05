@@ -21,6 +21,21 @@ fi
 LOCAL_BIN="target/x86_64-unknown-linux-musl/release/dynapm"
 
 if [ "${1:-}" != "--no-build" ]; then
+  # 基于 git 检测 admin-ui 变动：与上次部署时记录的 commit 比对（含已提交与未提交改动）
+  UI_MARKER=".deploy-ui-commit"
+  repo_root=$(git rev-parse --show-toplevel)
+  last_ui_commit=$(cat "$UI_MARKER" 2>/dev/null || echo)
+  if [ -z "$last_ui_commit" ] \
+    || ! git -C "$repo_root" diff --quiet "$last_ui_commit" -- packages/admin-ui \
+    || [ -n "$(git -C "$repo_root" status --porcelain -- packages/admin-ui)" ]; then
+    echo "📦 admin-ui 有变动（git 检测），重新构建面板..."
+    (cd ../admin-ui && pnpm exec vite build)
+    git -C "$repo_root" rev-parse HEAD > "$UI_MARKER"
+    # cargo 无法感知 include_dir! 嵌入内容的变化，touch 强制重编嵌入层
+    touch src/panel.rs
+  else
+    echo "☑️ admin-ui 无变动，跳过前端构建"
+  fi
   echo "🔨 编译 musl 静态二进制..."
   RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-musl
 fi

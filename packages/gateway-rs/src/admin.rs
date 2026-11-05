@@ -82,6 +82,14 @@ pub async fn list_services(
     }
     for rt in gw.all_runtimes() {
         let hosts = hosts_by_service.get(&rt.config.name).cloned().unwrap_or_default();
+        // 闲置回收倒计时（ms）：online 且无活跃连接时 = 阈值 - (now - lastAccess)，其余 null
+        let idle_remaining_ms = {
+            let threshold = if rt.config.keep_warm { rt.config.warm_idle_timeout } else { rt.config.idle_timeout };
+            let conns = rt.active_connections.load(Ordering::Relaxed);
+            let elapsed = crate::state::now_ms() as i64 - rt.last_access_ms.load(Ordering::Relaxed) as i64;
+            (rt.status() == Status::Online && conns == 0 && !rt.config.proxy_only)
+                .then(|| (threshold as i64 - elapsed).max(0))
+        };
         services.push(serde_json::json!({
             "name": rt.config.name,
             "base": rt.config.base,
@@ -98,6 +106,7 @@ pub async fn list_services(
             "totalRequestMs": rt.total_request_ms.load(Ordering::Relaxed),
             "startCount": rt.start_count.load(Ordering::Relaxed),
             "totalUptime": rt.uptime_ms(),
+            "idleRemainingMs": idle_remaining_ms,
         }));
     }
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "services": services }))
@@ -250,10 +259,15 @@ pub async fn put_config(
     if let Err(e) = crate::config::load_config_from_str(&content) {
         return json_response(axum::http::StatusCode::BAD_REQUEST, &serde_json::json!({ "error": format!("配置校验失败: {e}") }));
     }
-    // 原子写回：tmp + rename
+    // 原子写回：tmp + rename（文件 IO 放阻塞线程池）
     let path = config_path();
     let tmp = format!("{path}.tmp");
-    if let Err(e) = std::fs::write(&tmp, &content).and_then(|_| std::fs::rename(&tmp, &path)) {
+    let write_result = tokio::task::spawn_blocking(move || {
+        std::fs::write(&tmp, &content).and_then(|_| std::fs::rename(&tmp, &path))
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    if let Err(e) = write_result {
         return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": format!("写入配置失败: {e}") }));
     }
     // 延迟自重启：等响应先发出去（systemd Restart 拉起新进程加载新配置）
@@ -262,7 +276,11 @@ pub async fn put_config(
         logger::info("📝 配置已更新，网关自重启加载新配置...");
         let under_systemd = std::path::Path::new("/run/systemd/system").exists();
         if under_systemd {
-            let _ = std::process::Command::new("systemctl").arg("restart").arg("dynapm").spawn();
+            // fork+exec 放阻塞线程池，避免在 async 上下文直接 fork
+            let _ = tokio::task::spawn_blocking(|| {
+                std::process::Command::new("systemctl").arg("restart").arg("dynapm").spawn()
+            })
+            .await;
         } else {
             std::process::exit(0);
         }
@@ -290,11 +308,19 @@ pub async fn stats(
             ),
             None => (Vec::new(), Vec::new()),
         };
+        // /proc 扫描是同步文件 IO（数百次 open+read），必须放阻塞线程池，
+        // 面板轮询期间跑在 worker 上会钉死线程
+        let proc = {
+            let rt2 = Arc::clone(&rt);
+            tokio::task::spawn_blocking(move || proc_metrics(&rt2))
+                .await
+                .unwrap_or(serde_json::Value::Null)
+        };
         services.push(serde_json::json!({
             "name": rt.config.name,
             "reqBuckets": req_buckets.iter().map(|(m, c)| [*m, *c as u64]).collect::<Vec<[u64; 2]>>(),
             "aliveSpans": alive_spans.iter().map(|(s, e)| [*s as i64, (*e as i64).min(i64::MAX)]).collect::<Vec<_>>(),
-            "proc": proc_metrics(&rt),
+            "proc": proc,
         }));
     }
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "services": services }))

@@ -50,14 +50,10 @@ impl Default for CommandOptions {
 }
 
 /// 杀掉整个进程组（负 pid 即 pgid；bash 经 process_group(0) 成为组长）
-fn kill_process_group(pgid: u32) {
-    let _ = std::process::Command::new("kill")
-        .arg("-9")
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// 纯 libc 直调（无 fork+wait），微秒级返回，可在任意上下文安全调用
+pub fn kill_process_group(pgid: u32) {
+    // kill(pgid, SIGKILL)：等效 shell 的 kill -9 -- -<pgid>
+    unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
 }
 
 /// 执行 bash 命令并返回结果（等 bash 退出；超时 kill 进程组返回 124）
@@ -179,11 +175,26 @@ pub async fn spawn_direct(args: &[String], options: &CommandOptions) -> Result<u
     cmd.kill_on_drop(false);
     cmd.process_group(0);
     // logFile 配置时 stdout/stderr 追加重定向到文件（等价 bash 的 >> log 2>&1）
-    let log_stdio = options.log_file.as_ref().and_then(|p| {
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(p).ok()?;
-        let dup = f.try_clone().ok()?;
-        Some((Stdio::from(f), Stdio::from(dup)))
-    });
+    // 文件 open 放阻塞线程池：async 上下文里的同步文件 IO 会钉死 tokio worker
+    let log_stdio = match &options.log_file {
+        Some(p) => {
+            let p = p.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .ok()
+                    .and_then(|f| {
+                        let dup = f.try_clone().ok()?;
+                        Some((Stdio::from(f), Stdio::from(dup)))
+                    })
+            })
+            .await
+            .unwrap_or(None)
+        }
+        None => None,
+    };
     match log_stdio {
         Some((out, err)) => {
             cmd.stdout(out);

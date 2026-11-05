@@ -278,25 +278,13 @@ impl Gateway {
         let stale_pgid = *rt.start_pgid.lock().unwrap();
         if cfg.netns {
             if let Some(g) = stale_pgid {
-                let _ = std::process::Command::new("kill")
-                    .arg("-9")
-                    .arg("--")
-                    .arg(format!("-{g}"))
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                crate::executor::kill_process_group(g);
             }
             // 防御性清理旧进程组：网关重启内存态丢失（start_pgid 为 None）时靠 groupfile 兜底
             let groupfile = crate::netns::pump_group_path(&cfg.name);
             if let Ok(pgid) = std::fs::read_to_string(&groupfile) {
-                if let Ok(g) = pgid.trim().parse::<i32>() {
-                    let _ = std::process::Command::new("kill")
-                        .arg("-9")
-                        .arg("--")
-                        .arg(format!("-{g}"))
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
+                if let Ok(g) = pgid.trim().parse::<u32>() {
+                    crate::executor::kill_process_group(g);
                 }
                 let _ = std::fs::remove_file(&groupfile);
             }

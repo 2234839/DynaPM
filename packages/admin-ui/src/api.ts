@@ -68,6 +68,8 @@ export interface ServiceListItem {
   startCount?: number;
   /** 历史累计运行时长（毫秒，含进行中的当前次） */
   totalUptime?: number;
+  /** 闲置回收剩余毫秒（online 且无活跃连接时，其余为 null） */
+  idleRemainingMs?: number | null;
   /** 域名路由列表（供面板跳转） */
   hosts?: string[];
 }
