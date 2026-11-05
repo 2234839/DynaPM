@@ -158,6 +158,8 @@ pub struct TimeoutsConfig {
     pub stop_timeout_ms: Option<u64>,
     /// 代理请求超时（毫秒，后端无响应即 504，默认 30000）
     pub proxy_timeout_ms: Option<u64>,
+    /// 同时冷启动的服务数上限（默认 max(1, CPU 核数-1)）
+    pub start_concurrency: Option<usize>,
 }
 
 /// 日志配置
@@ -263,6 +265,8 @@ pub struct DynaPMConfig {
     pub stop_timeout_ms: u64,
     /// 代理请求超时（毫秒）
     pub proxy_timeout_ms: u64,
+    /// 同时冷启动的服务数上限（默认 max(1, CPU 核数-1)）
+    pub start_concurrency: usize,
     /// 请求日志开关
     pub enable_request_log: bool,
     /// WebSocket 日志开关
@@ -275,6 +279,14 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_START_TIMEOUT_MS: u64 = 30_000;
 /// keepWarm 默认闲置回收阈值（毫秒）
 pub const DEFAULT_WARM_IDLE_TIMEOUT_MS: u64 = 30_000;
+
+/** 默认冷启动并发上限：留一核服务在飞请求，最低 1 */
+fn default_start_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1))
+        .unwrap_or(1)
+        .max(1)
+}
 
 /// 从 JSON 文本加载并规范化配置
 ///
@@ -413,6 +425,9 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
         stop_wait_ms: timeouts.stop_wait_ms.unwrap_or(30_000),
         stop_timeout_ms: timeouts.stop_timeout_ms.unwrap_or(30_000),
         proxy_timeout_ms: timeouts.proxy_timeout_ms.unwrap_or(30_000),
+        start_concurrency: timeouts
+            .start_concurrency
+            .unwrap_or_else(default_start_concurrency),
         enable_request_log: logging.enable_request_log.unwrap_or(false),
         enable_websocket_log: logging.enable_websocket_log.unwrap_or(false),
     })

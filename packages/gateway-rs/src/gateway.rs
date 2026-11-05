@@ -99,6 +99,7 @@ impl Gateway {
         proxy_timeout_ms: u64,
         stop_wait_ms: u64,
         stop_timeout_ms: u64,
+        start_concurrency: usize,
         admin_auth_token: Option<String>,
         admin_host: Option<String>,
     ) -> Arc<Self> {
@@ -148,7 +149,7 @@ impl Gateway {
             stop_timeout_ms,
             http_client,
             uds_clients: Mutex::new(HashMap::new()),
-            start_concurrency: tokio::sync::Semaphore::new(2),
+            start_concurrency: tokio::sync::Semaphore::new(start_concurrency.max(1)),
             events,
             admin_auth_token,
         })

@@ -222,9 +222,14 @@ async fn run(cfg: DynaPMConfig) -> Result<(), String> {
         cfg.proxy_timeout_ms,
         cfg.stop_wait_ms,
         cfg.stop_timeout_ms,
+        cfg.start_concurrency,
         cfg.admin_api.as_ref().and_then(|a| a.auth_token.clone()),
         cfg.admin_api.as_ref().and_then(|a| a.host.clone()),
     );
+    logger::info(&format!(
+        "🚦 冷启动并发上限: {}（timeouts.startConcurrency 可覆盖）",
+        cfg.start_concurrency
+    ));
 
     // 端口路由：passthrough 服务走 TCP 直通，其余起独立 HTTP 代理监听
     for (port, mapping) in gw.port_routes_snapshot() {
