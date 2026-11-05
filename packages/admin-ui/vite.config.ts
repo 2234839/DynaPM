@@ -3,6 +3,8 @@ import vue from '@vitejs/plugin-vue';
 
 export default defineConfig({
   plugins: [vue()],
+  /** 面板可能挂在 /_dynapm/panel/ 或专属管理域名根路径 /，用相对 base 两者兼容 */
+  base: './',
   server: {
     port: 5173,
     proxy: {

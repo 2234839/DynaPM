@@ -88,24 +88,48 @@ h1 {
   font-size: 12px;
 }
 
-.status-running {
+.status-online {
   background: #dafbe1;
   color: #1a7f37;
 }
 
-.status-stopped {
+.status-offline {
   background: #e8e8e8;
   color: #666;
 }
 
-.status-starting {
+.status-starting,
+.status-stopping {
   background: #fff3cd;
   color: #9a6700;
 }
 
-.status-unknown {
+.status-disabled {
   background: #ffebe9;
   color: #cf222e;
+}
+
+.login-box {
+  max-width: 420px;
+  margin-top: 12vh;
+}
+
+.login-hint {
+  color: #666;
+  font-size: 13px;
+}
+
+.login-form {
+  display: flex;
+  gap: 8px;
+}
+
+.login-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font-size: 14px;
 }
 
 .mono {
@@ -136,4 +160,100 @@ h1 {
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 6px 12px;
+  font-size: 12px;
+  background: #fff;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-top: 10px;
+}
+
+.detail-grid > span {
+  color: #57606a;
+  white-space: nowrap;
+}
+
+.detail-grid > code {
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.detail-grid > code.cmd {
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  padding: 2px 6px;
+  display: block;
+}
+
+.detail-cell .error {
+  margin: 8px 0 0;
+  color: #cf222e;
+  font-size: 12px;
+}
+
+.name-cell .arrow {
+  width: 22px;
+  padding: 0;
+  margin-right: 6px;
+  color: #57606a;
+}
+
+.svc-link {
+  color: #0969da;
+  text-decoration: none;
+}
+
+.svc-link:hover {
+  text-decoration: underline;
+}
+
+.config-box {
+  background: #fff;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+.config-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.config-head > div {
+  margin-left: auto;
+}
+
+.config-hint {
+  font-size: 12px;
+  color: #57606a;
+}
+
+.config-editor {
+  width: 100%;
+  min-height: 320px;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 8px;
+  box-sizing: border-box;
+  resize: vertical;
+  white-space: pre;
+}
+
+.config-msg {
+  font-size: 13px;
+  color: #0969da;
+  margin: 8px 0 0;
 }

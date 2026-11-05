@@ -14,3 +14,10 @@ auto-*.d.ts
 
 src/**/CLAUDE.md
 .claude/scheduled_tasks.lock
+
+# Rust (packages/gateway-rs)：二进制项目 Cargo.lock 需提交以保证构建可复现
+target/
+**/*.rs.bk
+
+# 本地部署目标配置（不入库）
+.deploy-env
