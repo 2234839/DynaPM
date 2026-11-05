@@ -107,6 +107,7 @@ pub async fn list_services(
             "startCount": rt.start_count.load(Ordering::Relaxed),
             "totalUptime": rt.uptime_ms(),
             "idleRemainingMs": idle_remaining_ms,
+            "lastStartDurationMs": rt.last_start_duration_ms.load(Ordering::Relaxed),
         }));
     }
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "services": services }))

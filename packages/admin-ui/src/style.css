@@ -51,6 +51,28 @@ h1 {
   border-color: #e3b7b2;
 }
 
+/* 启动按钮：绿色系（激活动作） */
+.btn-start {
+  color: #1a7f37;
+  border-color: #b6dfc3;
+  background: #f0fbf3;
+}
+
+.btn-start:hover:not(:disabled) {
+  background: #ddf3e3;
+}
+
+/* 停止按钮：橙色系（中性暂停，区别于红色危险操作） */
+.btn-stop {
+  color: #9a6700;
+  border-color: #eedeb6;
+  background: #fff8e6;
+}
+
+.btn-stop:hover:not(:disabled) {
+  background: #fbf0d4;
+}
+
 .link {
   background: none;
   border: none;

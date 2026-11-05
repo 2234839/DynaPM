@@ -220,6 +220,7 @@ impl Gateway {
             return Ok(());
         }
         rt.set_status(Status::Starting);
+        let start_begun_ms = now_ms();
         let start_result = crate::state::start(&rt.config).await;
         if let Err(e) = start_result {
             rt.set_status(Status::Offline);
@@ -228,6 +229,8 @@ impl Gateway {
         let start_pgid = start_result.unwrap_or_default();
         *rt.start_pgid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
         *rt.pid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
+        rt.last_start_duration_ms
+            .store((now_ms() - start_begun_ms) as i64, Ordering::Relaxed);
         rt.set_status(Status::Online);
         *rt.start_time_ms.lock().unwrap() = Some(now_ms() as i64);
         rt.start_count.fetch_add(1, Ordering::Relaxed);
@@ -289,6 +292,7 @@ impl Gateway {
                 let _ = std::fs::remove_file(&groupfile);
             }
         }
+        let start_begun_ms = now_ms();
         let start_result = crate::state::start(cfg).await;
         if let Err(e) = start_result {
             rt.set_status(Status::Offline);
@@ -305,6 +309,8 @@ impl Gateway {
             *rt.last_start_error.lock().unwrap() = Some(err.clone());
             return Err(err);
         }
+        rt.last_start_duration_ms
+            .store((now_ms() - start_begun_ms) as i64, Ordering::Relaxed);
         rt.set_status(Status::Online);
         *rt.start_time_ms.lock().unwrap() = Some(now_ms() as i64);
         rt.start_count.fetch_add(1, Ordering::Relaxed);

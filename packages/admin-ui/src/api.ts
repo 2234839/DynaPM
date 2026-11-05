@@ -70,6 +70,8 @@ export interface ServiceListItem {
   totalUptime?: number;
   /** 闲置回收剩余毫秒（online 且无活跃连接时，其余为 null） */
   idleRemainingMs?: number | null;
+  /** 最近一次启动耗时（毫秒，starting 开始到 online） */
+  lastStartDurationMs?: number;
   /** 域名路由列表（供面板跳转） */
   hosts?: string[];
 }

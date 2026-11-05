@@ -181,11 +181,9 @@ function formatUptime(ms: number): string {
   return `${Math.floor(s / 86400)}d${Math.floor((s % 86400) / 3600)}h`;
 }
 
-/** 格式化平均请求耗时 */
-function avgRequestMs(svc: ServiceListItem): string {
-  const count = svc.requestCount ?? 0;
-  if (!count) return '-';
-  return `${((svc.totalRequestMs ?? 0) / count).toFixed(1)}ms`;
+/** 启动耗时格式化：秒级显示（冷启动排障用） */
+function formatMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
 }
 
 /** 闲置回收倒计时文案：null（有连接/不回收）显示 -，<1min 显示秒 */
@@ -295,7 +293,7 @@ onMounted(() => {
           <th>当前存活</th>
           <th>闲置回收</th>
           <th>请求数</th>
-          <th>平均耗时</th>
+          <th>启动耗时</th>
           <th>连接数</th>
           <th>操作</th>
         </tr>
@@ -327,7 +325,7 @@ onMounted(() => {
               <span v-else>-</span>
             </td>
             <td>{{ svc.requestCount ?? 0 }}</td>
-            <td>{{ avgRequestMs(svc) }}</td>
+            <td>{{ svc.lastStartDurationMs ? formatMs(svc.lastStartDurationMs) : '-' }}</td>
             <td>{{ svc.activeConnections }}</td>
             <td>
               <!-- 启动/停止合二为一：按状态切换文案与样式 -->

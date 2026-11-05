@@ -41,6 +41,8 @@ pub struct ServiceRuntime {
     _status_rx: watch::Receiver<Status>,
     /// 最近一次启动失败的错误（starting 结束为 offline 时供 503 细节）
     pub last_start_error: Mutex<Option<String>>,
+    /** 最近一次启动耗时（毫秒，starting 开始到 online） */
+    pub last_start_duration_ms: AtomicI64,
     /// 最近访问时间（unix 毫秒）
     pub last_access_ms: AtomicI64,
     /// 当前活动连接数（HTTP/SSE/WebSocket）
@@ -79,6 +81,7 @@ impl ServiceRuntime {
             status_tx: tx,
             _status_rx: rx,
             last_start_error: Mutex::new(None),
+            last_start_duration_ms: AtomicI64::new(0),
             last_access_ms: AtomicI64::new(now as i64),
             active_connections: AtomicI64::new(0),
             pid: Mutex::new(None),
