@@ -158,6 +158,9 @@ pub struct TimeoutsConfig {
     pub stop_timeout_ms: Option<u64>,
     /// 代理请求超时（毫秒，后端无响应即 504，默认 30000）
     pub proxy_timeout_ms: Option<u64>,
+    /// 链路停滞超时（毫秒，响应流/WS 桥无字节进展即断开，0 = 禁用，默认 120000）
+    /// 独立于 proxyTimeoutMs：长轮询/SSE 等合法空闲长连接不被 30s 代理超时误杀
+    pub stall_timeout_ms: Option<u64>,
     /// 同时冷启动的服务数上限（默认 max(1, CPU 核数-1)）
     pub start_concurrency: Option<usize>,
 }
@@ -265,6 +268,8 @@ pub struct DynaPMConfig {
     pub stop_timeout_ms: u64,
     /// 代理请求超时（毫秒）
     pub proxy_timeout_ms: u64,
+    /// 链路停滞超时（毫秒，0 = 禁用）
+    pub stall_timeout_ms: u64,
     /// 同时冷启动的服务数上限（默认 max(1, CPU 核数-1)）
     pub start_concurrency: usize,
     /// 请求日志开关
@@ -425,6 +430,7 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
         stop_wait_ms: timeouts.stop_wait_ms.unwrap_or(30_000),
         stop_timeout_ms: timeouts.stop_timeout_ms.unwrap_or(30_000),
         proxy_timeout_ms: timeouts.proxy_timeout_ms.unwrap_or(30_000),
+        stall_timeout_ms: timeouts.stall_timeout_ms.unwrap_or(120_000),
         start_concurrency: timeouts
             .start_concurrency
             .unwrap_or_else(default_start_concurrency),

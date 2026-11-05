@@ -7,6 +7,7 @@ use crate::state::{now_ms, wait_for_backend_ready, wait_status_leave, RouteMappi
 use axum::body::Body;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use bytes::Bytes;
+use futures_util::Future;
 use futures_util::{SinkExt, StreamExt};
 use http::HeaderMap;
 use std::collections::HashMap;
@@ -75,6 +76,9 @@ pub struct Gateway {
     start_locks: HashMap<String, Arc<AsyncMutex<()>>>,
     /// 代理请求超时（毫秒）
     pub proxy_timeout_ms: u64,
+    /// 链路停滞超时（毫秒，0 = 禁用）：响应流/WS 桥无字节进展即断开，
+    /// 防慢客户端把连接与缓冲永久挂住；独立于 proxyTimeoutMs 以免误杀长轮询/SSE
+    pub stall_timeout_ms: u64,
     /// 等待服务停止完成的超时上限（毫秒）
     pub stop_wait_ms: u64,
     /// 停止命令执行超时（毫秒）
@@ -97,6 +101,7 @@ impl Gateway {
     pub fn new(
         routes: Vec<(Arc<ServiceRuntime>, crate::config::RouteConfigResolved)>,
         proxy_timeout_ms: u64,
+        stall_timeout_ms: u64,
         stop_wait_ms: u64,
         stop_timeout_ms: u64,
         start_concurrency: usize,
@@ -145,6 +150,7 @@ impl Gateway {
             runtimes,
             start_locks,
             proxy_timeout_ms,
+            stall_timeout_ms,
             stop_wait_ms,
             stop_timeout_ms,
             http_client,
@@ -590,17 +596,19 @@ impl Gateway {
             }
         } else {
             let reqwest_body = reqwest::Body::wrap_stream(attempt_body.into_data_stream());
-            let send = self
-                .http_client
-                .request(method.clone(), &url)
-                .headers(proxy_headers.clone())
-                .body(reqwest_body)
-                .timeout(Duration::from_millis(self.proxy_timeout_ms))
-                .send()
-                .await;
+            // proxy_timeout_ms 只覆盖「发起连接 → 响应头返回」；响应体时长由 stall_timeout_ms 管理，
+            // 不能用 reqwest 的 .timeout()（那是含 body 的总超时，会掐断 SSE/长流式响应）
+            let send_fut = tokio::time::timeout(
+                Duration::from_millis(self.proxy_timeout_ms),
+                self.http_client
+                    .request(method.clone(), &url)
+                    .headers(proxy_headers.clone())
+                    .body(reqwest_body)
+                    .send(),
+            );
             // reqwest 响应统一为 http::Response<axum Body>（与 UDS 分支同型）
-            match send {
-                Ok(r) => {
+            match send_fut.await {
+                Ok(Ok(r)) => {
                     let mut out = http::Response::builder().status(r.status());
                     for (k, v) in r.headers().iter() {
                         out = out.header(k, v);
@@ -609,7 +617,8 @@ impl Gateway {
                         .body(axum::body::Body::from_stream(r.bytes_stream()))
                         .unwrap_or_else(|_| http::Response::builder().status(502).body(Default::default()).unwrap()))
                 }
-                Err(e) if e.is_timeout() => Err(ProxyUpstreamError::Timeout),
+                Ok(Err(e)) => Err(ProxyUpstreamError::Send(e.to_string())),
+                Err(_) => Err(ProxyUpstreamError::Timeout),
                 Err(e) => Err(ProxyUpstreamError::Send(e.to_string())),
             }
         };
@@ -701,6 +710,16 @@ impl Gateway {
         }
 
         let body = upstream.into_body();
+        // 响应体停滞超时：每收到一块字节重置计时，连续无进展超过 stallTimeoutMs
+        // 即中断响应流（防慢客户端挂住连接；0 = 禁用）
+        let body = if self.stall_timeout_ms > 0 {
+            Body::from_stream(StallTimeoutStream::new(
+                body.into_data_stream(),
+                self.stall_timeout_ms,
+            ))
+        } else {
+            body
+        };
         let mut out = axum::response::Response::builder().status(status_code);
         for (name, value) in response_headers.iter() {
             out = out.header(name, value);
@@ -751,6 +770,8 @@ impl Gateway {
         let cfg = &rt.config;
         rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
         rt.active_connections.fetch_add(1, Ordering::Relaxed);
+        // 桥接停滞超时：链路无字节进展超过 stallTimeoutMs 即断开（0 = 禁用）
+        let stall_timeout_ms = self.stall_timeout_ms;
 
         let scheme = if mapping.target_https { "wss" } else { "ws" };
         let upstream_url = format!(
@@ -872,7 +893,15 @@ impl Gateway {
                 };
                 match converted {
                     Some(m) => {
-                        if up_sink.send(m).await.is_err() {
+                        // 慢客户端阻塞反向链路时，上游 send 会持续背压停滞；
+                        // 超过 proxyTimeoutMs 无进展即断开，防连接永久挂住
+                        let send = if stall_timeout_ms > 0 {
+                            tokio::time::timeout(Duration::from_millis(stall_timeout_ms), up_sink.send(m))
+                        } else {
+                            // 未启用停滞超时：永不超时（等价裸 send）
+                            tokio::time::timeout(Duration::from_secs(86400 * 365), up_sink.send(m))
+                        };
+                        if matches!(send.await, Err(_) | Ok(Err(_))) {
                             break;
                         }
                     }
@@ -910,7 +939,17 @@ impl Gateway {
                 };
                 match converted {
                     Some(m) => {
-                        if client_sink.send(m).await.is_err() {
+                        // 慢客户端停滞超时：client_sink.send 背压超过 proxyTimeoutMs 即断开
+                        let send = if stall_timeout_ms > 0 {
+                            tokio::time::timeout(Duration::from_millis(stall_timeout_ms), client_sink.send(m))
+                        } else {
+                            tokio::time::timeout(Duration::from_secs(86400 * 365), client_sink.send(m))
+                        };
+                        if matches!(send.await, Err(_) | Ok(Err(_))) {
+                            logger::warn(&format!(
+                                "⚠️ [{}] WS 客户端响应停滞超过 {stall_timeout_ms}ms，断开桥接",
+                                rt_u2c.config.name
+                            ));
                             break;
                         }
                     }
@@ -1177,6 +1216,64 @@ impl tokio::io::AsyncWrite for WsUpstreamStream {
         match self.get_mut() {
             WsUpstreamStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             WsUpstreamStream::Uds(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// 响应体停滞超时流：上游→客户端方向长期无字节进展（stallTimeoutMs）时
+/// 主动报错中断，防慢客户端把连接与上游缓冲永久挂住。
+/// 计时按「进展」重置：每成功产出一块 chunk 重新起表，长轮询/SSE 只要有
+/// 周期性心跳即不受影响；流自然结束（None）不触发超时
+struct StallTimeoutStream<S> {
+    inner: S,
+    timeout_ms: u64,
+    /// 下一次允许停滞到期的时刻（首块字节前不计时）
+    deadline: Option<tokio::time::Instant>,
+    /// 定时器（Pin 在堆上，deadline 变更时 reset）
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<S> StallTimeoutStream<S> {
+    fn new(inner: S, timeout_ms: u64) -> Self {
+        Self {
+            inner,
+            timeout_ms,
+            deadline: None,
+            sleep: Box::pin(tokio::time::sleep(Duration::from_secs(86400 * 365))),
+        }
+    }
+}
+
+impl<S, E> futures_util::Stream for StallTimeoutStream<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // 先注册定时器 waker：停滞到期时唤醒本任务，下一次 poll 返回超时错误
+        if self.deadline.is_some() && self.sleep.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("响应体停滞超过 {}ms，断开连接", self.timeout_ms),
+            ))));
+        }
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                let dl = tokio::time::Instant::now() + Duration::from_millis(self.timeout_ms);
+                self.deadline = Some(dl);
+                self.sleep.as_mut().reset(dl);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            ))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }

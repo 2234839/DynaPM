@@ -220,6 +220,7 @@ async fn run(cfg: DynaPMConfig) -> Result<(), String> {
     let gw = Gateway::new(
         routes,
         cfg.proxy_timeout_ms,
+        cfg.stall_timeout_ms,
         cfg.stop_wait_ms,
         cfg.stop_timeout_ms,
         cfg.start_concurrency,
