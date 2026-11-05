@@ -65,14 +65,14 @@ const SKIP_RESPONSE_HEADERS: [&str; 4] = ["connection", "transfer-encoding", "ke
 pub struct Gateway {
     /// admin 面板专属域名（adminApi.host，None = 不限定）
     pub admin_host: Option<String>,
-    /// hostname 路由：hostname -> 路由映射
-    pub hostname_routes: Mutex<HashMap<String, Arc<RouteMapping>>>,
-    /// 端口路由：端口 -> 路由映射
-    pub port_routes: Mutex<HashMap<u16, Arc<RouteMapping>>>,
-    /// 按服务名索引的运行时
-    pub runtimes: Mutex<HashMap<String, Arc<ServiceRuntime>>>,
-    /// 每服务启动互斥锁：并发请求同一服务时串行化启动
-    start_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// hostname 路由：hostname -> 路由映射（启动后不可变，读路径无锁；配置变更走进程重启）
+    pub hostname_routes: HashMap<String, Arc<RouteMapping>>,
+    /// 端口路由：端口 -> 路由映射（启动后不可变，读路径无锁）
+    pub port_routes: HashMap<u16, Arc<RouteMapping>>,
+    /// 按服务名索引的运行时（启动后不可变，读路径无锁）
+    pub runtimes: HashMap<String, Arc<ServiceRuntime>>,
+    /// 每服务启动互斥锁：并发请求同一服务时串行化启动（启动后不可变，仅取值无锁）
+    start_locks: HashMap<String, Arc<AsyncMutex<()>>>,
     /// 代理请求超时（毫秒）
     pub proxy_timeout_ms: u64,
     /// 等待服务停止完成的超时上限（毫秒）
@@ -126,7 +126,9 @@ impl Gateway {
 
         let http_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(32)
+            // 高并发下连接复用是代理吞吐的关键：空闲池太小会频繁建拆连接（TIME_WAIT 堆积 + 握手延迟）
+            .pool_max_idle_per_host(512)
+            .tcp_nodelay(true)
             .build()
             .expect("构建 HTTP 客户端失败");
 
@@ -134,10 +136,10 @@ impl Gateway {
 
         Arc::new(Self {
             admin_host,
-            hostname_routes: Mutex::new(hostname_routes),
-            port_routes: Mutex::new(port_routes),
-            runtimes: Mutex::new(runtimes),
-            start_locks: Mutex::new(start_locks),
+            hostname_routes,
+            port_routes,
+            runtimes,
+            start_locks,
             proxy_timeout_ms,
             stop_wait_ms,
             stop_timeout_ms,
@@ -159,8 +161,6 @@ impl Gateway {
             return true;
         }
         self.hostname_routes
-            .lock()
-            .unwrap()
             .get(host)
             .map(|m| m.service.config.admin_panel)
             .unwrap_or(false)
@@ -178,17 +178,17 @@ impl Gateway {
 
     /// 全部运行时快照
     pub fn all_runtimes(&self) -> Vec<Arc<ServiceRuntime>> {
-        self.runtimes.lock().unwrap().values().cloned().collect()
+        self.runtimes.values().cloned().collect()
     }
 
     /// 按服务名查运行时
     pub fn runtime(&self, name: &str) -> Option<Arc<ServiceRuntime>> {
-        self.runtimes.lock().unwrap().get(name).cloned()
+        self.runtimes.get(name).cloned()
     }
 
     /// 已注册服务数量
     pub fn service_count(&self) -> usize {
-        self.runtimes.lock().unwrap().len()
+        self.runtimes.len()
     }
 
     /// 订阅服务生命周期事件（admin SSE）
@@ -199,8 +199,6 @@ impl Gateway {
     /// 端口路由快照（启动监听用）
     pub fn port_routes_snapshot(&self) -> Vec<(u16, Arc<RouteMapping>)> {
         self.port_routes
-            .lock()
-            .unwrap()
             .iter()
             .map(|(p, m)| (*p, Arc::clone(m)))
             .collect()
@@ -210,8 +208,6 @@ impl Gateway {
     pub async fn start_by_name(&self, rt: &Arc<ServiceRuntime>) -> Result<(), String> {
         let lock = self
             .start_locks
-            .lock()
-            .unwrap()
             .get(&rt.config.name)
             .cloned()
             .expect("启动锁缺失");
@@ -251,7 +247,7 @@ impl Gateway {
 
     /// 按 Host 头查找路由
     pub fn find_hostname_route(&self, hostname: &str) -> Option<Arc<RouteMapping>> {
-        self.hostname_routes.lock().unwrap().get(hostname).cloned()
+        self.hostname_routes.get(hostname).cloned()
     }
 
     /// 确保服务在线（供启动/等待路径共用）：每服务互斥串行化
@@ -263,8 +259,6 @@ impl Gateway {
         }
         let lock = self
             .start_locks
-            .lock()
-            .unwrap()
             .get(&cfg.name)
             .cloned()
             .expect("启动锁缺失");
@@ -333,8 +327,6 @@ impl Gateway {
     pub async fn stop_service(&self, rt: Arc<ServiceRuntime>) -> Result<(), String> {
         let lock = self
             .start_locks
-            .lock()
-            .unwrap()
             .get(&rt.config.name)
             .cloned()
             .expect("启动锁缺失");
@@ -359,8 +351,6 @@ impl Gateway {
                 ticker.tick().await;
                 let runtimes: Vec<Arc<ServiceRuntime>> = {
                     gw.runtimes
-                        .lock()
-                        .unwrap()
                         .values()
                         .cloned()
                         .collect()

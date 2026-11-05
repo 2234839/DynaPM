@@ -74,7 +74,7 @@ pub async fn list_services(
     for rt in gw.all_runtimes() {
         hosts_by_service.entry(rt.config.name.clone()).or_default();
     }
-    for (host, mapping) in gw.hostname_routes.lock().unwrap().iter() {
+    for (host, mapping) in gw.hostname_routes.iter() {
         hosts_by_service
             .entry(mapping.service.config.name.clone())
             .or_default()
