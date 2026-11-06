@@ -122,14 +122,16 @@ async function save(): Promise<void> {
     && !(await confirmDialog('磁盘配置已被外部修改，继续保存将覆盖外部改动。确定覆盖？', { danger: true, okText: '覆盖保存' }))) {
     return;
   }
-  if (!(await confirmDialog('保存并重启网关生效？重启期间服务短暂不可用（约 1 秒）。', { okText: '保存并重启' }))) return;
+  if (!(await confirmDialog('保存并热更新生效？路由变更原子替换，服务不中断。', { okText: '保存' }))) return;
   busy.value = true;
   msg.value = '';
   try {
     // 携带加载时 mtime：期间磁盘被外部改过则后端返回 409，提示重新加载
     const body = { ...JSON.parse(jsonText.value), _mtime: loadedMtime.value };
-    await saveConfig(body);
-    msg.value = '✅ 已保存，网关重启中… 几秒后可手动刷新';
+    const res = await saveConfig(body);
+    msg.value = res?.restarting
+      ? '✅ 已保存，监听地址变更需重启，网关退出中… 几秒后可手动刷新'
+      : '✅ 已保存，热更新生效（服务未中断）';
   } catch (e) {
     msg.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -203,10 +205,10 @@ onUnmounted(() => clearInterval(pollTimer));
         <button class="btn" :class="{ 'tab-active': mode === 'visual' }" @click="switchMode('visual')">可视化</button>
         <button class="btn" :class="{ 'tab-active': mode === 'json' }" @click="switchMode('json')">JSON</button>
       </div>
-      <span class="config-hint">保存后网关自重启生效；authToken 显示为 *** 时保持不变</span>
+      <span class="config-hint">保存后热更新生效（不中断服务）；authToken 显示为 *** 时保持不变</span>
       <div>
         <button class="btn" :disabled="busy" @click="reload">重新加载</button>
-        <button class="btn btn-danger" :disabled="busy" @click="save">保存并重启</button>
+        <button class="btn btn-danger" :disabled="busy" @click="save">保存</button>
         <button class="btn" @click="emit('close')">关闭</button>
       </div>
     </div>
