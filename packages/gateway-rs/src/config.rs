@@ -194,6 +194,10 @@ pub struct DynaPMConfigInput {
     pub admin_api: Option<AdminApiConfig>,
     /// 超时配置
     pub timeouts: Option<TimeoutsConfig>,
+    /// 主动回收：内存吃紧时驱逐无连接、非 keepWarm 的在跑服务给新启动腾地方
+    pub aggressive_reclaim: Option<bool>,
+    /// 主动回收触发线：MemAvailable 低于总内存百分比（默认 15）
+    pub mem_reclaim_threshold_pct: Option<u8>,
     /// 日志配置
     pub logging: Option<LoggingConfig>,
 }
@@ -277,6 +281,10 @@ pub struct DynaPMConfig {
     pub stall_timeout_ms: u64,
     /// 同时冷启动的服务数上限（默认按 CPU 与内存双约束，保底 2 上限 8）
     pub start_concurrency: usize,
+    /// 主动回收开关
+    pub aggressive_reclaim: bool,
+    /// 主动回收触发线（MemAvailable 占总内存百分比）
+    pub mem_reclaim_threshold_pct: u8,
     /// 请求日志开关
     pub enable_request_log: bool,
     /// WebSocket 日志开关
@@ -539,6 +547,8 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
         start_concurrency: timeouts
             .start_concurrency
             .unwrap_or_else(default_start_concurrency),
+        aggressive_reclaim: input.aggressive_reclaim.unwrap_or(false),
+        mem_reclaim_threshold_pct: input.mem_reclaim_threshold_pct.unwrap_or(15),
         enable_request_log: logging.enable_request_log.unwrap_or(false),
         enable_websocket_log: logging.enable_websocket_log.unwrap_or(false),
     })

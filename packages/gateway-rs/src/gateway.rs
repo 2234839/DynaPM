@@ -92,6 +92,10 @@ pub struct ProcessParams {
     pub start_limit: usize,
     /** admin API 认证令牌 */
     pub admin_auth_token: Option<String>,
+    /** 主动回收：内存吃紧时驱逐无连接、非 keepWarm 的在跑服务给新启动腾地方 */
+    pub aggressive_reclaim: bool,
+    /** 主动回收触发线：MemAvailable 低于总内存的百分比（默认 15） */
+    pub mem_reclaim_threshold_pct: u8,
 }
 
 pub struct Gateway {
@@ -178,6 +182,8 @@ impl Gateway {
                 start_limit: start_concurrency,
                 start_concurrency: Arc::new(tokio::sync::Semaphore::new(start_concurrency.max(1))),
                 admin_auth_token,
+                aggressive_reclaim: false,
+                mem_reclaim_threshold_pct: 15,
             }),
             config_mtime: std::sync::Mutex::new(0),
             listener: Mutex::new((0, String::new(), None)),
@@ -350,6 +356,8 @@ impl Gateway {
                     Arc::new(tokio::sync::Semaphore::new(cfg.start_concurrency.max(1)))
                 },
                 admin_auth_token: cfg.admin_api.as_ref().and_then(|a| a.auth_token.clone()),
+                aggressive_reclaim: cfg.aggressive_reclaim,
+                mem_reclaim_threshold_pct: cfg.mem_reclaim_threshold_pct,
             };
             self.params.store(Arc::new(new_params));
         }
@@ -450,6 +458,70 @@ impl Gateway {
         self.table.load().hostname_routes.get(hostname).cloned()
     }
 
+    /** 读 /proc/meminfo：返回 (MemAvailable, MemTotal) 字节 */
+    fn mem_available_total() -> Option<(u64, u64)> {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let mut avail = None;
+        let mut total = None;
+        for line in s.lines() {
+            if let Some(v) = line.strip_prefix("MemAvailable:") {
+                avail = v.trim().trim_end_matches(" kB").parse::<u64>().ok().map(|k| k * 1024);
+            } else if let Some(v) = line.strip_prefix("MemTotal:") {
+                total = v.trim().trim_end_matches(" kB").parse::<u64>().ok().map(|k| k * 1024);
+            }
+        }
+        Some((avail?, total?))
+    }
+
+    /**
+     * 内存压力主动回收：MemAvailable 低于阈值时，驱逐「无活跃连接、非 keepWarm、
+     * 非 starting」的在跑服务，剩余闲置时间（idleRemaining）最小者优先——
+     * 最接近自然回收的先杀，语义等价于帮闲置回收提前收尾；
+     * 正在被访问（活跃连接 > 0）或刚被唤醒的服务绝不会被杀
+     */
+    async fn reclaim_for_memory(&self, exclude: &str) {
+        let Some((avail, total)) = Self::mem_available_total() else { return };
+        let pct = self.params().mem_reclaim_threshold_pct as u64;
+        if avail * 100 > total * pct {
+            return;
+        }
+        logger::info(&format!(
+            "🧹 内存吃紧（可用 {:.0}MB < {pct}%），主动回收无连接服务…",
+            avail as f64 / 1024.0 / 1024.0
+        ));
+        // 候选：online、无连接、非 keepWarm、非 proxyOnly（无进程可杀）
+        let mut victims: Vec<Arc<ServiceRuntime>> = self
+            .all_runtimes()
+            .into_iter()
+            .filter(|rt| {
+                rt.config.name != exclude
+                    && rt.status() == Status::Online
+                    && rt.active_connections.load(Ordering::Relaxed) == 0
+                    && !rt.config.keep_warm
+                    && !rt.config.proxy_only
+            })
+            .collect();
+        // 剩余闲置时间最小者优先（最接近自然回收的先杀）
+        victims.sort_by_key(|rt| {
+            let threshold = if rt.config.keep_warm { rt.config.warm_idle_timeout } else { rt.config.idle_timeout };
+            let elapsed = now_ms() as i64 - rt.last_access_ms.load(Ordering::Relaxed) as i64;
+            (threshold as i64 - elapsed).max(0)
+        });
+        for rt in victims {
+            // 逐个杀并观察内存恢复，够用即停
+            if let Some((avail, total)) = Self::mem_available_total() {
+                if avail * 100 > total * pct {
+                    break;
+                }
+            }
+            let name = rt.config.name.clone();
+            logger::info(&format!("🧹 [{name}] 内存压力主动回收（闲置中、无连接）"));
+            if let Err(e) = self.stop_service(rt).await {
+                logger::error(&format!("❌ [{name}] 主动回收失败"), Some(&e));
+            }
+        }
+    }
+
     /// 取（惰性创建）服务启动互斥锁
     fn start_lock(&self, name: &str) -> Arc<AsyncMutex<()>> {
         let mut locks = self.start_locks.lock().unwrap();
@@ -472,6 +544,12 @@ impl Gateway {
         let lock = self.start_lock(&cfg.name);
         // 持锁进入：并发请求会在锁上排队，前一个完成后后一个直接命中 online 短路
         let _guard = lock.lock().await;
+
+        // 内存压力主动回收：低内存时驱逐「无连接、非 keepWarm」的在跑服务给新启动腾地方；
+        // 牺牲者优先级 = 剩余闲置时间最小（最接近自然回收的先杀），正在访问的服务绝不会被杀
+        if self.params().aggressive_reclaim {
+            self.reclaim_for_memory(cfg.name.as_str()).await;
+        }
 
         if cfg.proxy_only || rt.status() == Status::Online {
             return Ok(());
