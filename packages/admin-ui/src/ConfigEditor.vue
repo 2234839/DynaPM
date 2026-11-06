@@ -256,8 +256,8 @@ onUnmounted(() => clearInterval(pollTimer));
         <div class="form-grid">
           <label>域名 <input v-model="form.services[key].host" class="cfg-input" /></label>
           <label>后端地址 <input v-model="form.services[key].base" class="cfg-input" /></label>
-          <label>闲置回收(ms) <span v-if="fmtMs(form.services[key].idleTimeout)" class="ms-hint">≈ {{ fmtMs(form.services[key].idleTimeout) }}</span> <input v-model.number="form.services[key].idleTimeout" class="cfg-input" type="number" /></label>
-          <label>启动超时(ms) <span v-if="fmtMs(form.services[key].startTimeout)" class="ms-hint">≈ {{ fmtMs(form.services[key].startTimeout) }}</span> <input v-model.number="form.services[key].startTimeout" class="cfg-input" type="number" /></label>
+          <label>闲置回收(ms)<div class="cfg-row"><input v-model.number="form.services[key].idleTimeout" class="cfg-input" type="number" /><span v-if="fmtMs(form.services[key].idleTimeout)" class="ms-hint">≈ {{ fmtMs(form.services[key].idleTimeout) }}</span></div></label>
+          <label>启动超时(ms)<div class="cfg-row"><input v-model.number="form.services[key].startTimeout" class="cfg-input" type="number" /><span v-if="fmtMs(form.services[key].startTimeout)" class="ms-hint">≈ {{ fmtMs(form.services[key].startTimeout) }}</span></div></label>
           <label>健康检查
             <select v-model="form.services[key].healthCheck.type" class="cfg-input">
               <option v-for="t in hcTypes" :key="t" :value="t">{{ t }}</option>
@@ -288,7 +288,9 @@ onUnmounted(() => clearInterval(pollTimer));
 
 <style scoped>
 /* 毫秒输入旁的友好时长提示 */
-.ms-hint { color: #0969da; font-weight: 600; }
+.ms-hint { color: #0969da; font-weight: 600; white-space: nowrap; }
+/* 输入框与右侧提示同行排布 */
+.cfg-row { display: flex; align-items: center; gap: 6px; }
 .mode-tabs {
   display: inline-flex;
   gap: 0;
