@@ -12,6 +12,8 @@ const form = reactive({
   host: '',
   port: 0,
   adminHost: '',
+  aggressiveReclaim: false,
+  memReclaimThresholdPct: 15,
   services: {} as Record<string, any>,
 });
 /** JSON 文本态 */
@@ -58,6 +60,8 @@ function loadForm(cfg: Record<string, any>): void {
   form.host = cfg.host ?? '';
   form.port = cfg.port ?? 0;
   form.adminHost = cfg.adminApi?.host ?? '';
+  form.aggressiveReclaim = cfg.aggressiveReclaim ?? false;
+  form.memReclaimThresholdPct = cfg.memReclaimThresholdPct ?? 15;
   form.services = cfg.services ?? {};
 }
 
@@ -81,6 +85,8 @@ function syncJson(): void {
   const out: Record<string, any> = { ...raw, host: form.host, port: form.port };
   delete out._mtime;
   out.adminApi = { ...(raw.adminApi ?? {}), host: form.adminHost || undefined };
+  out.aggressiveReclaim = form.aggressiveReclaim || undefined;
+  out.memReclaimThresholdPct = form.aggressiveReclaim ? form.memReclaimThresholdPct : undefined;
   out.services = { ...form.services };
   jsonText.value = JSON.stringify(out, null, 2);
 }
@@ -213,6 +219,14 @@ onUnmounted(() => clearInterval(pollTimer));
         <label>监听地址 <input v-model="form.host" class="cfg-input" placeholder="127.0.0.1" /></label>
         <label>监听端口 <input v-model.number="form.port" class="cfg-input" type="number" /></label>
         <label>面板域名 <input v-model="form.adminHost" class="cfg-input" placeholder="dynapm.example.com" /></label>
+      </div>
+      <div class="form-flags" style="margin-bottom: 8px;">
+        <label title="内存吃紧时驱逐无连接、非 keepWarm 的在跑服务给新启动腾地，剩余闲置时间最短的先被回收；正在访问的服务绝不会被杀">
+          <input type="checkbox" v-model="form.aggressiveReclaim" /> 主动回收（内存压力驱逐）
+        </label>
+        <label v-if="form.aggressiveReclaim" title="MemAvailable 低于总内存该百分比时触发驱逐">
+          触发线 <input v-model.number="form.memReclaimThresholdPct" class="cfg-input" type="number" min="1" max="90" style="width: 64px;" /> %
+        </label>
       </div>
 
       <div class="svc-list-head">
