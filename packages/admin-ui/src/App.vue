@@ -16,6 +16,7 @@ import {
   type ServiceDetail,
   type ServiceStats,
 } from './api';
+import { fetchConfig, saveConfig } from './api';
 import StatsCharts from './StatsCharts.vue';
 import GlobalChart from './GlobalChart.vue';
 import ConfigEditor from './ConfigEditor.vue';
@@ -51,6 +52,95 @@ const globalSeries = computed(() =>
 );
 /** 配置编辑器可见性 */
 const configOpen = ref(false);
+/** 正在原地编辑配置的服务名（detail-grid 直接切输入态） */
+const editingSvc = ref('');
+/** 编辑表单：超时用秒展示，存储为毫秒 */
+const editForm = ref({
+  host: '',
+  base: '',
+  healthType: '',
+  idleSec: 0,
+  startSec: 0,
+  startCommand: '',
+  stopCommand: '',
+});
+/** 编辑态错误与保存中标志 */
+const editError = ref('');
+const editSaving = ref(false);
+
+/** 进入原地编辑：拉取配置定位该服务条目填充表单 */
+async function startEdit(name: string): Promise<void> {
+  editError.value = '';
+  try {
+    const [detail, cfg] = await Promise.all([fetchServiceDetail(name), fetchConfig()]);
+    /** 配置键是 host（面板 name 可能是 base 地址），从详情取 host 定位 */
+    const host = (detail.host as string) ?? name;
+    const svc = cfg.services?.[host];
+    if (!svc) {
+      editError.value = `配置中找不到服务 ${host}`;
+      return;
+    }
+    editForm.value = {
+      host,
+      base: svc.base ?? '',
+      healthType: svc.healthCheck?.type ?? '',
+      idleSec: Math.round((svc.idleTimeout ?? 0) / 1000),
+      startSec: Math.round((svc.startTimeout ?? 60000) / 1000),
+      startCommand: svc.commands?.start ?? '',
+      stopCommand: svc.commands?.stop ?? '',
+    };
+    editingSvc.value = name;
+  } catch (e) {
+    editError.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/** 保存原地编辑：改写配置内该服务条目后整体 PUT（服务/超时变更均可热更） */
+async function saveEdit(): Promise<void> {
+  editError.value = '';
+  const f = editForm.value;
+  if (!f.base.trim()) {
+    editError.value = '后端地址不能为空';
+    return;
+  }
+  editSaving.value = true;
+  try {
+    const cfg = await fetchConfig();
+    const svc = cfg.services?.[f.host];
+    if (!svc) {
+      editError.value = `配置中找不到服务 ${f.host}（可能已被外部修改）`;
+      return;
+    }
+    svc.base = f.base.trim();
+    if (f.healthType) {
+      svc.healthCheck = { ...(svc.healthCheck ?? {}), type: f.healthType };
+    } else {
+      delete svc.healthCheck;
+    }
+    svc.idleTimeout = f.idleSec * 1000;
+    svc.startTimeout = f.startSec * 1000;
+    svc.commands = { ...(svc.commands ?? {}) };
+    if (f.startCommand) svc.commands.start = f.startCommand;
+    else delete svc.commands.start;
+    if (f.stopCommand) svc.commands.stop = f.stopCommand;
+    else delete svc.commands.stop;
+    const res = await saveConfig(cfg);
+    if (!res.reloaded) {
+      // 含监听地址变更触发网关自重启，等其回来后刷新页面
+      editError.value = '保存成功，网关正在重启加载新配置…';
+      setTimeout(() => location.reload(), 3000);
+      return;
+    }
+    const name = editingSvc.value;
+    editingSvc.value = '';
+    await refresh();
+    if (name && expanded.value.has(name)) await toggleDetail(name);
+  } catch (e) {
+    editError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    editSaving.value = false;
+  }
+}
 
 /** 加载服务列表 */
 async function refresh(): Promise<void> {
@@ -361,9 +451,20 @@ onMounted(() => {
           <tr v-if="expanded.has(svc.name) && details.get(svc.name)">
             <td colspan="8" class="detail-cell">
               <StatsCharts v-if="statsMap.get(svc.name)" :stats="statsMap.get(svc.name)!" />
-              <div v-if="details.get(svc.name)" class="detail-grid">
-                <span>后端地址</span><code>{{ details.get(svc.name)!.base }}</code>
-                <span>健康检查</span><code>{{ details.get(svc.name)!.healthCheck?.type ?? '-' }}</code>
+              <div v-if="details.get(svc.name)" class="detail-grid" :class="{ editing: editingSvc === svc.name }">
+                <span>后端地址</span>
+                <template v-if="editingSvc === svc.name"><input v-model="editForm.base" placeholder="http://127.0.0.1:41001" /></template>
+                <code v-else>{{ details.get(svc.name)!.base }}</code>
+                <span>健康检查</span>
+                <template v-if="editingSvc === svc.name">
+                  <select v-model="editForm.healthType">
+                    <option value="">（默认 tcp）</option>
+                    <option value="tcp">tcp</option>
+                    <option value="http">http</option>
+                    <option value="command">command</option>
+                  </select>
+                </template>
+                <code v-else>{{ details.get(svc.name)!.healthCheck?.type ?? '-' }}</code>
                 <span>模式</span>
                 <code>
                   <template v-if="details.get(svc.name)!.proxyOnly">纯代理</template>
@@ -373,10 +474,29 @@ onMounted(() => {
                 </code>
                 <span>启动次数</span><code>{{ details.get(svc.name)!.startCount }}</code>
                 <span>最后访问</span><code>{{ formatTime(details.get(svc.name)!.lastAccessTime) }}</code>
-                <span>闲置回收</span><code>{{ formatUptime(details.get(svc.name)!.idleTimeout) }}</code>
-                <span>启动超时</span><code>{{ formatUptime(details.get(svc.name)!.startTimeout ?? 0) }}</code>
-                <span>启动命令</span><code class="cmd">{{ details.get(svc.name)!.startCommand || '-' }}</code>
-                <span>停止命令</span><code class="cmd">{{ details.get(svc.name)!.stopCommand || '-' }}</code>
+                <span>闲置回收</span>
+                <template v-if="editingSvc === svc.name"><div class="inline-field"><input v-model.number="editForm.idleSec" type="number" min="0" /><small class="hint">秒</small></div></template>
+                <code v-else>{{ formatUptime(details.get(svc.name)!.idleTimeout) }}</code>
+                <span>启动超时</span>
+                <template v-if="editingSvc === svc.name"><div class="inline-field"><input v-model.number="editForm.startSec" type="number" min="1" /><small class="hint">秒</small></div></template>
+                <code v-else>{{ formatUptime(details.get(svc.name)!.startTimeout ?? 0) }}</code>
+                <span>启动命令</span>
+                <template v-if="editingSvc === svc.name"><textarea v-model="editForm.startCommand" rows="2"></textarea></template>
+                <code v-else class="cmd">{{ details.get(svc.name)!.startCommand || '-' }}</code>
+                <span>停止命令</span>
+                <template v-if="editingSvc === svc.name"><textarea v-model="editForm.stopCommand" rows="2" placeholder="（默认按 pgid 杀进程组）"></textarea></template>
+                <code v-else class="cmd">{{ details.get(svc.name)!.stopCommand || '-' }}</code>
+                <template v-if="editingSvc === svc.name">
+                  <span></span>
+                  <div class="edit-actions">
+                    <p v-if="editError" class="error" style="margin: 0; flex: 1">{{ editError }}</p>
+                    <button class="btn" :disabled="editSaving" @click="editingSvc = ''">取消</button>
+                    <button class="btn btn-start" :disabled="editSaving" @click="saveEdit()">{{ editSaving ? '保存中…' : '保存' }}</button>
+                  </div>
+                </template>
+              </div>
+              <div v-if="editingSvc !== svc.name" style="display: flex; justify-content: flex-end; margin-top: 6px">
+                <button class="btn" @click="startEdit(svc.name)">编辑配置</button>
               </div>
               <p v-if="details.get(svc.name)?.lastStartError" class="error">启动失败：{{ details.get(svc.name)!.lastStartError }}</p>
             </td>

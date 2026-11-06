@@ -307,6 +307,12 @@ async fn run(cfg: DynaPMConfig, port_explicit: bool) -> Result<(), String> {
         cfg.admin_api.as_ref().and_then(|a| a.auth_token.clone()),
         cfg.admin_api.as_ref().and_then(|a| a.host.clone()),
     );
+    // 记录启动期监听地址：配置变更时据此判定可否热更（socket 重绑只能重启）
+    gw.set_listener(
+        cfg.port,
+        cfg.host.clone(),
+        cfg.admin_api.as_ref().and_then(|a| a.port),
+    );
     logger::info(&format!(
         "🚦 冷启动并发上限: {}（timeouts.startConcurrency 可覆盖）",
         cfg.start_concurrency
@@ -734,6 +740,8 @@ fn add_subcommand(args: &[String]) {
         .unwrap_or_else(|| dir.file_name().unwrap().to_string_lossy().to_string());
     // 多级子域名（foo.bar.localhost）在 macOS/部分解析器下不可靠，统一压成单级：
     // 路径分隔/点号一律转横杠，项目名与域名规则无关地稳定
+    // .localhost 是 RFC 6761 特殊域名，本地回环解析零配置，故写死；
+    // 需要自定义域名的场景（生产/团队）直接编辑配置文件的 host 字段
     let name = name.replace(['.', '/', '\\'], "-");
     let host = format!("{name}.localhost");
 

@@ -76,34 +76,44 @@ pub struct RouteTable {
 }
 
 /// 全局网关共享状态
+/** 可热替换的进程级参数：超时/冷启动并发/admin token 均可运行期原地生效，无需重启网关 */
+pub struct ProcessParams {
+    /** 代理请求超时（毫秒） */
+    pub proxy_timeout_ms: u64,
+    /** 链路停滞超时（毫秒，0 = 禁用）：响应流/WS 桥无字节进展即断开 */
+    pub stall_timeout_ms: u64,
+    /** 等待服务停止完成的超时上限（毫秒） */
+    pub stop_wait_ms: u64,
+    /** 停止命令执行超时（毫秒） */
+    pub stop_timeout_ms: u64,
+    /** 冷启动并发上限（reload 仅在限额变化时替换信号量，进行中的排队不受影响） */
+    pub start_concurrency: Arc<tokio::sync::Semaphore>,
+    /** start_concurrency 当前限额（用于 reload 时比对是否需要重建信号量） */
+    pub start_limit: usize,
+    /** admin API 认证令牌 */
+    pub admin_auth_token: Option<String>,
+}
+
 pub struct Gateway {
     /// 路由表（ArcSwap 原子替换，热更新入口 reload()）
     table: arc_swap::ArcSwap<RouteTable>,
+    /// 进程级参数（超时/并发/admin token）：ArcSwap 原子替换，reload() 热更新
+    params: arc_swap::ArcSwap<ProcessParams>,
+    /// 网关已知的配置文件 mtime（毫秒）：自身写入或已 reload 过的变更不算外部冲突
+    pub(crate) config_mtime: std::sync::Mutex<u64>,
+    /// 监听地址三元组（主端口/主host/admin端口）：socket 绑定于启动期，变更只能重启生效
+    listener: Mutex<(u16, String, Option<u16>)>,
     /// 每服务启动互斥锁：并发请求同一服务时串行化启动（惰性创建，跨热更新保留——
     /// 锁只增不删，保证 reload 期间旧新代码路径对同一服务仍串行化）
     start_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// 端口路由监听任务句柄（热更新时按端口 diff 起停）
     port_listeners: Mutex<HashMap<u16, tokio::task::AbortHandle>>,
-    /// 代理请求超时（毫秒）
-    pub proxy_timeout_ms: u64,
-    /// 链路停滞超时（毫秒，0 = 禁用）：响应流/WS 桥无字节进展即断开，
-    /// 防慢客户端把连接与缓冲永久挂住；独立于 proxyTimeoutMs 以免误杀长轮询/SSE
-    pub stall_timeout_ms: u64,
-    /// 等待服务停止完成的超时上限（毫秒）
-    pub stop_wait_ms: u64,
-    /// 停止命令执行超时（毫秒）
-    pub stop_timeout_ms: u64,
     /// 共享 HTTP 客户端（内部连接池 keep-alive，按目标自动复用）
     pub http_client: reqwest::Client,
     /// netns 服务专用 UDS HTTP 客户端（每服务一个连接器实例，见 uds_clients）
     pub uds_clients: Mutex<HashMap<String, crate::netns::UdsClient>>,
-    /// 全局冷启动并发上限：小内存机器上多个服务同时冷启动会把资源打爆
-    /// （docker start + 应用初始化的内存/CPU 峰值叠加），信号量排队避免启动风暴
-    start_concurrency: tokio::sync::Semaphore,
     /// 服务生命周期事件广播（admin SSE 用）
     pub events: broadcast::Sender<String>,
-    /// admin API 认证令牌
-    pub admin_auth_token: Option<String>,
 }
 
 impl Gateway {
@@ -160,18 +170,43 @@ impl Gateway {
                 port_routes,
                 runtimes,
             }),
+            params: arc_swap::ArcSwap::from_pointee(ProcessParams {
+                proxy_timeout_ms,
+                stall_timeout_ms,
+                stop_wait_ms,
+                stop_timeout_ms,
+                start_limit: start_concurrency,
+                start_concurrency: Arc::new(tokio::sync::Semaphore::new(start_concurrency.max(1))),
+                admin_auth_token,
+            }),
+            config_mtime: std::sync::Mutex::new(0),
+            listener: Mutex::new((0, String::new(), None)),
             start_locks: Mutex::new(start_locks),
             port_listeners: Mutex::new(HashMap::new()),
-            proxy_timeout_ms,
-            stall_timeout_ms,
-            stop_wait_ms,
-            stop_timeout_ms,
             http_client,
             uds_clients: Mutex::new(HashMap::new()),
-            start_concurrency: tokio::sync::Semaphore::new(start_concurrency.max(1)),
             events,
-            admin_auth_token,
         })
+    }
+
+    /// 进程级参数快照（ArcSwap 无锁读，请求路径零开销；Guard 可 Deref 到字段）
+    pub fn params(&self) -> arc_swap::Guard<Arc<ProcessParams>> {
+        self.params.load()
+    }
+
+    /// 记录启动期实际绑定的监听地址（main 绑定前调用，供配置变更时判定是否需重启）
+    pub fn set_listener(&self, port: u16, host: String, admin_port: Option<u16>) {
+        *self.listener.lock().unwrap() = (port, host, admin_port);
+    }
+
+    /// 新配置是否要求重新绑定 socket（主端口/host/admin端口变化）——唯一无法热更的项
+    pub fn listener_changed(&self, cfg: &crate::config::DynaPMConfig) -> bool {
+        let l = self.listener.lock().unwrap();
+        *l != (
+            cfg.port,
+            cfg.host.clone(),
+            cfg.admin_api.as_ref().and_then(|a| a.port),
+        )
     }
 
     /// admin 面板在指定 Host 下是否可达：
@@ -190,9 +225,9 @@ impl Gateway {
         let _ = self.events.send(msg);
     }
 
-    /// admin API 认证令牌
-    pub fn admin_auth_token(&self) -> Option<&String> {
-        self.admin_auth_token.as_ref()
+    /// admin API 认证令牌（热替换参数的快照，返回拷贝避免持有 Guard）
+    pub fn admin_auth_token(&self) -> Option<String> {
+        self.params().admin_auth_token.clone()
     }
 
     /// admin 面板专属域名快照
@@ -249,8 +284,10 @@ impl Gateway {
         }
         // 手动启动视为人工确认：清除失败冷却，立即重试
         rt.clear_start_failure();
-        // 全局冷启动并发上限：排队等空位，防止小机被同时冷启动打爆（启动风暴）
-        let _start_permit = self.start_concurrency.acquire().await;
+        // 全局冷启动并发上限：排队等空位，防止小机被同时冷启动打爆（启动风暴）；
+        // 信号量是 Arc 拷贝，reload 替换限额不影响在途排队
+        let sem = Arc::clone(&self.params().start_concurrency);
+        let _start_permit = sem.acquire().await;
         if rt.status() == Status::Online || rt.config.proxy_only {
             return Ok(());
         }
@@ -291,6 +328,26 @@ impl Gateway {
     /// 超时参数等不可热更字段由调用方（admin put_config）判断后走自重启
     pub async fn reload(self: &Arc<Self>, cfg: &crate::config::DynaPMConfig) {
         let old = self.table.load_full();
+
+        // 进程级参数热替换：超时/admin token 原地生效；冷启动并发限额变化时重建信号量
+        // （在途排队持有旧信号量不受影响，新排队走新限额）
+        {
+            let p = self.params.load_full();
+            let new_params = ProcessParams {
+                proxy_timeout_ms: cfg.proxy_timeout_ms,
+                stall_timeout_ms: cfg.stall_timeout_ms,
+                stop_wait_ms: cfg.stop_wait_ms,
+                stop_timeout_ms: cfg.stop_timeout_ms,
+                start_limit: cfg.start_concurrency,
+                start_concurrency: if p.start_limit == cfg.start_concurrency {
+                    Arc::clone(&p.start_concurrency)
+                } else {
+                    Arc::new(tokio::sync::Semaphore::new(cfg.start_concurrency.max(1)))
+                },
+                admin_auth_token: cfg.admin_api.as_ref().and_then(|a| a.auth_token.clone()),
+            };
+            self.params.store(Arc::new(new_params));
+        }
 
         // 构建新运行时集合：配置未变的同名服务复用旧运行时
         let mut new_runtimes: HashMap<String, Arc<ServiceRuntime>> = HashMap::new();
@@ -426,7 +483,8 @@ impl Gateway {
         }
 
         // 全局冷启动并发上限（与 ensure_service_online 同策略）
-        let _start_permit = self.start_concurrency.acquire().await;
+        let sem = Arc::clone(&self.params().start_concurrency);
+        let _start_permit = sem.acquire().await;
         if cfg.proxy_only || rt.status() == Status::Online {
             return Ok(());
         }
@@ -501,7 +559,7 @@ impl Gateway {
         }
         rt.set_status(Status::Stopping);
         rt.close_session();
-        let result = crate::state::stop(&rt, self.stop_timeout_ms).await;
+        let result = crate::state::stop(&rt, self.params().stop_timeout_ms).await;
         rt.set_status(Status::Offline);
         self.publish_event(format!(r#"{{"type":"stop","service":"{}"}}"#, rt.config.name));
         result
@@ -564,7 +622,7 @@ impl Gateway {
             Status::Starting => self.ensure_service_online(mapping).await,
             Status::Stopping => {
                 logger::info(&format!("⏳ [{}] 等待服务停止完成...", cfg.name));
-                if wait_status_leave(rt, Status::Stopping, self.stop_wait_ms).await {
+                if wait_status_leave(rt, Status::Stopping, self.params().stop_wait_ms).await {
                     if rt.status() == Status::Offline {
                         self.ensure_service_online(mapping).await
                     } else {
@@ -723,7 +781,7 @@ impl Gateway {
                 Err(e) => return proxy_request_error_response(e, cfg, rt, &overflow),
             };
             let send_fut = tokio::time::timeout(
-                Duration::from_millis(self.proxy_timeout_ms),
+                Duration::from_millis(self.params().proxy_timeout_ms),
                 client.request(req),
             );
             match send_fut.await {
@@ -744,7 +802,7 @@ impl Gateway {
             // proxy_timeout_ms 只覆盖「发起连接 → 响应头返回」；响应体时长由 stall_timeout_ms 管理，
             // 不能用 reqwest 的 .timeout()（那是含 body 的总超时，会掐断 SSE/长流式响应）
             let send_fut = tokio::time::timeout(
-                Duration::from_millis(self.proxy_timeout_ms),
+                Duration::from_millis(self.params().proxy_timeout_ms),
                 self.http_client
                     .request(method.clone(), &url)
                     .headers(proxy_headers.clone())
@@ -857,10 +915,10 @@ impl Gateway {
         let body = upstream.into_body();
         // 响应体停滞超时：每收到一块字节重置计时，连续无进展超过 stallTimeoutMs
         // 即中断响应流（防慢客户端挂住连接；0 = 禁用）
-        let body = if self.stall_timeout_ms > 0 {
+        let body = if self.params().stall_timeout_ms > 0 {
             Body::from_stream(StallTimeoutStream::new(
                 body.into_data_stream(),
-                self.stall_timeout_ms,
+                self.params().stall_timeout_ms,
             ))
         } else {
             body
@@ -916,7 +974,7 @@ impl Gateway {
         rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
         rt.active_connections.fetch_add(1, Ordering::Relaxed);
         // 桥接停滞超时：链路无字节进展超过 stallTimeoutMs 即断开（0 = 禁用）
-        let stall_timeout_ms = self.stall_timeout_ms;
+        let stall_timeout_ms = self.params().stall_timeout_ms;
 
         let scheme = if mapping.target_https { "wss" } else { "ws" };
         let upstream_url = format!(

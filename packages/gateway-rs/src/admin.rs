@@ -46,7 +46,7 @@ fn is_authorized(uri: &axum::http::Uri, headers: &axum::http::HeaderMap, token: 
 /// 通用鉴权入口（不匹配返回 Some(错误响应)）
 fn auth_check(uri: &axum::http::Uri, headers: &axum::http::HeaderMap, gw: &Gateway) -> Option<axum::response::Response> {
     let token = gw.admin_auth_token();
-    if !is_authorized(uri, headers, token) {
+    if !is_authorized(uri, headers, token.as_ref()) {
         return Some(
             axum::response::Response::builder()
                 .status(axum::http::StatusCode::UNAUTHORIZED)
@@ -238,7 +238,8 @@ pub async fn put_config(
             }
         }
     }
-    // 外部修改检测：body 携带加载时的 _mtime，与磁盘不一致返回 409（客户端可重新拉取合并）
+    // 外部修改检测：body 携带加载时的 _mtime，与磁盘不一致返回 409（客户端可重新拉取合并）；
+    // 网关自己写入/已 reload 加载过的 mtime 视为已知变更，不误判为外部冲突
     let loaded_mtime = v.get("_mtime").and_then(|m| m.as_u64()).unwrap_or(0);
     if let Some(obj) = v.as_object_mut() {
         obj.remove("_mtime");
@@ -249,7 +250,8 @@ pub async fn put_config(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    if loaded_mtime > 0 && disk_mtime > 0 && loaded_mtime != disk_mtime {
+    let seen_mtime = *gw.config_mtime.lock().unwrap();
+    if loaded_mtime > 0 && disk_mtime > 0 && loaded_mtime != disk_mtime && disk_mtime != seen_mtime {
         return json_response(
             axum::http::StatusCode::CONFLICT,
             &serde_json::json!({ "error": "配置文件已被外部修改（mtime 不一致），请重新加载后再保存", "mtime": disk_mtime }),
@@ -261,8 +263,6 @@ pub async fn put_config(
         Ok(c) => c,
         Err(e) => return json_response(axum::http::StatusCode::BAD_REQUEST, &serde_json::json!({ "error": format!("配置校验失败: {e}") })),
     };
-    // 写回前快照旧配置，用于热更判定（仅路由/服务变更可热更）
-    let old_cfg = crate::config::load_config().ok();
     // 原子写回：tmp + rename（文件 IO 放阻塞线程池）
     let path = config_path();
     let tmp = format!("{}.tmp", path.display());
@@ -274,27 +274,26 @@ pub async fn put_config(
     if let Err(e) = write_result {
         return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": format!("写入配置失败: {e}") }));
     }
-    // 热更判定：监听参数/超时参数/admin token 变化无法原地生效，走自重启；
-    // 仅服务与路由变更时原子替换路由表（在线服务不中断）
-    let hot_reloadable = !old_cfg.map(|o| config_affects_process(&o, &new_cfg)).unwrap_or(true);
+    // 记录本次写入的 mtime：后续携带旧 mtime 的保存不再误判为外部冲突
+    if let Ok(m) = std::fs::metadata(config_path()).and_then(|m| m.modified()) {
+        if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+            *gw.config_mtime.lock().unwrap() = d.as_millis() as u64;
+        }
+    }
+    // 热更判定：仅监听地址（主端口/host/admin端口）变更需要重启重绑 socket；
+    // 超时/并发/admin token 已随 reload 原地生效，服务路由变更原子替换不停机
+    let hot_reloadable = !gw.listener_changed(&new_cfg);
     if hot_reloadable {
         gw.reload(&new_cfg).await;
         return json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "reloaded": true }));
     }
-    // 延迟自重启：等响应先发出去（systemd Restart 拉起新进程加载新配置）
-    tokio::spawn(async {
+    // 延迟自重启：等响应先发出去（systemd Restart 拉起新进程加载新配置）；
+    // 系统级 unit + User=gs 无权 systemctl restart，唯一可靠路径就是自己退出
+    tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         logger::info("📝 配置已更新（含不可热更字段），网关自重启加载新配置...");
-        let under_systemd = std::path::Path::new("/run/systemd/system").exists();
-        if under_systemd {
-            // fork+exec 放阻塞线程池，避免在 async 上下文直接 fork
-            let _ = tokio::task::spawn_blocking(|| {
-                std::process::Command::new("systemctl").arg("restart").arg("dynapm").spawn()
-            })
-            .await;
-        } else {
-            std::process::exit(0);
-        }
+        gw.cleanup().await;
+        std::process::exit(0);
     });
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "restarting": true }))
 }
@@ -361,19 +360,6 @@ pub async fn restart_gateway(
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "restarting": true }))
 }
 
-/** 判断配置变化是否影响进程级参数（监听地址/超时/并发/admin 鉴权），true = 只能重启生效 */
-fn config_affects_process(old: &crate::config::DynaPMConfig, new: &crate::config::DynaPMConfig) -> bool {
-    old.port != new.port
-        || old.host != new.host
-        || old.stop_wait_ms != new.stop_wait_ms
-        || old.stop_timeout_ms != new.stop_timeout_ms
-        || old.proxy_timeout_ms != new.proxy_timeout_ms
-        || old.stall_timeout_ms != new.stall_timeout_ms
-        || old.start_concurrency != new.start_concurrency
-        || old.admin_api.as_ref().map(|a| (a.host.clone(), a.port, a.auth_token.clone()))
-            != new.admin_api.as_ref().map(|a| (a.host.clone(), a.port, a.auth_token.clone()))
-}
-
 /** POST /_dynapm/api/reload：从磁盘重读配置并热加载（供 CLI/外部文件 watch 触发） */
 pub async fn reload_config(
     uri: axum::http::Uri,
@@ -387,18 +373,21 @@ pub async fn reload_config(
         Ok(c) => c,
         Err(e) => return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": format!("配置读取失败: {e}") })),
     };
-    // 热加载只能更新路由/服务；超时参数固化在 Gateway 字段上无法原地替换
-    let process_changed = gw.proxy_timeout_ms != cfg.proxy_timeout_ms
-        || gw.stall_timeout_ms != cfg.stall_timeout_ms
-        || gw.stop_wait_ms != cfg.stop_wait_ms
-        || gw.stop_timeout_ms != cfg.stop_timeout_ms;
-    if process_changed {
+    // 超时/冷启动并发/admin token 随 reload 原地生效；
+    // 仅监听地址变更（主端口/host/admin端口）无法热更——需重启重绑 socket
+    if gw.listener_changed(&cfg) {
         return json_response(
             axum::http::StatusCode::CONFLICT,
-            &serde_json::json!({ "error": "配置含进程级参数变更（端口/超时/admin token），无法热加载，请通过 PUT /_dynapm/api/config 触发重启" }),
+            &serde_json::json!({ "error": "配置含监听地址变更（主端口/host/admin端口），无法热加载，需通过 PUT /_dynapm/api/config 保存并重启" }),
         );
     }
     gw.reload(&cfg).await;
+    // 已 reload 加载过的磁盘状态记为已知：后续面板携带旧 _mtime 保存不误判外部冲突
+    if let Ok(m) = std::fs::metadata(config_path()).and_then(|m| m.modified()) {
+        if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+            *gw.config_mtime.lock().unwrap() = d.as_millis() as u64;
+        }
+    }
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "reloaded": true }))
 }
 

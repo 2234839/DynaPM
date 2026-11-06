@@ -130,8 +130,8 @@ export function fetchConfig(): Promise<Record<string, any>> {
   return api('/_dynapm/api/config');
 }
 
-/** 保存配置（校验通过后网关自重启；携带 _mtime 做外部修改冲突检测，冲突时后端返回 409） */
-export function saveConfig(cfg: Record<string, any>): Promise<{ ok: boolean; restarting: boolean }> {
+/** 保存配置（校验通过后热更或自重启；携带 _mtime 做外部修改冲突检测，冲突时后端返回 409） */
+export function saveConfig(cfg: Record<string, any>): Promise<{ ok: boolean; reloaded?: boolean; restarting?: boolean }> {
   return api('/_dynapm/api/config', { method: 'PUT', body: JSON.stringify(cfg, null, 2) });
 }
 
