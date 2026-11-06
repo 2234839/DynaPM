@@ -404,6 +404,8 @@ onMounted(() => {
                 rel="noopener"
               >{{ svc.name }}</a>
               <span v-else>{{ svc.name }}</span>
+              <span v-if="svc.socks" class="badge port-badge" title="SOCKS5 代理端口">🧦 :{{ svc.ports?.[0] }}</span>
+              <span v-else-if="svc.ports?.length" class="badge port-badge" title="专属端口">:{{ svc.ports[0] }}</span>
             </td>
             <td>
               <span class="badge" :class="svc.paused ? 'status-disabled' : statusClass(svc.status)">{{ svc.paused ? 'disabled' : svc.status }}</span>
@@ -455,6 +457,10 @@ onMounted(() => {
                 <span>后端地址</span>
                 <template v-if="editingSvc === svc.name"><input v-model="editForm.base" placeholder="http://127.0.0.1:41001" /></template>
                 <code v-else>{{ details.get(svc.name)!.base }}</code>
+                <span>代理端口</span>
+                <code v-if="svc.socks">🧦 socks5 :{{ svc.ports?.[0] }}（socks5h://127.0.0.1:{{ svc.ports?.[0] }}）</code>
+                <code v-else-if="svc.ports?.length">:{{ svc.ports[0] }}</code>
+                <code v-else>-</code>
                 <span>健康检查</span>
                 <template v-if="editingSvc === svc.name">
                   <select v-model="editForm.healthType">

@@ -282,6 +282,14 @@ h1 {
   text-decoration: underline;
 }
 
+/* 服务名旁的端口徽标（SOCKS/专属端口模式） */
+.port-badge {
+  background: #ddf4ff;
+  color: #0969da;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
 .config-box {
   background: #fff;
   border: 1px solid #d0d7de;

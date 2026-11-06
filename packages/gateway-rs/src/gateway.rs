@@ -270,6 +270,11 @@ impl Gateway {
             .collect()
     }
 
+    /// 注册端口监听句柄（供启动流程使用）
+    pub fn register_port_listener(&self, port: u16, handle: tokio::task::AbortHandle) {
+        self.port_listeners.lock().unwrap().insert(port, handle);
+    }
+
     /// 订阅服务生命周期事件（admin SSE）
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.events.subscribe()
@@ -402,11 +407,12 @@ impl Gateway {
             }
             for (port, mapping) in port_routes {
                 if !listeners.contains_key(&port) {
-                    if mapping.service.config.passthrough {
-                        self.start_passthrough_listener(port, mapping);
+                    let h = if mapping.service.config.passthrough {
+                        self.start_passthrough_listener(port, mapping)
                     } else {
-                        self.start_port_http_listener(port, mapping);
-                    }
+                        self.start_port_http_listener(port, mapping)
+                    };
+                    listeners.insert(port, h);
                 }
             }
         }
@@ -585,6 +591,10 @@ impl Gateway {
                     } else {
                         cfg.idle_timeout
                     };
+                    // idleTimeout/warmIdleTimeout = 0 表示永不回收（长驻服务如 SSH 隧道）
+                    if idle_threshold == 0 {
+                        continue;
+                    }
                     let now = now_ms();
                     if rt.status() == Status::Online
                         && rt.active_connections.load(Ordering::Relaxed) == 0
@@ -1172,9 +1182,10 @@ impl Gateway {
     }
 
     /// 端口路由 TCP 直通：整条连接纯 TCP 双向拷贝
-    pub fn start_passthrough_listener(self: &Arc<Self>, port: u16, mapping: Arc<RouteMapping>) {
+    /// 启动 passthrough 监听（返回 AbortHandle，由调用方注册，避免重入锁）
+    pub fn start_passthrough_listener(self: &Arc<Self>, port: u16, mapping: Arc<RouteMapping>) -> tokio::task::AbortHandle {
         let gw = Arc::clone(self);
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -1202,7 +1213,19 @@ impl Gateway {
                         logger::error(&format!("❌ [{}] passthrough 启动失败", rt.config.name), Some(&e));
                         return;
                     }
-                    let target = match tokio::net::TcpStream::connect((
+                    let (client, dest) = if mapping.service.config.socks {
+                        // SOCKS5 服务模式：与客户端完成握手，拿到实际目标
+                        match socks5_handshake(client).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                logger::info(&format!("🧦 [{}] SOCKS5 握手失败: {}", rt.config.name, e));
+                                return;
+                            }
+                        }
+                    } else {
+                        (client, String::new())
+                    };
+                    let mut target = match tokio::net::TcpStream::connect((
                         mapping.target_host.as_str(),
                         mapping.target_port,
                     ))
@@ -1214,6 +1237,13 @@ impl Gateway {
                             return;
                         }
                     };
+                    if mapping.service.config.socks {
+                        // 上游本身是 SOCKS 代理：以客户端原始目标对上游发起 CONNECT
+                        if let Err(e) = socks5_connect(&mut target, &dest).await {
+                            logger::info(&format!("🧦 [{}] SOCKS5 上游 CONNECT {} 失败: {}", rt.config.name, dest, e));
+                            return;
+                        }
+                    }
                     rt.active_connections.fetch_add(1, Ordering::Relaxed);
                     let (mut cr, mut cw) = tokio::io::split(client);
                     let (mut tr, mut tw) = tokio::io::split(target);
@@ -1223,14 +1253,15 @@ impl Gateway {
                     rt.active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
-        });
-        self.port_listeners.lock().unwrap().insert(port, task.abort_handle());
+        })
+        .abort_handle()
     }
 
     /// 端口路由 HTTP 监听：独立 axum server
-    pub fn start_port_http_listener(self: &Arc<Self>, port: u16, mapping: Arc<RouteMapping>) {
+    /// 启动端口 HTTP 监听（返回 AbortHandle，由调用方注册，避免重入锁）
+    pub fn start_port_http_listener(self: &Arc<Self>, port: u16, mapping: Arc<RouteMapping>) -> tokio::task::AbortHandle {
         let gw = Arc::clone(self);
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let gw_for_route = Arc::clone(&gw);
             let mapping_for_route = Arc::clone(&mapping);
             let app = axum::Router::new().fallback(move |method: axum::http::Method,
@@ -1266,10 +1297,12 @@ impl Gateway {
             if let Err(e) = axum::serve(listener, app).await {
                 logger::error(&format!("❌ 端口 {port} HTTP 服务退出: {e}"), None);
             }
-        });
-        self.port_listeners.lock().unwrap().insert(port, task.abort_handle());
+        })
+        .abort_handle()
     }
 }
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 声明的 content-length（无头时 None）
 fn declared_content_length(headers: &HeaderMap) -> Option<usize> {
@@ -1604,4 +1637,130 @@ where
 #[allow(dead_code)]
 pub async fn service_is_running(rt: &ServiceRuntime) -> bool {
     crate::state::is_running(&rt.config, false).await
+}
+
+/** 读满 n 字节（对端提前关闭则报错） */
+async fn read_exact_or(
+    stream: &mut tokio::net::TcpStream,
+    buf: &mut [u8],
+) -> Result<(), String> {
+    stream
+        .read_exact(buf)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/**
+ * SOCKS5 服务端握手：无鉴权 + CONNECT
+ * 返回 (客户端流, 目标地址 "host:port")，握手失败时已向客户端回了错误应答
+ */
+async fn socks5_handshake(
+    mut stream: tokio::net::TcpStream,
+) -> Result<(tokio::net::TcpStream, String), String> {
+    // greeting: VER NMETHODS METHODS...
+    let mut hdr = [0u8; 2];
+    read_exact_or(&mut stream, &mut hdr).await?;
+    if hdr[0] != 0x05 {
+        return Err(format!("不支持的协议版本 {}", hdr[0]));
+    }
+    let mut methods = vec![0u8; hdr[1] as usize];
+    read_exact_or(&mut stream, &mut methods).await?;
+    // 选无鉴权 (0x00)；客户端不支持则拒绝
+    let method = if methods.contains(&0x00) { 0x00 } else { 0xFF };
+    stream.write_all(&[0x05, method]).await.map_err(|e| e.to_string())?;
+    if method == 0xFF {
+        return Err("客户端不支持无鉴权".to_string());
+    }
+    // request: VER CMD RSV ATYP ADDR...
+    let mut req = [0u8; 4];
+    read_exact_or(&mut stream, &mut req).await?;
+    if req[1] != 0x01 {
+        return Err(format!("仅支持 CONNECT，收到 CMD {}", req[1]));
+    }
+    let host = match req[3] {
+        0x01 => {
+            let mut b = [0u8; 4];
+            read_exact_or(&mut stream, &mut b).await?;
+            std::net::Ipv4Addr::from(b).to_string()
+        }
+        0x04 => {
+            let mut b = [0u8; 16];
+            read_exact_or(&mut stream, &mut b).await?;
+            std::net::Ipv6Addr::from(b).to_string()
+        }
+        0x03 => {
+            let mut l = [0u8; 1];
+            read_exact_or(&mut stream, &mut l).await?;
+            let mut b = vec![0u8; l[0] as usize];
+            read_exact_or(&mut stream, &mut b).await?;
+            String::from_utf8_lossy(&b).to_string()
+        }
+        t => return Err(format!("不支持的 ATYP {t}")),
+    };
+    let mut pb = [0u8; 2];
+    read_exact_or(&mut stream, &mut pb).await?;
+    let port = u16::from_be_bytes(pb);
+    // 成功应答：VER REP RSV ATYP BND.ADDR(0.0.0.0) BND.PORT(0)
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((stream, format!("{host}:{port}")))
+}
+
+/** 作为 SOCKS5 客户端对上游代理发起 CONNECT（无鉴权），成功后流进入可转发状态 */
+async fn socks5_connect(
+    stream: &mut tokio::net::TcpStream,
+    dest: &str,
+) -> Result<(), String> {
+    let (host, port) = dest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("非法目标 {dest}"))?;
+    let port: u16 = port.parse().map_err(|_| format!("非法端口 {dest}"))?;
+    // greeting：只要无鉴权
+    stream.write_all(&[0x05, 0x01, 0x00]).await.map_err(|e| e.to_string())?;
+    let mut resp = [0u8; 2];
+    read_exact_or(stream, &mut resp).await?;
+    if resp[0] != 0x05 || resp[1] != 0x00 {
+        return Err(format!("上游拒绝无鉴权 (method {})", resp[1]));
+    }
+    // request：按 host 形态选 ATYP
+    let mut req = vec![0x05, 0x01, 0x00];
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        req.push(0x01);
+        req.extend_from_slice(&v4.octets());
+    } else if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        req.push(0x04);
+        req.extend_from_slice(&v6.octets());
+    } else {
+        let b = host.as_bytes();
+        if b.len() > 255 {
+            return Err("域名过长".to_string());
+        }
+        req.push(0x03);
+        req.push(b.len() as u8);
+        req.extend_from_slice(b);
+    }
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).await.map_err(|e| e.to_string())?;
+    // response: VER CMD RSV ATYP ...
+    let mut r = [0u8; 4];
+    read_exact_or(stream, &mut r).await?;
+    if r[1] != 0x00 {
+        return Err(format!("上游 CONNECT 失败 (REP {})", r[1]));
+    }
+    let skip = match r[3] {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => {
+            let mut l = [0u8; 1];
+            read_exact_or(stream, &mut l).await?;
+            l[0] as usize
+        }
+        _ => return Err(format!("上游回包 ATYP {}", r[3])),
+    };
+    let mut rest = vec![0u8; skip + 2];
+    read_exact_or(stream, &mut rest).await?;
+    Ok(())
 }

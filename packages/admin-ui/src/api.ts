@@ -74,6 +74,10 @@ export interface ServiceListItem {
   lastStartDurationMs?: number;
   /** 域名路由列表（供面板跳转） */
   hosts?: string[];
+  /** 专属端口路由列表（端口模式服务） */
+  ports?: number[];
+  /** SOCKS5 服务模式（ports[0] 为 SOCKS 端口） */
+  socks?: boolean;
 }
 
 /** 服务详情（列表项字段 + 扩展信息） */

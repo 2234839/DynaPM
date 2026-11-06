@@ -320,11 +320,12 @@ async fn run(cfg: DynaPMConfig, port_explicit: bool) -> Result<(), String> {
 
     // 端口路由：passthrough 服务走 TCP 直通，其余起独立 HTTP 代理监听
     for (port, mapping) in gw.port_routes_snapshot() {
-        if mapping.service.config.passthrough {
-            gw.start_passthrough_listener(port, mapping);
+        let h = if mapping.service.config.passthrough {
+            gw.start_passthrough_listener(port, mapping)
         } else {
-            gw.start_port_http_listener(port, mapping);
-        }
+            gw.start_port_http_listener(port, mapping)
+        };
+        gw.register_port_listener(port, h);
     }
 
     gw.start_idle_reaper();

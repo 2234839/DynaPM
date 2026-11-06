@@ -113,6 +113,9 @@ pub struct ServiceConfigInput {
     pub proxy_only: Option<bool>,
     /// TCP 直通模式
     pub passthrough: Option<bool>,
+    /// passthrough 端口以 SOCKS5 服务对外：客户端握手后按其 CONNECT 目标转发上游
+    /// （上游本身是 SOCKS 代理时直接透传目标，网关只做生命周期管理与活跃记账）
+    pub socks: Option<bool>,
     /// netns 模式：服务在零权限 user+net namespace 内运行，宿主机零端口占用
     /// （网关经 UDS 泵转发；与 passthrough 互斥）
     pub netns: Option<bool>,
@@ -214,6 +217,8 @@ pub struct ServiceConfig {
     pub proxy_only: bool,
     /// TCP 直通模式
     pub passthrough: bool,
+    /// SOCKS5 服务模式（依赖 passthrough）
+    pub socks: bool,
     /// netns 模式（宿主机零端口占用，UDS 泵转发）
     pub netns: bool,
     /// 常驻软预热
@@ -463,6 +468,7 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
             health_check: sc.health_check.clone(),
             proxy_only: sc.proxy_only.unwrap_or(false),
             passthrough: sc.passthrough.unwrap_or(false),
+            socks: sc.socks.unwrap_or(false),
             netns: sc.netns.unwrap_or(false),
             keep_warm,
             admin_panel,
@@ -473,6 +479,18 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
         if service.netns && service.passthrough {
             return Err(format!(
                 "[{}] netns 与 passthrough 互斥：TCP 直通需要宿主机端口，netns 模式不占用端口",
+                service.name
+            ));
+        }
+        if service.socks && !service.passthrough {
+            return Err(format!(
+                "[{}] socks 模式依赖 passthrough：需同时声明 passthrough=true",
+                service.name
+            ));
+        }
+        if service.socks && !service.passthrough {
+            return Err(format!(
+                "[{}] socks 模式依赖 passthrough：需同时声明 passthrough=true",
                 service.name
             ));
         }

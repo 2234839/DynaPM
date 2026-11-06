@@ -71,8 +71,12 @@ pub async fn list_services(
     // 收集各服务的域名路由（供面板生成跳转链接）
     let mut hosts_by_service: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // 收集各服务的专属端口路由（端口模式服务无域名，面板展示端口）
+    let mut ports_by_service: std::collections::HashMap<String, Vec<u16>> =
+        std::collections::HashMap::new();
     for rt in gw.all_runtimes() {
         hosts_by_service.entry(rt.config.name.clone()).or_default();
+        ports_by_service.entry(rt.config.name.clone()).or_default();
     }
     for (host, mapping) in gw.hostname_routes_snapshot() {
         hosts_by_service
@@ -80,8 +84,15 @@ pub async fn list_services(
             .or_default()
             .push(host.clone());
     }
+    for (port, mapping) in gw.port_routes_snapshot() {
+        ports_by_service
+            .entry(mapping.service.config.name.clone())
+            .or_default()
+            .push(port);
+    }
     for rt in gw.all_runtimes() {
         let hosts = hosts_by_service.get(&rt.config.name).cloned().unwrap_or_default();
+        let ports = ports_by_service.get(&rt.config.name).cloned().unwrap_or_default();
         // 闲置回收倒计时（ms）：online 且无活跃连接时 = 阈值 - (now - lastAccess)，其余 null
         let idle_remaining_ms = {
             let threshold = if rt.config.keep_warm { rt.config.warm_idle_timeout } else { rt.config.idle_timeout };
@@ -94,6 +105,8 @@ pub async fn list_services(
             "name": rt.config.name,
             "base": rt.config.base,
             "hosts": hosts,
+            "ports": ports,
+            "socks": rt.config.socks,
             "status": rt.status().as_str(),
             "uptime": rt.session_uptime_ms(),
             "lastAccessTime": rt.last_access_ms.load(Ordering::Relaxed),
