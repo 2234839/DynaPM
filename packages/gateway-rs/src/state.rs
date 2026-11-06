@@ -65,6 +65,10 @@ pub struct ServiceRuntime {
     pub total_request_ms: AtomicI64,
     /** 持久化历史统计（mmap 文件，30 天分钟请求桶 + 存活区间；打开失败为 None） */
     pub stats: Option<StatsFile>,
+    /// 最近一次启动失败的开始时刻（unix 毫秒，0 = 无失败记录）
+    pub last_start_fail_ms: AtomicI64,
+    /// 连续启动失败次数（成功启动清零；冷却时长按次数指数退避）
+    pub start_fail_streak: AtomicU64,
     /** 上次 CPU 采样 (jiffies, unix_ms)，用于差值计算 CPU% */
     pub proc_cpu_last: Mutex<Option<(u64, u64)>>,
 }
@@ -73,6 +77,7 @@ impl ServiceRuntime {
     /// 创建运行时（初始状态与 Bun 版一致：proxyOnly 为 online，否则 offline）
     pub fn new(config: ServiceConfig) -> Arc<Self> {
         let initial = if config.proxy_only { Status::Online } else { Status::Offline };
+        let paused = crate::procreg::is_paused(&config.name);
         let stats = crate::stats::open_for(&config.name);
         let (tx, rx) = watch::channel(initial);
         let now = now_ms();
@@ -89,12 +94,45 @@ impl ServiceRuntime {
             start_time_ms: Mutex::new(None),
             start_count: AtomicU64::new(0),
             total_uptime_ms: AtomicI64::new(0),
-            paused: AtomicBool::new(false),
+            // 彻底关停意图持久化：磁盘是事实源（否则网关重启后被用户 disable 的服务会被按需拉起复活）
+            paused: AtomicBool::new(paused),
             request_count: AtomicU64::new(0),
             total_request_ms: AtomicI64::new(0),
             stats,
             proc_cpu_last: Mutex::new(None),
+            last_start_fail_ms: AtomicI64::new(0),
+            start_fail_streak: AtomicU64::new(0),
         })
+    }
+
+    /// 记录一次启动失败（进入/延长冷却期）
+    pub fn note_start_failure(&self) {
+        self.start_fail_streak.fetch_add(1, Ordering::Relaxed);
+        self.last_start_fail_ms.store(now_ms() as i64, Ordering::Relaxed);
+    }
+
+    /// 启动成功：清空连续失败计数与冷却
+    pub fn clear_start_failure(&self) {
+        self.start_fail_streak.store(0, Ordering::Relaxed);
+        self.last_start_fail_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// 冷却剩余毫秒数（0 = 不在冷却期）
+    /// 冷却时长 = start_timeout << min(streak-1, 4)，上限 10 分钟：
+    /// 故障服务（如容器镜像损坏反复秒退）不能以 start_timeout 为周期无限霸占冷启动槽位
+    pub fn start_cooldown_remaining_ms(&self) -> u64 {
+        let fail_ms = self.last_start_fail_ms.load(Ordering::Relaxed);
+        if fail_ms == 0 {
+            return 0;
+        }
+        let streak = self.start_fail_streak.load(Ordering::Relaxed);
+        let base = self.config.start_timeout.max(10_000);
+        let cooldown = (base << (streak - 1).min(4)).min(600_000);
+        let since = now_ms() as i64 - fail_ms;
+        if since < 0 {
+            return cooldown
+        }
+        (cooldown as i64 - since).max(0) as u64
     }
 
     /// 当前状态
@@ -217,6 +255,15 @@ pub async fn start(service: &ServiceConfig) -> Result<u32, String> {
     let fast_path = service.commands.start_exec.is_some();
     if is_running(service, fast_path).await {
         logger::info(&format!("[{}] 服务已在运行，跳过启动", service.name));
+        // 端口被占但网关无簿记（手动起的服务/网关重启后）：反查收编，后续关停可直接杀组
+        let port = health::resolve_service_port(service);
+        if service.commands.start_exec.is_none() && !service.netns {
+            if let (Some(p), None) = (port, crate::procreg::lookup(&service.name)) {
+                if let Some(pgid) = crate::procreg::adopt_by_port(&service.name, p) {
+                    logger::info(&format!("[{}] 已收编端口 {} 的现有进程组 {}", service.name, p, pgid));
+                }
+            }
+        }
         return Ok(0);
     }
     if !fast_path && service.commands.start.trim().is_empty() {
@@ -235,7 +282,12 @@ pub async fn start(service: &ServiceConfig) -> Result<u32, String> {
         if service.netns {
             return spawn_netns_direct(args, service).await;
         }
-        return executor::spawn_direct(args, &opts).await;
+        let pgid = executor::spawn_direct(args, &opts).await?;
+        // 直启路径同样落盘登记（否则网关重启后 stop 只剩端口反查一级兑底）
+        if pgid > 0 {
+            crate::procreg::register(&service.name, pgid);
+        }
+        return Ok(pgid);
     }
     // bash 通用方式：启动命令是长驻/后台拉起，不需要收集输出，
     // stdio 直接 null 免掉退出后的 drain 等待与 pipe-EOF 问题
@@ -265,6 +317,10 @@ pub async fn start(service: &ServiceConfig) -> Result<u32, String> {
             result.stderr.trim(),
             result.stdout.trim()
         ));
+    }
+    // pgid 落盘：网关重启后内存态丢失，关停时从磁盘恢复簿记直接杀组（不再依赖 pkill -f）
+    if result.pgid > 0 {
+        crate::procreg::register(&service.name, result.pgid);
     }
     Ok(result.pgid)
 }
@@ -305,14 +361,56 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// 停止服务：执行 stop 命令（如有），随后在 stopWaitMs 内等待端口关闭；
-/// 超时则对 start 拉起的进程组 SIGKILL 兑底（孤儿服务链不可优雅终止时保收敛）
-pub async fn stop(
-    rt: &ServiceRuntime,
-    stop_timeout_ms: u64,
-    stop_wait_ms: u64,
-) -> Result<(), String> {
+/** SIGTERM 后给优雅退出的观察窗口 */
+const STOP_TERM_GRACE_MS: u64 = 2_000;
+/** SIGKILL 后给内核回收的观察窗口 */
+const STOP_KILL_GRACE_MS: u64 = 3_000;
+
+/// 探活当前是否仍有服务实例存活（netns 走 UDS，普通服务走端口）
+async fn service_alive(service: &ServiceConfig) -> bool {
+    if service.netns {
+        crate::netns::check_uds_http(&crate::netns::sock_path(&service.name)).await
+    } else {
+        match health::resolve_service_port(service) {
+            Some(port) => health::check_tcp_port("127.0.0.1", port).await,
+            None => false,
+        }
+    }
+}
+
+/// 停止服务：执行 stop 命令（如有）后不再被动干等，而是主动升级——
+/// 先对 start 拉起的进程组 SIGTERM 给优雅退出窗口，超窗未死立即 SIGKILL，
+/// 只在 KILL 窗口内做最终确认；总耗时上界 = 命令本身 + 约 5 秒，与配置的等待时长无关
+pub async fn stop(rt: &ServiceRuntime, stop_timeout_ms: u64) -> Result<(), String> {
     let service = &rt.config;
+    // proxyOnly：网关从不拉起它的进程，base 端口的监听者是外部服务，
+    // 做端口收编/杀组会误杀别人（网关退出时 cleanup 会 stop 全部 Online 服务，含 proxyOnly）
+    if service.proxy_only {
+        return Ok(());
+    }
+    // pgid 真相源优先级：端口反查 > 内存簿记 > 磁盘登记簿 > netns groupfile。
+    // 端口占用者的进程组才是"要杀的对象"（判死标准就是端口关闭）——
+    // 登记簿可能过期（手动起过服务、上一次收编后进程已换代），盲信旧簿记会杀错组
+    let mut pgid = None;
+    if !service.netns {
+        if let Some(p) = health::resolve_service_port(service) {
+            pgid = crate::procreg::adopt_by_port(&service.name, p);
+        }
+    }
+    if pgid.is_none() {
+        pgid = rt.start_pgid.lock().unwrap().or_else(|| crate::procreg::lookup(&service.name));
+    }
+    if pgid.is_none() && service.netns {
+        // netns 路径：从 groupfile 恢复组长 pgid（网关崩溃重启后内存态丢失，
+        // 不读它则 ns 内服务进程无法被组信号升级，stop 只能杀泵留孤儿）
+        if let Ok(s) = std::fs::read_to_string(crate::netns::pump_group_path(&service.name)) {
+            if let Ok(g) = s.trim().parse::<u32>() {
+                if g > 1 && crate::procreg::group_alive(g) {
+                    pgid = Some(g);
+                }
+            }
+        }
+    }
     if let Some(stop_cmd) = &service.commands.stop {
         let opts = CommandOptions {
             cwd: service.commands.cwd.clone(),
@@ -323,69 +421,56 @@ pub async fn stop(
         let result = executor::execute(stop_cmd, &opts).await;
         if result.exit_code != 0 {
             logger::warn(&format!(
-                "[{}] 停止命令退出码 {}（继续等待端口关闭）",
+                "[{}] 停止命令退出码 {}（继续主动升级停止）",
                 service.name, result.exit_code
             ));
         }
     }
-    // netns 模式：整组兑底杀进程（bash/泵/服务进程同 pgid），
-    // 用户 stop 命令可能匹配不到跨 netns 的同名进程
-    if service.netns {
-        let pgid = *rt.start_pgid.lock().unwrap();
+    // 第 1 阶段：SIGTERM 进程组 + 优雅窗口轮询（用户 stop 命令可能只杀了
+    // pidfile 记录的 wrapper，真正占端口的孙进程仍靠 pgid 兜住）
+    if let Some(g) = pgid {
+        executor::signal_process_group(g, libc::SIGTERM);
+    }
+    if !wait_dead(service, STOP_TERM_GRACE_MS).await {
+        // 第 2 阶段：SIGKILL 强杀（bash 包裹层 + 泵 + 服务进程同组）
         if let Some(g) = pgid {
+            logger::warn(&format!(
+                "[{}] 优雅退出超时，SIGKILL 进程组 {g}",
+                service.name
+            ));
             executor::kill_process_group(g);
         }
-        let sock = crate::netns::sock_path(&service.name).display().to_string();
-        let kill_pump = format!("pkill -f \"__uds-pump {sock}\" || true");
-        let opts = CommandOptions {
-            timeout_ms: Some(5_000),
-            ..Default::default()
-        };
-        let _ = executor::execute(&kill_pump, &opts).await;
-    }
-    // 等待端口真正关闭（与 Bun 版 stopService 语义一致）
-    // netns 模式：端口在 namespace 内，宿主机不可见，等待 UDS 探活消失即可
-    if service.netns {
-        let sock = crate::netns::sock_path(&service.name);
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(stop_wait_ms);
-        while tokio::time::Instant::now() < deadline {
-            if !crate::netns::check_uds_http(&sock).await {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        if service.netns {
+            let sock = crate::netns::sock_path(&service.name).display().to_string();
+            let kill_pump = format!("pkill -f \"__uds-pump {sock}\" || true");
+            let opts = CommandOptions {
+                timeout_ms: Some(5_000),
+                ..Default::default()
+            };
+            let _ = executor::execute(&kill_pump, &opts).await;
         }
-        return Ok(());
-    }
-    if let Some(port) = health::resolve_service_port(service) {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(stop_wait_ms);
-        let mut closed = false;
-        while tokio::time::Instant::now() < deadline {
-            if !health::check_tcp_port("127.0.0.1", port).await {
-                closed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if !closed {
-            // 兑底：SIGKILL start 拉起的进程组（bash 后台副本 + 服务进程）
-            let pgid = *rt.start_pgid.lock().unwrap();
-            if let Some(g) = pgid {
-                logger::warn(&format!(
-                    "[{}] 优雅停止超时，SIGKILL 进程组 {g}",
-                    service.name
-                ));
-                executor::kill_process_group(g);
-                // 给内核一点回收时间再复查
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            if let Some(port) = health::resolve_service_port(service) {
-                if health::check_tcp_port("127.0.0.1", port).await {
-                    return Err("等待服务停止超时".to_string());
-                }
-            }
+        // 第 3 阶段：强杀后最终确认
+        if !wait_dead(service, STOP_KILL_GRACE_MS).await {
+            return Err("等待服务停止超时".into());
         }
     }
+    // 确认死亡：清理簿记（内存 pgid 字段由调用方重置）
+    crate::procreg::unregister(&service.name);
     Ok(())
+}
+
+/** 轮询等待服务实例消失（端口关闭 / UDS 探活失败），返回是否在窗口内确认死亡 */
+async fn wait_dead(service: &ServiceConfig, window_ms: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(window_ms);
+    loop {
+        if !service_alive(service).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// 等待后端就绪：按服务 healthCheck 类型分派，默认 tcp 快速轮询 + 退避

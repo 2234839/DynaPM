@@ -19,7 +19,7 @@ pub enum HealthCheckType {
 }
 
 /// 健康检查配置
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HealthCheckConfig {
     /// 健康检查类型：tcp | http | command | none
@@ -38,7 +38,7 @@ pub struct HealthCheckConfig {
 }
 
 /// 服务命令配置
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ServiceCommands {
     /// 启动命令（bash 通用方式）；配置了 startExec 时可不填
@@ -161,7 +161,7 @@ pub struct TimeoutsConfig {
     /// 链路停滞超时（毫秒，响应流/WS 桥无字节进展即断开，0 = 禁用，默认 120000）
     /// 独立于 proxyTimeoutMs：长轮询/SSE 等合法空闲长连接不被 30s 代理超时误杀
     pub stall_timeout_ms: Option<u64>,
-    /// 同时冷启动的服务数上限（默认 max(1, CPU 核数-1)）
+    /// 同时冷启动的服务数上限（默认按 CPU 与内存双约束，保底 2 上限 8）
     pub start_concurrency: Option<usize>,
 }
 
@@ -196,7 +196,7 @@ pub struct DynaPMConfigInput {
 }
 
 /// 规范化后的服务配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServiceConfig {
     /// 服务标识
     pub name: String,
@@ -225,7 +225,7 @@ pub struct ServiceConfig {
 }
 
 /// 规范化后的路由
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RouteValue {
     /// hostname 路由
     Host(String),
@@ -234,7 +234,7 @@ pub enum RouteValue {
 }
 
 /// 规范化后的路由映射
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouteConfigResolved {
     /// 路由入口
     pub route: RouteValue,
@@ -270,7 +270,7 @@ pub struct DynaPMConfig {
     pub proxy_timeout_ms: u64,
     /// 链路停滞超时（毫秒，0 = 禁用）
     pub stall_timeout_ms: u64,
-    /// 同时冷启动的服务数上限（默认 max(1, CPU 核数-1)）
+    /// 同时冷启动的服务数上限（默认按 CPU 与内存双约束，保底 2 上限 8）
     pub start_concurrency: usize,
     /// 请求日志开关
     pub enable_request_log: bool,
@@ -285,12 +285,52 @@ pub const DEFAULT_START_TIMEOUT_MS: u64 = 30_000;
 /// keepWarm 默认闲置回收阈值（毫秒）
 pub const DEFAULT_WARM_IDLE_TIMEOUT_MS: u64 = 30_000;
 
-/** 默认冷启动并发上限：留一核服务在飞请求，最低 1 */
+/**
+ * 读取本进程内存上限（MB）：cgroup v2 memory.max 与 /proc/meminfo MemTotal 取小。
+ * 容器化部署时 cgroup 限额才是真实可用内存；读不到返回 0（视为不限）。
+ */
+fn system_memory_limit_mb() -> u64 {
+    let mut limit = read_meminfo_total_mb().unwrap_or(u64::MAX);
+    if let Ok(text) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        // cgroup v2："max" 表示不限
+        if let Ok(v) = text.trim().parse::<u64>() {
+            limit = limit.min(v / 1024 / 1024);
+        }
+    }
+    if limit == u64::MAX {
+        0
+    } else {
+        limit
+    }
+}
+
+/** 从 /proc/meminfo 读 MemTotal（MB） */
+fn read_meminfo_total_mb() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // 单位 kB（实为 KiB）
+            return rest.trim().split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb / 1024);
+        }
+    }
+    None
+}
+
+/**
+ * 默认冷启动并发上限：按系统实际情况双约束——
+ * CPU 上限 = 核数（冷启动主要是进程/IO 等待，不必减一）；
+ * 内存上限 = 总内存 / 512MB（单次冷启动预算）；
+ * 保底 2：单槽位会被一个故障服务的重试循环长期饿死（配合失败冷却双保险），
+ * 上限 8 防止大机冷启动风暴。timeouts.startConcurrency 可显式覆盖。
+ */
 fn default_start_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(1))
-        .unwrap_or(1)
-        .max(1)
+    let cpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .max(2);
+    let mem_mb = system_memory_limit_mb();
+    let mem_bound: usize = if mem_mb == 0 { 8 } else { (mem_mb / 512).max(1) as usize };
+    cpu.min(mem_bound).clamp(2, 8)
 }
 
 /// 从 JSON 文本加载并规范化配置
@@ -303,11 +343,57 @@ pub fn load_config_from_str(content: &str) -> Result<DynaPMConfig, String> {
     resolve_config(input)
 }
 
-/// 从文件加载配置（`DYNAPM_CONFIG` 环境变量优先，默认 `./dynapm.config.json`）
+/// 用户级默认配置路径（~/.config/dynapm/dynapm.config.json），目录不存在则创建。
+/// sudo 环境下 HOME=/root 会指错人：优先用 SUDO_USER 的真实 home（getent 解析）
+fn user_config_path() -> std::path::PathBuf {
+    let home = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .and_then(|u| {
+            let out = std::process::Command::new("getent")
+                .arg("passwd")
+                .arg(&u)
+                .output()
+                .ok()?;
+            let line = String::from_utf8_lossy(&out.stdout);
+            let field = line.split(':').nth(5)?.to_string();
+            if field.is_empty() { None } else { Some(field) }
+        })
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| ".".to_string());
+    let dir = std::path::Path::new(&home).join(".config/dynapm");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("dynapm.config.json")
+}
+
+/// 配置文件路径解析：DYNAPM_CONFIG 显式指定 > 当前目录 dynapm.config.json > 用户级默认。
+/// 用户级文件不存在时自动创建最小骨架（dev 用户开箱即用，无需手写配置）
+pub fn config_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("DYNAPM_CONFIG") {
+        return std::path::PathBuf::from(p);
+    }
+    let local = std::path::PathBuf::from("dynapm.config.json");
+    if local.exists() {
+        return local;
+    }
+    let user = user_config_path();
+    if !user.exists() {
+        // 骨架默认带 adminApi.host：dev 用户面板固定用 http://dynapm.localhost 访问
+        let skeleton = serde_json::json!({
+            "host": "127.0.0.1",
+            "adminApi": { "host": "dynapm.localhost" },
+            "services": {}
+        });
+        let _ = std::fs::write(&user, serde_json::to_string_pretty(&skeleton).unwrap());
+    }
+    user
+}
+
+/// 从文件加载配置（路径解析见 [`config_path`]）
 pub fn load_config() -> Result<DynaPMConfig, String> {
-    let path = std::env::var("DYNAPM_CONFIG").unwrap_or_else(|_| "dynapm.config.json".to_string());
+    let path = config_path();
     let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取配置 {path} 失败: {e}"))?;
+        .map_err(|e| format!("读取配置 {} 失败: {e}", path.display()))?;
     load_config_from_str(&content)
 }
 
@@ -422,7 +508,8 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
     }
 
     Ok(DynaPMConfig {
-        port: input.port.unwrap_or(3000),
+        // 默认 80：子域名免端口号是 dev 体验首选；未显式配置时无权限绑定会自动回退冷门端口
+        port: input.port.unwrap_or(80),
         host: input.host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
         services: services.iter().map(|(_, s, _)| s.clone()).collect(),
         resolved_routes,

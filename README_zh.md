@@ -652,6 +652,8 @@ ISC
 
 ## 📮 支持
 
+[![扫码加入微信群](https://tsfullstack.heartstack.space/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
+
 - 🐛 **Bug 报告**：[GitHub Issues](https://github.com/2234839/DynaPM/issues)
 - 💡 **功能建议**：[GitHub Discussions](https://github.com/2234839/DynaPM/discussions)
 - 👤 **作者**：崮生

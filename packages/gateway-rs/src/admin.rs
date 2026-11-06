@@ -74,7 +74,7 @@ pub async fn list_services(
     for rt in gw.all_runtimes() {
         hosts_by_service.entry(rt.config.name.clone()).or_default();
     }
-    for (host, mapping) in gw.hostname_routes.iter() {
+    for (host, mapping) in gw.hostname_routes_snapshot() {
         hosts_by_service
             .entry(mapping.service.config.name.clone())
             .or_default()
@@ -179,9 +179,9 @@ fn proc_metrics(rt: &ServiceRuntime) -> serde_json::Value {
 /// authToken 脱敏占位值（GET 返回、PUT 保存时还原为真实值）
 const TOKEN_REDACTED: &str = "***";
 
-/// 配置文件路径（DYNAPM_CONFIG 或默认）
-fn config_path() -> String {
-    std::env::var("DYNAPM_CONFIG").unwrap_or_else(|_| "dynapm.config.json".to_string())
+/// 配置文件路径（与 loader 同一解析规则：DYNAPM_CONFIG > 当前目录 > 用户级默认）
+fn config_path() -> std::path::PathBuf {
+    crate::config::config_path()
 }
 
 /// GET /_dynapm/api/config：返回配置文件 JSON（adminApi.authToken 脱敏）
@@ -257,12 +257,15 @@ pub async fn put_config(
     }
     let content = serde_json::to_string_pretty(&v).unwrap_or_default();
     // 语义校验：必须能通过 loader 规范化，防止写入坏配置导致重启失败循环
-    if let Err(e) = crate::config::load_config_from_str(&content) {
-        return json_response(axum::http::StatusCode::BAD_REQUEST, &serde_json::json!({ "error": format!("配置校验失败: {e}") }));
-    }
+    let new_cfg = match crate::config::load_config_from_str(&content) {
+        Ok(c) => c,
+        Err(e) => return json_response(axum::http::StatusCode::BAD_REQUEST, &serde_json::json!({ "error": format!("配置校验失败: {e}") })),
+    };
+    // 写回前快照旧配置，用于热更判定（仅路由/服务变更可热更）
+    let old_cfg = crate::config::load_config().ok();
     // 原子写回：tmp + rename（文件 IO 放阻塞线程池）
     let path = config_path();
-    let tmp = format!("{path}.tmp");
+    let tmp = format!("{}.tmp", path.display());
     let write_result = tokio::task::spawn_blocking(move || {
         std::fs::write(&tmp, &content).and_then(|_| std::fs::rename(&tmp, &path))
     })
@@ -271,10 +274,17 @@ pub async fn put_config(
     if let Err(e) = write_result {
         return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": format!("写入配置失败: {e}") }));
     }
+    // 热更判定：监听参数/超时参数/admin token 变化无法原地生效，走自重启；
+    // 仅服务与路由变更时原子替换路由表（在线服务不中断）
+    let hot_reloadable = !old_cfg.map(|o| config_affects_process(&o, &new_cfg)).unwrap_or(true);
+    if hot_reloadable {
+        gw.reload(&new_cfg).await;
+        return json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "reloaded": true }));
+    }
     // 延迟自重启：等响应先发出去（systemd Restart 拉起新进程加载新配置）
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        logger::info("📝 配置已更新，网关自重启加载新配置...");
+        logger::info("📝 配置已更新（含不可热更字段），网关自重启加载新配置...");
         let under_systemd = std::path::Path::new("/run/systemd/system").exists();
         if under_systemd {
             // fork+exec 放阻塞线程池，避免在 async 上下文直接 fork
@@ -287,6 +297,109 @@ pub async fn put_config(
         }
     });
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "restarting": true }))
+}
+
+/// GET /_dynapm/api/info：网关实例信息。
+/// CLI 用 binaryMtime/startedAt 判断运行实例是否为旧版本（cargo build 原地替换二进制后，
+/// 运行中进程的启动时刻早于新二进制 mtime 即为旧实例）
+pub async fn get_info(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    axum::Extension(gw): axum::Extension<Arc<Gateway>>,
+) -> axum::response::Response {
+    if let Some(resp) = auth_check(&uri, &headers, &gw) {
+        return resp;
+    }
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    let mtime = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    json_response(axum::http::StatusCode::OK, &serde_json::json!({
+        "pid": std::process::id(),
+        "exe": exe,
+        "binaryMtime": mtime,
+        "startedAt": crate::process_start_ms(),
+    }))
+}
+
+/// POST /_dynapm/api/restart：网关自重启（二进制升级后 CLI 触发）。
+/// 网关自重启（二进制更新后 CLI 触发）：
+/// systemd 托管（Restart=always）→ 优雅退出全部服务后 exit(0)，systemd 用新二进制拉起
+/// （进程以普通用户运行时无权 systemctl restart 系统单元，唯一可靠路径就是自己退出）；
+/// 裸跑（开发机直接启动）→ 短暂延迟后 spawn 自身新实例接管端口，再退出
+pub async fn restart_gateway(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    axum::Extension(gw): axum::Extension<Arc<Gateway>>,
+) -> axum::response::Response {
+    if let Some(resp) = auth_check(&uri, &headers, &gw) {
+        return resp;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        logger::info("🔄 收到重启指令（二进制已更新），网关自重启...");
+        gw.cleanup().await;
+        let under_systemd = std::path::Path::new("/run/systemd/system").exists();
+        if !under_systemd {
+            if let Ok(exe) = std::env::current_exe() {
+                // 延迟 1s 让本进程端口先释放，新实例再启动（避免单例探测误判）；
+                // 环境变量（含 DYNAPM_CONFIG）自动继承，无需传参；独立进程组防连带杀
+                use std::os::unix::process::CommandExt;
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("sleep 1; exec '{}'", exe.display()))
+                    .process_group(0)
+                    .spawn();
+            }
+        }
+        std::process::exit(0);
+    });
+    json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "restarting": true }))
+}
+
+/** 判断配置变化是否影响进程级参数（监听地址/超时/并发/admin 鉴权），true = 只能重启生效 */
+fn config_affects_process(old: &crate::config::DynaPMConfig, new: &crate::config::DynaPMConfig) -> bool {
+    old.port != new.port
+        || old.host != new.host
+        || old.stop_wait_ms != new.stop_wait_ms
+        || old.stop_timeout_ms != new.stop_timeout_ms
+        || old.proxy_timeout_ms != new.proxy_timeout_ms
+        || old.stall_timeout_ms != new.stall_timeout_ms
+        || old.start_concurrency != new.start_concurrency
+        || old.admin_api.as_ref().map(|a| (a.host.clone(), a.port, a.auth_token.clone()))
+            != new.admin_api.as_ref().map(|a| (a.host.clone(), a.port, a.auth_token.clone()))
+}
+
+/** POST /_dynapm/api/reload：从磁盘重读配置并热加载（供 CLI/外部文件 watch 触发） */
+pub async fn reload_config(
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    axum::Extension(gw): axum::Extension<Arc<Gateway>>,
+) -> axum::response::Response {
+    if let Some(resp) = auth_check(&uri, &headers, &gw) {
+        return resp;
+    }
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(e) => return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": format!("配置读取失败: {e}") })),
+    };
+    // 热加载只能更新路由/服务；超时参数固化在 Gateway 字段上无法原地替换
+    let process_changed = gw.proxy_timeout_ms != cfg.proxy_timeout_ms
+        || gw.stall_timeout_ms != cfg.stall_timeout_ms
+        || gw.stop_wait_ms != cfg.stop_wait_ms
+        || gw.stop_timeout_ms != cfg.stop_timeout_ms;
+    if process_changed {
+        return json_response(
+            axum::http::StatusCode::CONFLICT,
+            &serde_json::json!({ "error": "配置含进程级参数变更（端口/超时/admin token），无法热加载，请通过 PUT /_dynapm/api/config 触发重启" }),
+        );
+    }
+    gw.reload(&cfg).await;
+    json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "reloaded": true }))
 }
 
 /// GET /_dynapm/api/stats：各服务历史统计（分钟请求桶 + 存活区间 + 进程资源），供面板图表
@@ -369,6 +482,8 @@ pub async fn service_detail(
         "requestCount": rt.request_count.load(Ordering::Relaxed),
         "totalRequestMs": rt.total_request_ms.load(Ordering::Relaxed),
         "lastStartError": rt.last_start_error.lock().unwrap().clone(),
+        "startFailStreak": rt.start_fail_streak.load(Ordering::Relaxed),
+        "cooldownRemainingMs": rt.start_cooldown_remaining_ms(),
     });
     json_response(axum::http::StatusCode::OK, &detail)
 }
@@ -456,6 +571,7 @@ pub async fn disable_service(
         }
     };
     rt.paused.store(true, Ordering::Relaxed);
+    crate::procreg::set_paused(&name, true);
     match gw.stop_service(rt).await {
         Ok(()) => {
             logger::info(&format!("🛑 [{}] 已彻底关停（禁止按需拉起）", name));
@@ -488,6 +604,7 @@ pub async fn enable_service(
         }
     };
     rt.paused.store(false, Ordering::Relaxed);
+    crate::procreg::set_paused(&name, false);
     logger::info(&format!("✅ [{}] 已解除彻底关停", name));
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "success": true, "paused": false }))
 }

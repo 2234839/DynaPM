@@ -103,6 +103,18 @@ impl StatsFile {
             sf.wr_u32(OFF_SPAN_LEN, 0);
             sf.wr_u64(OFF_LAST_MIN, 0);
         }
+        // 崩溃恢复：上次网关进程死亡时来不及写 offline，最后一个存活段
+        // 会永远停在 SPAN_OPEN——既导致读取侧把已死服务当"进行中"，
+        // 又让 record_status 的幂等检查跳过新会话的开段。这里闭合到当前时刻
+        let head = sf.rd_u32(OFF_SPAN_HEAD) as usize;
+        let len = sf.rd_u32(OFF_SPAN_LEN) as usize;
+        if len > 0 {
+            let last = (head + SPANS - 1) % SPANS;
+            let slot = OFF_SPANS + last * 16 + 8;
+            if sf.rd_u64(slot) == SPAN_OPEN {
+                sf.wr_u64(slot, now_ms());
+            }
+        }
         Some(sf)
     }
 
@@ -163,8 +175,7 @@ impl StatsFile {
     }
 
     /// 记录状态变化：online 开新段（幂等），offline 关闭进行段
-    pub fn record_status(&self, online: bool) {
-        let now = now_ms();
+    pub fn record_status(&self, online: bool) {        let now = now_ms();
         let head = self.rd_u32(OFF_SPAN_HEAD) as usize;
         let len = self.rd_u32(OFF_SPAN_LEN) as usize;
         if online {

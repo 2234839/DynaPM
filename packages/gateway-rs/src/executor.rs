@@ -52,8 +52,12 @@ impl Default for CommandOptions {
 /// 杀掉整个进程组（负 pid 即 pgid；bash 经 process_group(0) 成为组长）
 /// 纯 libc 直调（无 fork+wait），微秒级返回，可在任意上下文安全调用
 pub fn kill_process_group(pgid: u32) {
-    // kill(pgid, SIGKILL)：等效 shell 的 kill -9 -- -<pgid>
-    unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+    signal_process_group(pgid, libc::SIGKILL);
+}
+
+/** 对整个进程组发送指定信号（负 pid 即 pgid；SIGTERM 优雅 / SIGKILL 强杀） */
+pub fn signal_process_group(pgid: u32, sig: i32) {
+    unsafe { libc::kill(-(pgid as i32), sig) };
 }
 
 /// 执行 bash 命令并返回结果（等 bash 退出；超时 kill 进程组返回 124）

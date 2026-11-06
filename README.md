@@ -1,14 +1,14 @@
 # DynaPM
 
-[中文文档](./README_zh.md)
-
-> ⚠️ **当前主实现为 Rust 版 [`packages/gateway-rs`](./packages/gateway-rs)**（单文件原生二进制）。原 Bun/TS 版（packages/gateway）已废弃，仅保留 [README 墓碑](./packages/gateway/README.md)；本文档部分章节描述的是旧版行为。
+[中文文档 (Chinese Documentation)](./README_zh.md)
 
 > **Dynamic Process Manager** - A lightweight, universal service management system with serverless-like features.
+>
+> ⚙️ The current implementation is a single-file native Rust binary ([`packages/gateway-rs`](./packages/gateway-rs)). The legacy Bun/TS version is deprecated (only a [README tombstone](./packages/gateway/README.md) remains).
 
-[![npm version](https://badge.fury.io/js/dynapm.svg)](https://www.npmjs.com/package/dynapm) ![Tests](https://img.shields.io/badge/tests-81%2F81%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen)
+![Tests](https://img.shields.io/badge/tests-5%2F5%20suites%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen) ![Runtime](https://img.shields.io/badge/runtime-Rust%20%2B%20tokio-orange)
 
-DynaPM is a **lightweight alternative** to complex container orchestration platforms (like Knative, Sablier) for private deployments. It helps you manage hundreds of low-frequency services on resource-constrained servers by starting them on-demand and stopping them when idle.
+DynaPM is a **lightweight alternative** to complex container orchestration platforms (like Knative, Sablier) for private deployments. It helps you manage hundreds (or thousands) of low-frequency services on resource-constrained servers by starting them on-demand and stopping them when idle.
 
 ---
 
@@ -36,7 +36,7 @@ You have many side projects or internal tools that:
 
 | Feature | DynaPM | Sablier | traefik-lazyload | Knative |
 |---------|--------|---------|------------------|---------|
-| **Technology** | **Bun** (Bun.serve) | Go | Go | Go + K8s |
+| **Technology** | **Rust** (tokio + axum, single binary) | Go | Go | Go + K8s |
 | **Scope** | ⭐ **Universal** (any process) | Docker only | Docker only | K8s only |
 | **Setup Complexity** | ⭐ **Simple** | ⭐⭐⭐ Medium | ⭐⭐⭐ Medium | ⭐⭐⭐⭐⭐ Complex |
 | **Infrastructure** | Single server | Docker/K8s | Docker + Traefik | K8s cluster |
@@ -70,11 +70,13 @@ When services are running, proxy latency is only **1-2ms**:
 📤 [myapp] POST /api/data - 200 - 2ms
 ```
 
-True streaming with **Bun.serve** - zero buffering for maximum throughput!
+True bidirectional streaming (request body → upstream, response body → client) with **zero buffering** — the only time DynaPM buffers is when a request arrives while the service is still cold-starting.
+
+Slow clients can't hold upstream connections hostage: `timeouts.stallTimeoutMs` (default 120s, `0` disables) disconnects a stream or WebSocket where **not a single chunk** arrives within the window. `proxyTimeoutMs` only covers *connect → response headers*, so SSE and long streaming responses are never cut off prematurely.
 
 ### 🌐 **SSE & WebSocket Support**
 
-DynaPM supports modern real-time protocols out of the box:
+DynaPM supports modern real-time protocols out of the box — WebSocket upgrades are sniffed and taken over on **any path** (no rewrite rules needed):
 
 **Server-Sent Events (SSE):**
 ```log
@@ -153,8 +155,8 @@ Test Environment: Node.js HTTP Server (autocannon benchmark)
 ✅ Stream proxy:     Avg 10.3ms (range: 9-12ms)
 ✅ Throughput:       5,942 req/s (multi-service, 150 concurrent)
 ✅ Load test:        Low latency even under high concurrency
-✅ Memory overhead:  ~50MB (Node.js runtime)
-✅ Bundle size:      21.7KB (minified)
+✅ Memory overhead:  ~10MB RSS (native Rust binary)
+✅ Binary size:      ~10MB (static musl build, zero runtime deps)
 ✅ Logging:          Structured JSON logging (built-in)
 ```
 
@@ -164,172 +166,115 @@ Test Environment: Node.js HTTP Server (autocannon benchmark)
 
 ### Installation
 
-```bash
-# Install globally
-npm install -g dynapm
+Build from source (Rust toolchain required):
 
-# Or use with pnpm
-pnpm install -g dynapm
+```bash
+git clone https://github.com/2234839/DynaPM.git
+cd DynaPM/packages/gateway-rs
+cargo build --release
+# Binary: target/release/dynapm
+
+# Optional: fully static build (runs on any Linux)
+RUSTFLAGS="-C target-feature=+crt-static" \
+  cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 ### Configuration
 
-Create a `dynapm.config.ts` file in your project directory:
+Create a `dynapm.config.json` file in your project directory:
 
-```typescript
-import type { DynaPMConfig } from 'dynapm';
+```jsonc
+{
+  "port": 3000,
+  "host": "127.0.0.1",
 
-const config: DynaPMConfig = {
-  port: 3000,
-  host: '127.0.0.1',
+  // Optional: timeout tuning (defaults shown)
+  "timeouts": {
+    "proxyTimeoutMs": 30000,  // connect → response headers
+    "stallTimeoutMs": 120000  // response/WS stall disconnect (0 disables)
+  },
 
   // Logging configuration (optional, disable for better performance in production)
-  logging: {
-    enableRequestLog: false,      // Enable request/response logging (high frequency, affects performance)
-    enableWebSocketLog: false,    // Enable WebSocket lifecycle logging
-    // Error logging is always enabled
+  "logging": {
+    "enableRequestLog": false,
+    "enableWebSocketLog": false
   },
 
-  services: {
-    'app.example.com': {
-      name: 'my-app',
-      base: 'http://127.0.0.1:3001',
-      idleTimeout: 5 * 60 * 1000, // Auto-stop after 5 minutes idle
-      startTimeout: 10 * 1000,    // Startup timeout
-
-      commands: {
-        start: 'nohup node /path/to/app.js > logs/app.log 2>&1 &',
-        stop: 'lsof -ti:3001 | xargs -r kill -9',
-        check: 'lsof -ti:3001 >/dev/null 2>&1',
+  "services": {
+    "my-app": {
+      "base": "http://127.0.0.1:3001",
+      "host": "app.example.com",   // route by Host header
+      "idleTimeout": 300000,        // auto-stop after 5 minutes idle
+      "startTimeout": 10000,
+      "commands": {
+        "startExec": ["node", "/path/to/app.js"]
       },
-
-      healthCheck: {
-        type: 'tcp', // TCP port check (default, no service code changes needed)
-      },
-    },
-  },
-};
-
-export default config;
+      "healthCheck": {
+        "type": "tcp"              // TCP port check (default)
+      }
+    }
+  }
+}
 ```
 
 ### Usage
 
 ```bash
 # Start the DynaPM gateway
-dynapm
+DYNAPM_CONFIG=./dynapm.config.json ./dynapm
 
-# Or use with npx
-npx dynapm
+# Admin panel: http://127.0.0.1:3000/_dynapm/panel
 ```
 
-Now access your services at `http://app.example.com:3000` - they'll start automatically!
+Requests to `http://app.example.com:3000` now start the service automatically!
 
 ---
 
 ## 🧪 Running Tests
 
-DynaPM comes with a comprehensive automated test suite covering all core features.
-
-### Quick Test
+DynaPM comes with a regression suite of 5 test suites (66 assertions) covering the gateway core.
 
 ```bash
-# Clone the project
 git clone https://github.com/2234839/DynaPM.git
-cd DynaPM
+cd DynaPM/packages/gateway-rs
 
-# Install dependencies
-pnpm install
+# Clean up leftover processes first (required on WSL: stale listeners cause TCP black holes)
+pkill -f 'release/dynapm'; pkill -f 'test/backend.ts'
 
-# Run the full test suite
-pnpm test
+# Run all 5 suites serially (requires Bun >= 1.4)
+bun test/run-all.ts
 ```
 
 ### Test Coverage
 
-The automated tests validate 81 test cases across 6 test suites:
-
-1. ✅ **On-demand start** - Services auto-start when offline
-2. ✅ **Hot start** - Direct proxy when service is running
-3. ✅ **Auto-stop** - Services auto-stop after timeout
-4. ✅ **404 handling** - Unconfigured services return 404
-5. ✅ **Multi-service** - Manage multiple services concurrently
-6. ✅ **Health checks** - TCP and HTTP check methods
-7. ✅ **Path proxying** - Different paths proxy correctly
-8. ✅ **Idle protection** - Continuous requests update idle time
-9. ✅ **POST requests** - POST method support
-10. ✅ **SSE streaming** - Server-Sent Events proxy support
-11. ✅ **WebSocket** - WebSocket bidirectional communication support
-12. ✅ **Long connections** - Active connections prevent premature shutdown
-13. ✅ **Concurrent startup** - Multiple requests to offline service
-14. ✅ **Security hardening** - Body size limits, CRLF injection protection
-15. ✅ **Port routing** - Direct port-based proxy and on-demand start
-
-### Test Output Example
-
-```
-============================================================
-Test Results Summary
-============================================================
-✓ Test 1: On-demand start (773ms)
-✓ Test 2: Hot start (service running) (11ms)
-✓ Test 3: Auto-stop (18025ms)
-✓ Test 4: 404 error handling (11ms)
-✓ Test 5: Multi-service concurrent start (843ms)
-✓ Test 6: Different health checks (20ms)
-✓ Test 7: Path proxying (10ms)
-✓ Test 8: Idle time update on continuous requests (14112ms)
-✓ Test 9: POST requests (12ms)
-✓ Test 10: SSE streaming (3963ms)
-✓ Test 11: WebSocket (1098ms)
-✓ Test 12: Long connections (10110ms)
-
-------------------------------------------------------------
-Total: 12 tests
-Passed: 12 ✓
-Failed: 0
-🎉 All tests passed!
-```
-
-### Performance Verification
-
-Tests output detailed performance logs:
+1. ✅ **test-core** (20) - hostname routing, request/response streaming, status & header passthrough, unknown-Host 404, CRLF injection stripping, 50-way concurrency
+2. ✅ **test-coldstart** (17) - on-demand start state machine, concurrent start single-flight, startup failure 503, idle reclamation, keepWarm, disable/enable
+3. ✅ **test-ws** (9) - any-path WS upgrade, subprotocol passthrough, close-code passthrough, binary frames, cold-start WS
+4. ✅ **test-limits** (9) - 413 precheck & streaming cutoff, 504 proxy timeout, stall-timeout disconnect, no false kills
+5. ✅ **test-admin** (11) - admin API, SSE lifecycle events, stats, panel, admin-plane isolation
 
 ```log
-🚀 [app1] GET / - Starting service...
-[app1] Start command executed
-✅ [app1] Service ready (startup: 8ms, wait: 17ms)
-📤 [app1] GET / - 200 - 30ms
-
-# Subsequent requests (service already running)
-📤 [app1] GET / - 200 - 1ms
-📤 [app1] POST /api/data - 200 - 2ms
+test-core:     20 passed, 0 failed
+test-coldstart: 17 passed, 0 failed
+test-ws:        9 passed, 0 failed
+test-limits:    9 passed, 0 failed
+test-admin:    11 passed, 0 failed
+========== Summary: 5/5 suites passed ==========
 ```
 
 ---
 
 ## 📊 Performance Benchmarking
 
-DynaPM includes an automated performance test script to verify system metrics.
-
-### Running Performance Tests
+Benchmarks use the built binary plus any HTTP load generator (e.g. autocannon):
 
 ```bash
-# Clone the project
-git clone https://github.com/2234839/DynaPM.git
-cd DynaPM
+npm install -g autocannon
 
-# Install dependencies
-pnpm install
-
-# Build the project
-pnpm build
-
-# Run performance benchmark
-pnpm benchmark
+cd packages/gateway-rs && cargo build --release
+# point dynapm.config.json at a backend, start the gateway, then:
+autocannon -c 50 -d 5 http://127.0.0.1:3000/
 ```
-
-### Performance Test Output
 
 ```
 🚀 DynaPM Performance Benchmark
@@ -362,26 +307,22 @@ Throughput Test (autocannon)
 
 ### Test Requirements
 
-- **Bun** (>= 1.4): Run DynaPM gateway and tests
-- **curl**: Basic functionality testing
-- **autocannon** (optional): Throughput load testing
-
-Install autocannon:
-```bash
-npm install -g autocannon
-```
+- **Rust toolchain**: Build the gateway (`cargo build --release`)
+- **Bun** (>= 1.4): Run the regression test suite
+- **curl** / **autocannon** (optional): Manual & load testing (`npm install -g autocannon`)
 
 ---
 
 ## 📖 Configuration Examples
 
-Check out [dynapm.config.example.ts](./dynapm.config.example.ts) for complete examples including:
+Check out [`packages/gateway-rs/dynapm.config.json`](./packages/gateway-rs/dynapm.config.json) for complete examples including:
 - PM2-managed Node.js apps
-- Docker containers
+- Docker containers (tip: use `http` health checks — docker-proxy accepts TCP before the app is ready)
 - systemd services
 - Direct process management
-- Environment variables
+- Port-based routing & TCP passthrough
 - Custom health checks (HTTP/TCP/Command)
+- Timeout tuning (`proxyTimeoutMs` / `stallTimeoutMs` / `stopWaitMs`)
 
 ---
 
@@ -395,11 +336,13 @@ Check out [dynapm.config.example.ts](./dynapm.config.example.ts) for complete ex
                    │
                    ▼
 ┌─────────────────────────────────────────────────┐
-│      DynaPM Gateway (Bun.serve)                  │
-│  - Check service status (memory cached)          │
-│  - Execute start command if needed (8ms)         │
-│  - Fast TCP port polling (17ms, zero-delay retry)│
-│  - Stream proxy request (1-2ms)                  │
+│      DynaPM Gateway (Rust: tokio + axum)         │
+│  - Route by Host header / dedicated port        │
+│  - On-demand start state machine (25ms)         │
+│  - Fast TCP port polling (backoff retry)        │
+│  - Bidirectional stream proxy (zero buffering)  │
+│  - Any-path WebSocket upgrade sniffing          │
+│  - Stall timeout for slow clients               │
 │  - Structured logging (JSON lines, built-in)     │
 └──────────────────┬──────────────────────────────┘
                    │
@@ -421,8 +364,6 @@ Check out [dynapm.config.example.ts](./dynapm.config.example.ts) for complete ex
 ---
 
 ## 📊 Performance Benchmarks
-
-All performance data measured via `pnpm benchmark` script.
 
 ### Cold Start Performance
 
@@ -463,11 +404,11 @@ Results:
 ### Resource Usage
 
 ```
-Runtime resource usage:
+Runtime resource usage (native Rust binary):
 
-├─ Memory:          ~50MB (Node.js runtime)
+├─ Memory:          ~10MB RSS
 ├─ CPU:             <1% when idle
-├─ Disk:            21.7KB (bundle size, minified)
+├─ Disk:            ~10MB (static musl binary, zero runtime deps)
 ├─ Network:         Proxy traffic only, no overhead
 └─ Logging:         Structured JSON logging (built-in)
 ```
@@ -487,83 +428,26 @@ Runtime resource usage:
 
 ## 🔧 Roadmap
 
-- [ ] 🎛️ **Web Dashboard** - Service monitoring and management UI
+- [x] 🎛️ **Web Dashboard** - Service monitoring and management UI ([admin-ui](./packages/admin-ui), Vue3 + ECharts)
+- [x] ⚡ **Rust rewrite** - Completed (tokio + axum, single-file static binary)
+- [x] 🌐 **Any-path WebSocket upgrade** - Upgrade-header sniffing on every route
+- [x] 🐌 **Slow-client stall timeout** - `timeouts.stallTimeoutMs`
 - [ ] 📈 **Prometheus Integration** - Metrics collection and visualization
 - [ ] 📋 **Service Templates** - One-click PM2/Docker config generation
 - [ ] 🔄 **Multi-instance Support** - Distributed locking and state sync
 - [ ] 🔌 **Plugin System** - Custom integrations and extensions
 - [ ] 🌐 **More Health Checks** - gRPC, Redis, etc.
-- [x] ⚡ **Bun migration** - Completed (single-runtime, bun --compile single binary)
 - [x] 📊 **Structured Logging** - Completed (JSON-line logging)
 
 ---
 
 ## 📦 Publishing Releases
 
-DynaPM uses GitHub Actions to automatically publish to npm, requiring no manual tokens or 2FA.
+Releases ship as **static musl binaries attached to GitHub Releases** (the legacy npm-publish workflow was retired along with the Bun version).
 
-### Release Process
+Planned process: update CHANGELOG → commit → tag → push → CI builds & publishes the release.
 
-The project uses **npm OIDC (OpenID Connect) Trusted Publishing**, automatically triggered by Git tags:
-
-```bash
-# Method 1: patch version (bug fixes)
-npm version patch
-git push origin main --tags
-
-# Method 2: minor version (new features)
-npm version minor
-git push origin main --tags
-
-# Method 3: major version (breaking changes)
-npm version major
-git push origin main --tags
-```
-
-### Automated Release Workflow
-
-After pushing a tag, GitHub Actions automatically:
-
-1. ✅ **Build project** - Compile TypeScript with rslib
-2. ✅ **Verify build** - Check output file integrity
-3. ✅ **Publish to npm** - Use OIDC, no tokens needed
-4. ✅ **Create Release** - Generate release notes on GitHub
-
-### Monitor Release Status
-
-- **GitHub Actions**: https://github.com/2234839/DynaPM/actions
-- **npm package**: https://www.npmjs.com/package/dynapm
-
-### Verify Release
-
-```bash
-# Check latest version
-npm view dynapm version
-
-# View version history
-npm view dynapm versions --json
-
-# Install and test
-npm install -g dynapm@latest
-```
-
-### Publishing Configuration
-
-This project uses **npm Trusted Publishing**:
-- ✅ No NPM_TOKEN environment variable needed
-- ✅ No two-factor authentication (2FA) required
-- ✅ Automatic verification via GitHub Actions OIDC
-- ✅ More secure (short-lived tokens, auto-expiry)
-
-For detailed setup: [docs/NPM_OIDC_SETUP.md](./docs/NPM_OIDC_SETUP.md)
-
-### Version Numbering
-
-Follows [Semantic Versioning](https://semver.org/):
-
-- **1.0.4** → **1.0.5** (`patch`): Bug fixes
-- **1.0.4** → **1.1.0** (`minor`): New features, backward compatible
-- **1.0.4** → **2.0.0** (`major`): Breaking changes
+Historical npm OIDC setup notes are kept in [docs/NPM_OIDC_SETUP.md](./docs/NPM_OIDC_SETUP.md).
 
 ---
 
@@ -589,12 +473,16 @@ ISC
 ## 🙏 Acknowledgments
 
 Built with amazing open-source tools:
-- [Bun](https://bun.sh/) - All-in-one JavaScript runtime & toolkit (Bun.serve, bun --compile single-file binary)
-- [c12](https://github.com/unjs/c12) - Configuration loader
+- [tokio](https://tokio.rs/) / [axum](https://github.com/tokio-rs/axum) - Async runtime & HTTP framework
+- [reqwest](https://github.com/seanmonstar/reqwest) / [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) - Upstream HTTP & WebSocket clients
+- [Bun](https://bun.sh/) - Test suite runtime
+- [Vue 3](https://vuejs.org/) / [ECharts](https://echarts.apache.org/) - Admin dashboard
 
 ---
 
 ## 📮 Support
+
+[![扫码加入微信群 / Join our WeChat group](https://tsfullstack.heartstack.space/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
 
 - 🐛 **Bug Reports**: [GitHub Issues](https://github.com/2234839/DynaPM/issues)
 - 💡 **Feature Requests**: [GitHub Discussions](https://github.com/2234839/DynaPM/discussions)

@@ -62,18 +62,28 @@ const SKIP_REQUEST_HEADERS: [&str; 4] = ["connection", "keep-alive", "content-le
 /// 不应转发的响应头（小写）
 const SKIP_RESPONSE_HEADERS: [&str; 4] = ["connection", "transfer-encoding", "keep-alive", "content-length"];
 
-/// 全局网关共享状态
-pub struct Gateway {
+/// 路由表快照：hostname/端口路由 + 服务运行时 + admin 面板域名。
+/// 整体原子替换实现配置热更新，读路径 `table.load()` 无锁
+pub struct RouteTable {
     /// admin 面板专属域名（adminApi.host，None = 不限定）
     pub admin_host: Option<String>,
-    /// hostname 路由：hostname -> 路由映射（启动后不可变，读路径无锁；配置变更走进程重启）
+    /// hostname 路由：hostname -> 路由映射
     pub hostname_routes: HashMap<String, Arc<RouteMapping>>,
-    /// 端口路由：端口 -> 路由映射（启动后不可变，读路径无锁）
+    /// 端口路由：端口 -> 路由映射
     pub port_routes: HashMap<u16, Arc<RouteMapping>>,
-    /// 按服务名索引的运行时（启动后不可变，读路径无锁）
+    /// 按服务名索引的运行时
     pub runtimes: HashMap<String, Arc<ServiceRuntime>>,
-    /// 每服务启动互斥锁：并发请求同一服务时串行化启动（启动后不可变，仅取值无锁）
-    start_locks: HashMap<String, Arc<AsyncMutex<()>>>,
+}
+
+/// 全局网关共享状态
+pub struct Gateway {
+    /// 路由表（ArcSwap 原子替换，热更新入口 reload()）
+    table: arc_swap::ArcSwap<RouteTable>,
+    /// 每服务启动互斥锁：并发请求同一服务时串行化启动（惰性创建，跨热更新保留——
+    /// 锁只增不删，保证 reload 期间旧新代码路径对同一服务仍串行化）
+    start_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// 端口路由监听任务句柄（热更新时按端口 diff 起停）
+    port_listeners: Mutex<HashMap<u16, tokio::task::AbortHandle>>,
     /// 代理请求超时（毫秒）
     pub proxy_timeout_ms: u64,
     /// 链路停滞超时（毫秒，0 = 禁用）：响应流/WS 桥无字节进展即断开，
@@ -144,11 +154,14 @@ impl Gateway {
         let (events, _) = broadcast::channel(256);
 
         Arc::new(Self {
-            admin_host,
-            hostname_routes,
-            port_routes,
-            runtimes,
-            start_locks,
+            table: arc_swap::ArcSwap::from_pointee(RouteTable {
+                admin_host,
+                hostname_routes,
+                port_routes,
+                runtimes,
+            }),
+            start_locks: Mutex::new(start_locks),
+            port_listeners: Mutex::new(HashMap::new()),
             proxy_timeout_ms,
             stall_timeout_ms,
             stop_wait_ms,
@@ -162,19 +175,14 @@ impl Gateway {
     }
 
     /// admin 面板在指定 Host 下是否可达：
-    /// 默认拒绝；仅 adminApi.host 专属域名、显式配置 adminPanel 的服务域名、
-    /// 以及本机回环（localhost/127.0.0.1/::1）放行
+    /// 默认拒绝；仅 adminApi.host 专属域名与本机回环（localhost/127.0.0.1/::1）放行，
+    /// 服务域名一律透传给后端（专属域名已是面板的唯一入口，不再每个服务挂面板）
     pub fn host_allows_admin(&self, host: &str) -> bool {
         if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
             return true;
         }
-        if self.admin_host.as_deref() == Some(host) {
-            return true;
-        }
-        self.hostname_routes
-            .get(host)
-            .map(|m| m.service.config.admin_panel)
-            .unwrap_or(false)
+        let table = self.table.load();
+        table.admin_host.as_deref() == Some(host)
     }
 
     /// 发布服务生命周期事件
@@ -187,19 +195,44 @@ impl Gateway {
         self.admin_auth_token.as_ref()
     }
 
+    /// admin 面板专属域名快照
+    pub fn admin_host(&self) -> Option<String> {
+        self.table.load().admin_host.clone()
+    }
+
     /// 全部运行时快照
     pub fn all_runtimes(&self) -> Vec<Arc<ServiceRuntime>> {
-        self.runtimes.values().cloned().collect()
+        self.table.load().runtimes.values().cloned().collect()
     }
 
     /// 按服务名查运行时
     pub fn runtime(&self, name: &str) -> Option<Arc<ServiceRuntime>> {
-        self.runtimes.get(name).cloned()
+        self.table.load().runtimes.get(name).cloned()
     }
 
     /// 已注册服务数量
     pub fn service_count(&self) -> usize {
-        self.runtimes.len()
+        self.table.load().runtimes.len()
+    }
+
+    /// hostname 路由快照（admin 面板收集域名用）
+    pub fn hostname_routes_snapshot(&self) -> Vec<(String, Arc<RouteMapping>)> {
+        self.table
+            .load()
+            .hostname_routes
+            .iter()
+            .map(|(h, m)| (h.clone(), Arc::clone(m)))
+            .collect()
+    }
+
+    /// 端口路由快照（启动监听用）
+    pub fn port_routes_snapshot(&self) -> Vec<(u16, Arc<RouteMapping>)> {
+        self.table
+            .load()
+            .port_routes
+            .iter()
+            .map(|(p, m)| (*p, Arc::clone(m)))
+            .collect()
     }
 
     /// 订阅服务生命周期事件（admin SSE）
@@ -207,25 +240,15 @@ impl Gateway {
         self.events.subscribe()
     }
 
-    /// 端口路由快照（启动监听用）
-    pub fn port_routes_snapshot(&self) -> Vec<(u16, Arc<RouteMapping>)> {
-        self.port_routes
-            .iter()
-            .map(|(p, m)| (*p, Arc::clone(m)))
-            .collect()
-    }
-
     /// admin API 主动启动：offline -> starting -> online
     pub async fn start_by_name(&self, rt: &Arc<ServiceRuntime>) -> Result<(), String> {
-        let lock = self
-            .start_locks
-            .get(&rt.config.name)
-            .cloned()
-            .expect("启动锁缺失");
+        let lock = self.start_lock(&rt.config.name);
         let _guard = lock.lock().await;
         if rt.status() == Status::Online || rt.config.proxy_only {
             return Ok(());
         }
+        // 手动启动视为人工确认：清除失败冷却，立即重试
+        rt.clear_start_failure();
         // 全局冷启动并发上限：排队等空位，防止小机被同时冷启动打爆（启动风暴）
         let _start_permit = self.start_concurrency.acquire().await;
         if rt.status() == Status::Online || rt.config.proxy_only {
@@ -235,6 +258,7 @@ impl Gateway {
         let start_begun_ms = now_ms();
         let start_result = crate::state::start(&rt.config).await;
         if let Err(e) = start_result {
+            rt.note_start_failure();
             rt.set_status(Status::Offline);
             return Err(e);
         }
@@ -243,6 +267,7 @@ impl Gateway {
         *rt.pid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
         rt.last_start_duration_ms
             .store((now_ms() - start_begun_ms) as i64, Ordering::Relaxed);
+        rt.clear_start_failure();
         rt.set_status(Status::Online);
         *rt.start_time_ms.lock().unwrap() = Some(now_ms() as i64);
         rt.start_count.fetch_add(1, Ordering::Relaxed);
@@ -261,9 +286,114 @@ impl Gateway {
         }
     }
 
+    /// 配置热更新：路由表原子替换 + 端口监听 diff + 被移除/被修改服务停机。
+    /// 同名且配置未变的服务复用现有运行时（在线服务不中断）；
+    /// 超时参数等不可热更字段由调用方（admin put_config）判断后走自重启
+    pub async fn reload(self: &Arc<Self>, cfg: &crate::config::DynaPMConfig) {
+        let old = self.table.load_full();
+
+        // 构建新运行时集合：配置未变的同名服务复用旧运行时
+        let mut new_runtimes: HashMap<String, Arc<ServiceRuntime>> = HashMap::new();
+        for (svc, resolved) in &cfg.resolved_routes {
+            let rt = match old.runtimes.get(&svc.name) {
+                Some(existing) if existing.config == *svc => Arc::clone(existing),
+                _ => ServiceRuntime::new(svc.clone()),
+            };
+            new_runtimes.insert(svc.name.clone(), Arc::clone(&rt));
+            let _ = resolved;
+        }
+
+        // 构建新路由表
+        let mut hostname_routes = HashMap::new();
+        let mut port_routes: HashMap<u16, Arc<RouteMapping>> = HashMap::new();
+        for (svc, resolved) in &cfg.resolved_routes {
+            let Some(rt) = new_runtimes.get(&svc.name) else { continue };
+            let mapping = Arc::new(RouteMapping {
+                service: Arc::clone(rt),
+                target: resolved.target.clone(),
+                target_host: resolved.target_host.clone(),
+                target_port: resolved.target_port,
+                target_https: resolved.target_https,
+            });
+            match &resolved.route {
+                RouteValue::Host(h) => {
+                    hostname_routes.insert(h.clone(), mapping);
+                }
+                RouteValue::Port(p) => {
+                    port_routes.insert(*p, mapping);
+                }
+            }
+        }
+        self.table.store(Arc::new(RouteTable {
+            admin_host: cfg.admin_api.as_ref().and_then(|a| a.host.clone()),
+            hostname_routes,
+            port_routes: port_routes.clone(),
+            runtimes: new_runtimes.clone(),
+        }));
+
+        // 端口监听 diff：新增端口起监听，移除端口 abort
+        {
+            let mut listeners = self.port_listeners.lock().unwrap();
+            let old_ports: Vec<u16> = listeners.keys().copied().collect();
+            for port in old_ports {
+                if !port_routes.contains_key(&port) {
+                    if let Some(h) = listeners.remove(&port) {
+                        h.abort();
+                        logger::info(&format!("🛑 端口 {port} 监听已移除（配置热更新）"));
+                    }
+                }
+            }
+            for (port, mapping) in port_routes {
+                if !listeners.contains_key(&port) {
+                    if mapping.service.config.passthrough {
+                        self.start_passthrough_listener(port, mapping);
+                    } else {
+                        self.start_port_http_listener(port, mapping);
+                    }
+                }
+            }
+        }
+
+        // 停掉被移除或被修改（配置变化导致运行时替换）的服务
+        let to_stop: Vec<(String, Arc<ServiceRuntime>)> = old
+            .runtimes
+            .iter()
+            .filter(|(name, old_rt)| {
+                !new_runtimes
+                    .get(*name)
+                    .map(|r| Arc::ptr_eq(r, *old_rt))
+                    .unwrap_or(false)
+            })
+            .filter(|(_, old_rt)| old_rt.status() != Status::Offline)
+            .map(|(name, old_rt)| (name.clone(), Arc::clone(old_rt)))
+            .collect();
+        for (name, rt) in to_stop {
+            logger::info(&format!("🔁 [{name}] 配置已变更/移除，停机旧实例（热更新）"));
+            let gw = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(e) = gw.stop_service(rt).await {
+                    logger::error(&format!("❌ [{name}] 热更新停机失败"), Some(&e));
+                }
+            });
+        }
+        logger::info(&format!(
+            "♻️ 配置热更新完成，当前 {} 个服务",
+            new_runtimes.len()
+        ));
+    }
+
     /// 按 Host 头查找路由
     pub fn find_hostname_route(&self, hostname: &str) -> Option<Arc<RouteMapping>> {
-        self.hostname_routes.get(hostname).cloned()
+        self.table.load().hostname_routes.get(hostname).cloned()
+    }
+
+    /// 取（惰性创建）服务启动互斥锁
+    fn start_lock(&self, name: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.start_locks.lock().unwrap();
+        locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// 确保服务在线（供启动/等待路径共用）：每服务互斥串行化
@@ -273,16 +403,26 @@ impl Gateway {
         if cfg.proxy_only || rt.status() == Status::Online {
             return Ok(());
         }
-        let lock = self
-            .start_locks
-            .get(&cfg.name)
-            .cloned()
-            .expect("启动锁缺失");
+        if cfg.proxy_only || rt.status() == Status::Online {
+            return Ok(());
+        }
+        let lock = self.start_lock(&cfg.name);
         // 持锁进入：并发请求会在锁上排队，前一个完成后后一个直接命中 online 短路
         let _guard = lock.lock().await;
 
         if cfg.proxy_only || rt.status() == Status::Online {
             return Ok(());
+        }
+
+        // 启动失败冷却：故障服务在冷却期内快速拒绝，不占用冷启动槽位也不执行启动命令
+        // （否则一个起不来的服务会以 start_timeout 为周期无限重试，长期饿死其他服务的冷启动）
+        let cooldown_left = rt.start_cooldown_remaining_ms();
+        if cooldown_left > 0 {
+            let streak = rt.start_fail_streak.load(Ordering::Relaxed);
+            return Err(format!(
+                "服务连续启动失败 {streak} 次，冷却中（剩余 {} 秒）",
+                cooldown_left / 1000
+            ));
         }
 
         // 全局冷启动并发上限（与 ensure_service_online 同策略）
@@ -311,6 +451,7 @@ impl Gateway {
         let start_begun_ms = now_ms();
         let start_result = crate::state::start(cfg).await;
         if let Err(e) = start_result {
+            rt.note_start_failure();
             rt.set_status(Status::Offline);
             *rt.last_start_error.lock().unwrap() = Some(e.clone());
             return Err(e);
@@ -320,6 +461,7 @@ impl Gateway {
         *rt.pid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
         let ready = wait_for_backend_ready(cfg, &to_resolved(mapping)).await;
         if !ready {
+            rt.note_start_failure();
             rt.set_status(Status::Offline);
             let err = format!("服务启动超时: 端口 {} 不可用", mapping.target);
             *rt.last_start_error.lock().unwrap() = Some(err.clone());
@@ -327,6 +469,7 @@ impl Gateway {
         }
         rt.last_start_duration_ms
             .store((now_ms() - start_begun_ms) as i64, Ordering::Relaxed);
+        rt.clear_start_failure();
         rt.set_status(Status::Online);
         *rt.start_time_ms.lock().unwrap() = Some(now_ms() as i64);
         rt.start_count.fetch_add(1, Ordering::Relaxed);
@@ -347,18 +490,18 @@ impl Gateway {
     /// 就绪判定之间杀掉后端，ensure 随后把状态设为 Online（实际已死），
     /// 用户会先吃一次 502 才走「后端已死」自愈路径
     pub async fn stop_service(&self, rt: Arc<ServiceRuntime>) -> Result<(), String> {
-        let lock = self
-            .start_locks
-            .get(&rt.config.name)
-            .cloned()
-            .expect("启动锁缺失");
+        let lock = self.start_lock(&rt.config.name);
         let _guard = lock.lock().await;
         if rt.status() == Status::Offline {
-            return Ok(());
+            // Offline 短路仅在上游确实无人监听时成立：端口仍被占（进程残留、
+            // 用户手动起的 dev server、网关重启后状态机归零）时 disable/stop 必须真杀
+            if !crate::state::is_running(&rt.config, true).await {
+                return Ok(());
+            }
         }
         rt.set_status(Status::Stopping);
         rt.close_session();
-        let result = crate::state::stop(&rt, self.stop_timeout_ms, self.stop_wait_ms).await;
+        let result = crate::state::stop(&rt, self.stop_timeout_ms).await;
         rt.set_status(Status::Offline);
         self.publish_event(format!(r#"{{"type":"stop","service":"{}"}}"#, rt.config.name));
         result
@@ -372,10 +515,7 @@ impl Gateway {
             loop {
                 ticker.tick().await;
                 let runtimes: Vec<Arc<ServiceRuntime>> = {
-                    gw.runtimes
-                        .values()
-                        .cloned()
-                        .collect()
+                    gw.all_runtimes()
                 };
                 for rt in runtimes {
                     let cfg = &rt.config;
@@ -474,6 +614,11 @@ impl Gateway {
 
         if let Err(e) = self.ensure_ready(&mapping).await {
             logger::warn(&format!("⚠️ 服务不可用: {}", e));
+            // 浏览器导航请求（GET + Accept: text/html）返回可自动重试的唤醒等待页，
+            // API/XHR/WS 保持 503 语义——「访问即启动」场景下用户感知是进度而非报错
+            if is_browser_navigation(&method, &headers) {
+                return cold_start_waiting_page(&cfg.name, &e);
+            }
             return text_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable");
         }
 
@@ -971,7 +1116,7 @@ impl Gateway {
     /// 端口路由 TCP 直通：整条连接纯 TCP 双向拷贝
     pub fn start_passthrough_listener(self: &Arc<Self>, port: u16, mapping: Arc<RouteMapping>) {
         let gw = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -1021,12 +1166,13 @@ impl Gateway {
                 });
             }
         });
+        self.port_listeners.lock().unwrap().insert(port, task.abort_handle());
     }
 
     /// 端口路由 HTTP 监听：独立 axum server
     pub fn start_port_http_listener(self: &Arc<Self>, port: u16, mapping: Arc<RouteMapping>) {
         let gw = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let gw_for_route = Arc::clone(&gw);
             let mapping_for_route = Arc::clone(&mapping);
             let app = axum::Router::new().fallback(move |method: axum::http::Method,
@@ -1063,6 +1209,7 @@ impl Gateway {
                 logger::error(&format!("❌ 端口 {port} HTTP 服务退出: {e}"), None);
             }
         });
+        self.port_listeners.lock().unwrap().insert(port, task.abort_handle());
     }
 }
 
@@ -1081,6 +1228,71 @@ pub fn text_response(status: axum::http::StatusCode, text: &str) -> axum::respon
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Body::from(text.to_string()))
         .unwrap()
+}
+
+/** 是否为浏览器导航请求（GET 且 Accept 含 text/html，用于冷启动等待页判定） */
+fn is_browser_navigation(method: &http::Method, headers: &HeaderMap) -> bool {
+    if method != http::Method::GET {
+        return false;
+    }
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/html"))
+        .unwrap_or(false)
+}
+
+/** 冷启动等待页：服务正在唤起或启动失败时给浏览器的进度页（自动重试，上限后展示失败原因） */
+fn cold_start_waiting_page(service: &str, error: &str) -> axum::response::Response {
+    let page = format!(
+        r#"<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>正在唤醒 {service} - DynaPM</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; margin: 0; background: #0f172a; color: #e2e8f0; }}
+  .card {{ text-align: center; padding: 3rem; }}
+  .spinner {{ width: 42px; height: 42px; margin: 0 auto 1.5rem; border-radius: 50%;
+              border: 3px solid #334155; border-top-color: #38bdf8; animation: spin 1s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .err {{ margin-top: 1rem; font-size: 13px; color: #f87171; word-break: break-all; max-width: 32rem; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="spinner"></div>
+  <h2>正在唤醒 <code>{service}</code> …</h2>
+  <p>服务冷启动中，就绪后将自动进入。</p>
+  <div class="err" id="err"></div>
+</div>
+<script>
+  // 重试上限：连续 30 次（约 45 秒）仍失败则停止刷新并展示错误
+  const KEY = 'dynapm-wait-' + location.host;
+  const n = (parseInt(sessionStorage.getItem(KEY) || '0', 10) || 0) + 1;
+  if (n <= 30) {{
+    sessionStorage.setItem(KEY, String(n));
+    setTimeout(() => location.reload(), 1500);
+  }} else {{
+    sessionStorage.removeItem(KEY);
+    document.querySelector('.spinner').style.display = 'none';
+    document.querySelector('h2').textContent = '{service} 启动失败';
+    document.getElementById('err').textContent = {error:?};
+  }}
+</script>
+</body>
+</html>"#,
+        service = service,
+        error = error
+    );
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .body(Body::from(page))
+        .unwrap_or_else(|_| text_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"))
 }
 
 /// RouteMapping -> RouteConfigResolved（供就绪等待复用）

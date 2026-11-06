@@ -230,10 +230,11 @@ function formatTime(ms?: number): string {
   return new Date(ms).toLocaleString('zh-CN', { hour12: false });
 }
 
-/** 服务可访问的公网地址（域名路由优先，无则 null） */
+/** 服务可访问地址（域名路由优先，无则 null）。
+ *  http 而非 https：本地 dev 域名（*.localhost）只有 HTTP 80，浏览器强制 https 会连接被拒 */
 function serviceUrl(svc: ServiceListItem): string | null {
   const host = svc.hosts?.[0];
-  return host ? `https://${host}/` : null;
+  return host ? `http://${host}/` : null;
 }
 
 onMounted(() => {
