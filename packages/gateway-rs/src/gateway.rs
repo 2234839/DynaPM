@@ -1202,6 +1202,16 @@ impl Gateway {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
+                // TCP keepalive：客户端异常死亡（进程被杀/mirrored 网络半开）时
+                // 内核探测失败自动关连接，避免 io::copy 永久阻塞、活跃计数泄漏
+                {
+                    let ka = socket2::SockRef::from(&client);
+                    let _ = ka.set_tcp_keepalive(
+                        &socket2::TcpKeepalive::new()
+                            .with_time(std::time::Duration::from_secs(60))
+                            .with_interval(std::time::Duration::from_secs(15)),
+                    );
+                }
                 let mapping = Arc::clone(&mapping);
                 let rt = Arc::clone(&mapping.service);
                 rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
