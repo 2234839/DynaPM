@@ -216,6 +216,12 @@ async fn main() {
         return;
     }
 
+    // 子命令：restart 触发运行中网关自重启（无需 sudo，systemd Restart=always 负责拉起）
+    if args.len() >= 2 && args[1] == "restart" {
+        gateway_restart_cli();
+        return;
+    }
+
     logger::info("DynaPM-Rust 网关启动中...");
 
     // 统计持久化目录：配置文件同目录下 stats/（配置加载后、服务运行时创建前注入）
@@ -287,7 +293,7 @@ async fn ensure_single_instance(cfg: &DynaPMConfig) -> Result<(), String> {
         return Err(format!(
             "端口 {host}:{port} 已被占用——DynaPM 网关已在运行（单例，勿重复启动）。\n\
              ↳ 管理面板  http://{admin_host}{}\n\
-             如需重启: {}  （或 sudo systemctl restart dynapm.service）\n\
+             如需重启: {} restart  （无需 sudo）\n\
              如需添加服务: {} add",
             show_port(port),
             std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "dynapm".into()),
@@ -683,6 +689,84 @@ fn ensure_gateway_up_to_date(cfg: &serde_json::Value) {
         }
         println!("⚠️ 网关重启中，尚未就绪（可用 systemctl status dynapm.service 查看）");
     }
+}
+
+/** CLI 管理面请求基址与认证头：127.0.0.1:{adminPort}/_dynapm/api + Bearer token */
+fn cli_admin_base(cfg: &serde_json::Value) -> (String, String) {
+    let main_port = cfg.get("port").and_then(|p| p.as_u64()).unwrap_or(80) as u16;
+    let admin_port = cfg
+        .pointer("/adminApi/port")
+        .and_then(|p| p.as_u64())
+        .unwrap_or(main_port as u64) as u16;
+    let token = cfg.pointer("/adminApi/authToken").and_then(|t| t.as_str()).unwrap_or("");
+    (
+        format!("http://127.0.0.1:{admin_port}/_dynapm/api"),
+        format!("Bearer {token}"),
+    )
+}
+
+/** `dynapm restart`：调 /_dynapm/api/restart 让运行中网关自重启并轮询等它回来 */
+fn gateway_restart_cli() {
+    let path = config::config_path();
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| {
+            eprintln!("❌ 读取配置 {} 失败: {e}", path.display());
+            std::process::exit(1);
+        });
+    let cfg: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+        eprintln!("❌ 解析配置失败: {e}");
+        std::process::exit(1);
+    });
+    let (base, auth) = cli_admin_base(&cfg);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let info = client
+        .get(format!("{base}/info"))
+        .header("Authorization", &auth)
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok());
+    let old_pid = info.as_ref().and_then(|i| i.get("pid")).and_then(|p| p.as_u64());
+    if info.is_none() {
+        eprintln!("❌ 网关未运行或管理面不可达（{base}）");
+        std::process::exit(1);
+    }
+    println!("🔄 触发网关自重启...");
+    if !client
+        .post(format!("{base}/restart"))
+        .header("Authorization", &auth)
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+    {
+        eprintln!("❌ 重启指令发送失败");
+        std::process::exit(1);
+    }
+    // 轮询等网关回来（最多 15s）：新实例 pid 变化或 startedAt 刷新即认为完成
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Ok(r) = client
+            .get(format!("{base}/info"))
+            .header("Authorization", &auth)
+            .send()
+        {
+            if let Ok(new_info) = r.json::<serde_json::Value>() {
+                let new_pid = new_info.get("pid").and_then(|p| p.as_u64());
+                let restarted = match (old_pid, new_pid) {
+                    (Some(o), Some(n)) => o != n,
+                    (_, Some(_)) => true,
+                    _ => false,
+                };
+                if restarted {
+                    println!("✅ 网关已重启完成");
+                    return;
+                }
+            }
+        }
+    }
+    println!("⚠️ 网关重启中，尚未就绪（可用 systemctl status dynapm.service 查看）");
 }
 
 /** 分配一个未占用端口：跳过配置内各服务 base 已用端口 + 本地 bind 探测（41000 起） */

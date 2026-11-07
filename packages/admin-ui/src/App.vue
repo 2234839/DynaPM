@@ -405,24 +405,22 @@ function formatMs(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
 }
 
-/** 闲置回收倒计时文案：null（有连接/不回收）显示 -，<1min 显示秒 */
-function idleText(svc: ServiceListItem): string {
-  const r = svc.idleRemainingMs;
-  if (r == null) return '-';
-  return r <= 60_000 ? `${Math.ceil(r / 1000)}s 后停` : `${formatUptime(r)} 后停`;
+/** 存活/回收合并单元格文案：online 显示存活时长+回收倒计时，已停回退显示历史累计存活 */
+function uptimeCell(svc: ServiceListItem): { main: string; sub: string | null; title: string } {
+  if (svc.status === 'online') {
+    const main = formatUptime(svc.uptime);
+    if (svc.idleRemainingMs == null) return { main, sub: null, title: '有活跃连接，不回收' };
+    const sub = svc.idleRemainingMs <= 60_000 ? `${Math.ceil(svc.idleRemainingMs / 1000)}s后停` : `${formatUptime(svc.idleRemainingMs)}后停`;
+    return { main, sub, title: `闲置 ${formatUptime(svc.idleTimeout)} 后自动停止，剩余 ${formatUptime(svc.idleRemainingMs)}` };
+  }
+  if (svc.totalUptime) return { main: '总 ' + formatUptime(svc.totalUptime), sub: null, title: '历史累计存活时间' };
+  return { main: '-', sub: null, title: '' };
 }
 
 /** 倒计时样式：临近回收（<1 分钟）高亮 */
 function idleClass(svc: ServiceListItem): string {
   const r = svc.idleRemainingMs;
   return r != null && r <= 60_000 ? 'idle-soon' : 'idle-far';
-}
-
-/** 倒计时悬浮提示 */
-function idleTitle(svc: ServiceListItem): string {
-  const r = svc.idleRemainingMs;
-  if (r == null) return '有活跃连接，不回收';
-  return `闲置 ${formatUptime(svc.idleTimeout)} 后自动停止，剩余 ${formatUptime(r)}`;
 }
 
 /** 拉取历史统计（图表，本地 + 全部远程面板，键为聚合行 uid） */
@@ -531,25 +529,25 @@ onMounted(() => {
         <tr>
           <th>
             <div class="name-filter">
-              <span>名称</span>
-              <input
-                v-model="searchKw"
-                class="search-input"
-                type="search"
-                placeholder="搜索服务名/面板名…"
-              />
-              <select v-model="filterPanel" class="panel-select" title="按面板筛选">
-                <option v-for="o in panelOptions" :key="o.id || 'all'" :value="o.id">
-                  {{ o.name }}（{{ o.count }}）
-                </option>
-              </select>
+              <div class="filter-group">
+                <input
+                  v-model="searchKw"
+                  class="search-input"
+                  type="search"
+                  placeholder="搜索服务/面板…"
+                />
+                <select v-model="filterPanel" class="panel-select" title="按面板筛选">
+                  <option v-for="o in panelOptions" :key="o.id || 'all'" :value="o.id">
+                    {{ o.name }} {{ o.count }}
+                  </option>
+                </select>
+              </div>
             </div>
           </th>
           <th>状态</th>
-          <th>当前存活</th>
-          <th>闲置回收</th>
+          <th>存活 / 回收</th>
           <th>请求数</th>
-          <th>启动耗时</th>
+          <th title="最近一次冷启动耗时">启动耗时</th>
           <th>连接数</th>
           <th>操作</th>
         </tr>
@@ -577,16 +575,14 @@ onMounted(() => {
               <span class="badge" :class="row.svc.paused ? 'status-disabled' : statusClass(row.svc.status)">{{ row.svc.paused ? 'disabled' : row.svc.status }}</span>
             </td>
             <td>{{ row.svc.status === 'online' ? formatUptime(row.svc.uptime) : '-' }}</td>
-            <td>
-              <!-- 在线时显示闲置回收倒计时；已停时回退显示历史累计存活 -->
-              <span v-if="row.svc.status === 'online'" :class="idleClass(row.svc)" :title="idleTitle(row.svc)">{{ idleText(row.svc) }}</span>
-              <span v-else-if="row.svc.totalUptime" title="历史累计存活时间">总 {{ formatUptime(row.svc.totalUptime) }}</span>
-              <span v-else>-</span>
+            <td class="uptime-cell" :title="uptimeCell(row.svc).title">
+              <span>{{ uptimeCell(row.svc).main }}</span>
+              <span v-if="uptimeCell(row.svc).sub" class="idle-sub" :class="idleClass(row.svc)">{{ uptimeCell(row.svc).sub }}</span>
             </td>
             <td>{{ row.svc.requestCount ?? 0 }}</td>
-            <td>{{ row.svc.lastStartDurationMs ? formatMs(row.svc.lastStartDurationMs) : '-' }}</td>
+            <td :title="row.svc.lastStartDurationMs ? '最近一次冷启动耗时' : ''">{{ row.svc.lastStartDurationMs ? formatMs(row.svc.lastStartDurationMs) : '-' }}</td>
             <td>{{ row.svc.activeConnections }}</td>
-            <td>
+            <td class="ops-cell">
               <!-- 启动/停止合二为一：按状态切换文案与样式 -->
               <button
                 v-if="row.svc.status !== 'online'"

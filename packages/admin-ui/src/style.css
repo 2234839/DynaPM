@@ -104,6 +104,36 @@ h1 {
   font-weight: 600;
 }
 
+/* 数值/时间类列与操作列不允许换行：窄屏时优先压缩名称列，而不是把按钮挤成两行 */
+.service-table th:not(:first-child),
+.service-table .uptime-cell,
+.service-table .ops-cell {
+  white-space: nowrap;
+}
+
+/* 存活/回收合并单元格：回收倒计时副文案样式 */
+.uptime-cell .idle-sub {
+  margin-left: 6px;
+  font-size: 12px;
+}
+.idle-soon {
+  color: #cf222e;
+}
+.idle-far {
+  color: #57606a;
+}
+
+/* 操作列：按钮横排不换行，窄屏时列间距收紧 */
+.ops-cell {
+  padding: 8px 8px !important;
+}
+.ops-cell .btn {
+  margin-right: 6px;
+}
+.ops-cell .btn:last-child {
+  margin-right: 0;
+}
+
 .badge {
   padding: 2px 8px;
   border-radius: 10px;
@@ -298,11 +328,28 @@ h1 {
   white-space: nowrap;
 }
 
-/* 表头名称列内嵌搜索框 + 面板筛选下拉 */
+/* 表头名称列内嵌搜索框 + 面板筛选下拉：合并为一个紧凑输入组 */
 .name-filter {
   display: flex;
   align-items: center;
-  gap: 8px;
+}
+.filter-group {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+.filter-group .search-input {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: none;
+}
+.filter-group .panel-select {
+  max-width: 150px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
 }
 .search-input {
   flex: 1;
