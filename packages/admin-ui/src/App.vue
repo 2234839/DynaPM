@@ -574,7 +574,6 @@ onMounted(() => {
             <td>
               <span class="badge" :class="row.svc.paused ? 'status-disabled' : statusClass(row.svc.status)">{{ row.svc.paused ? 'disabled' : row.svc.status }}</span>
             </td>
-            <td>{{ row.svc.status === 'online' ? formatUptime(row.svc.uptime) : '-' }}</td>
             <td class="uptime-cell" :title="uptimeCell(row.svc).title">
               <span>{{ uptimeCell(row.svc).main }}</span>
               <span v-if="uptimeCell(row.svc).sub" class="idle-sub" :class="idleClass(row.svc)">{{ uptimeCell(row.svc).sub }}</span>
