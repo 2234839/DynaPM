@@ -464,9 +464,15 @@ Runtime resource usage (native Rust binary):
 
 ## 📦 Publishing Releases
 
-Releases ship as **static musl binaries attached to GitHub Releases** (the legacy npm-publish workflow was retired along with the Bun version).
+Releases ship as **static/portable binaries attached to GitHub Releases**, built automatically by GitHub Actions (`.github/workflows/release.yml`).
 
-Planned process: update CHANGELOG → commit → tag → push → CI builds & publishes the release.
+**Release process:**
+
+1. Update docs/changelog as needed, commit to `main`
+2. Tag and push: `git tag v0.x.y && git push origin v0.x.y`
+3. CI builds all platforms in parallel and uploads archives (`tar.gz` for Linux/macOS, `zip` for Windows, each with a SHA-256 checksum file) to the GitHub Release
+
+Targets: `linux-x86_64` (musl static), `linux-aarch64` (musl static), `macos-aarch64`, `macos-x86_64`, `windows-x86_64` (MSVC).
 
 Historical npm OIDC setup notes are kept in [docs/NPM_OIDC_SETUP.md](./docs/NPM_OIDC_SETUP.md).
 
