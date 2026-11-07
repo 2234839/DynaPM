@@ -81,13 +81,9 @@ jobs:
           RUSTFLAGS="-C target-feature=+crt-static" \
             cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (windows)
-        if: runner.os == 'Windows'
-        working-directory: packages/gateway-rs
-        shell: pwsh
-        run: cargo build --release --target ${{ matrix.target }}
-
       - name: Package
+        shell: bash
+        run: |
           mkdir -p dist
           cp packages/gateway-rs/target/${{ matrix.target }}/release/dynapm dist/
           cp README.md README_zh.md LICENSE dist/
