@@ -146,7 +146,26 @@ DynaPM 原生支持现代实时通信协议：
 - 为活跃服务释放内存和 CPU
 - 定时检查间隔：3 秒
 
-### 📊 **高性能指标**
+### �️ **多面板联邦（聚合管理）**
+
+管理面板支持接入其他 DynaPM 网关，在一个面板里统一查看/启停/编辑所有服务器的服务：
+
+- **配置式接入**：面板内「面板管理」对话框填对方的地址 + 管理令牌即可，存浏览器 localStorage，无需中心化组件
+- **能力完整**：远程服务列表、统计图表、服务详情、启动/停止/彻底关停、原地编辑远程配置，与本地面板体验一致
+- **安全模型**：跨域走 `adminApi.corsOrigins` Origin 白名单（精确匹配，**默认为空 = 禁止一切跨域**），鉴权仍由 `adminApi.authToken` 把关；被接入方显式信任面板来源后才能读
+
+```jsonc
+// 被接入方网关配置（允许哪些面板 Origin 跨域访问管理 API）
+{
+  "adminApi": {
+    "authToken": "<令牌>",
+    "host": "dynapm.example.com",
+    "corsOrigins": ["http://dynapm.localhost", "https://panel.other.com"]
+  }
+}
+```
+
+### �📊 **高性能指标**
 
 ```
 测试环境：Node.js HTTP 服务器 (autocannon 压测)

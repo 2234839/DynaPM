@@ -92,6 +92,8 @@ pub struct ProcessParams {
     pub start_limit: usize,
     /** admin API 认证令牌 */
     pub admin_auth_token: Option<String>,
+    /** admin API 跨域 Origin 白名单（精确匹配，空 = 禁止跨域） */
+    pub admin_cors_origins: Arc<Vec<String>>,
     /** 主动回收：内存吃紧时驱逐无连接、非 keepWarm 的在跑服务给新启动腾地方 */
     pub aggressive_reclaim: bool,
     /** 主动回收触发线：MemAvailable 低于总内存的百分比（默认 15） */
@@ -131,6 +133,7 @@ impl Gateway {
         start_concurrency: usize,
         admin_auth_token: Option<String>,
         admin_host: Option<String>,
+        admin_cors_origins: Vec<String>,
     ) -> Arc<Self> {
         let mut hostname_routes = HashMap::new();
         let mut port_routes = HashMap::new();
@@ -182,6 +185,7 @@ impl Gateway {
                 start_limit: start_concurrency,
                 start_concurrency: Arc::new(tokio::sync::Semaphore::new(start_concurrency.max(1))),
                 admin_auth_token,
+                admin_cors_origins: Arc::new(admin_cors_origins),
                 aggressive_reclaim: false,
                 mem_reclaim_threshold_pct: 15,
             }),
@@ -234,6 +238,11 @@ impl Gateway {
     /// admin API 认证令牌（热替换参数的快照，返回拷贝避免持有 Guard）
     pub fn admin_auth_token(&self) -> Option<String> {
         self.params().admin_auth_token.clone()
+    }
+
+    /// admin API 跨域 Origin 白名单快照
+    pub fn admin_cors_origins(&self) -> Vec<String> {
+        (*self.params().admin_cors_origins).clone()
     }
 
     /// admin 面板专属域名快照
@@ -356,6 +365,12 @@ impl Gateway {
                     Arc::new(tokio::sync::Semaphore::new(cfg.start_concurrency.max(1)))
                 },
                 admin_auth_token: cfg.admin_api.as_ref().and_then(|a| a.auth_token.clone()),
+                admin_cors_origins: Arc::new(
+                    cfg.admin_api
+                        .as_ref()
+                        .and_then(|a| a.cors_origins.clone())
+                        .unwrap_or_default(),
+                ),
                 aggressive_reclaim: cfg.aggressive_reclaim,
                 mem_reclaim_threshold_pct: cfg.mem_reclaim_threshold_pct,
             };

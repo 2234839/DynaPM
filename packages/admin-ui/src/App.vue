@@ -22,6 +22,8 @@ import GlobalChart from './GlobalChart.vue';
 import ConfigEditor from './ConfigEditor.vue';
 import AppDialog from './components/AppDialog.vue';
 import { confirmDialog } from './composables/dialog';
+import { loadPanels, PanelClient, type RemotePanel } from './panels';
+import PanelManager from './components/PanelManager.vue';
 
 /** URL hash 中的令牌持久化后清除地址栏 */
 captureTokenFromHash();
@@ -40,19 +42,101 @@ const error = ref('');
 /** 操作中的服务名（按钮禁用） */
 const busy = ref('');
 const expanded = ref<Set<string>>(new Set());
-/** 各服务历史统计（图表数据） */
+/** 各服务历史统计（图表数据，键为聚合行 uid） */
 const statsMap = ref<Map<string, ServiceStats>>(new Map());
 
-/** 全局折线图数据：所有服务的分钟请求桶 */
+/** 远程面板列表（localStorage 持久化） */
+const remotePanels = ref<RemotePanel[]>(loadPanels());
+/** 各远程面板拉取结果：面板 id -> 服务列表或错误 */
+const remoteData = ref<Map<string, { services: ServiceListItem[]; error: string }>>(new Map());
+/** 面板管理对话框可见性 */
+const panelManagerOpen = ref(false);
+
+/** 聚合行：本地面板 + 各远程面板的服务统一行模型 */
+interface FedRow {
+  /** 唯一键：local:<name> 或 <panelId>:<name> */
+  uid: string;
+  /** 所属面板 id（本地为空串） */
+  panelId: string;
+  /** 所属面板显示名（本地为空串） */
+  panelName: string;
+  /** 是否来自远程面板 */
+  remote: boolean;
+  /** 服务数据 */
+  svc: ServiceListItem;
+}
+
+/** 聚合后的完整服务行列表 */
+const fedRows = computed<FedRow[]>(() => [
+  ...services.value.map((s) => ({ uid: `local:${s.name}`, panelId: '', panelName: '', remote: false, svc: s })),
+  ...remotePanels.value.flatMap((p) =>
+    (remoteData.value.get(p.id)?.services ?? []).map(
+      (s): FedRow => ({ uid: `${p.id}:${s.name}`, panelId: p.id, panelName: p.name, remote: true, svc: s }),
+    ),
+  ),
+]);
+
+/** 各远程面板的拉取错误（表内以提示行展示） */
+const panelErrors = computed(() =>
+  remotePanels.value
+    .map((p) => ({ id: p.id, name: p.name, error: remoteData.value.get(p.id)?.error ?? '' }))
+    .filter((x) => x.error),
+);
+
+/** 拉取全部远程面板的服务列表（单面板失败不影响其他面板） */
+async function refreshRemote(): Promise<void> {
+  const entries = await Promise.all(
+    remotePanels.value.map(async (p): Promise<readonly [string, { services: ServiceListItem[]; error: string }]> => {
+      try {
+        const data = await new PanelClient(p).fetchServices();
+        return [p.id, { services: data.services ?? [], error: '' }] as const;
+      } catch (e) {
+        const msg = e instanceof Error && e.message === 'UNAUTHORIZED' ? '令牌无效（401）' : e instanceof Error ? e.message : String(e);
+        return [p.id, { services: [], error: msg }] as const;
+      }
+    }),
+  );
+  remoteData.value = new Map(entries);
+}
+
+/** 全局折线图数据：所有聚合行的分钟请求桶（远程行名称加面板前缀） */
 const globalSeries = computed(() =>
-  services.value.map((s) => ({
-    name: s.name,
-    reqBuckets: statsMap.value.get(s.name)?.reqBuckets ?? [],
+  fedRows.value.map((r) => ({
+    name: r.remote ? `${r.panelName}/${r.svc.name}` : r.svc.name,
+    reqBuckets: statsMap.value.get(r.uid)?.reqBuckets ?? [],
+    panelName: r.remote ? r.panelName : '',
   })),
 );
+
+/** 服务名搜索关键字（不区分大小写，空串 = 不过滤） */
+const searchKw = ref('');
+/** 面板筛选：空串 = 全部；'local' = 仅本地；否则为面板 id */
+const filterPanel = ref('');
+
+/** 筛选下拉选项：本地 + 各远程面板（含服务计数） */
+const panelOptions = computed(() => [
+  { id: '', name: '全部面板', count: fedRows.value.length },
+  { id: 'local', name: '本地', count: fedRows.value.filter((r) => !r.remote).length },
+  ...remotePanels.value.map((p) => ({
+    id: p.id,
+    name: p.name,
+    count: fedRows.value.filter((r) => r.panelId === p.id).length,
+  })),
+]);
+
+/** 搜索 + 面板筛选后的聚合行 */
+const visibleRows = computed(() => {
+  const kw = searchKw.value.trim().toLowerCase();
+  return fedRows.value.filter((r) => {
+    if (filterPanel.value === 'local' && r.remote) return false;
+    if (filterPanel.value && filterPanel.value !== 'local' && r.panelId !== filterPanel.value) return false;
+    if (kw && !r.svc.name.toLowerCase().includes(kw) && !(r.remote && r.panelName.toLowerCase().includes(kw))) return false;
+    return true;
+  });
+});
 /** 配置编辑器可见性 */
 const configOpen = ref(false);
-/** 正在原地编辑配置的服务名（detail-grid 直接切输入态） */
+/** 正在原地编辑配置的服务（聚合行 uid，detail-grid 直接切输入态） */
 const editingSvc = ref('');
 /** 编辑表单：超时用秒展示，存储为毫秒 */
 const editForm = ref({
@@ -68,11 +152,16 @@ const editForm = ref({
 const editError = ref('');
 const editSaving = ref(false);
 
-/** 进入原地编辑：拉取配置定位该服务条目填充表单 */
-async function startEdit(name: string): Promise<void> {
+/** 进入原地编辑：拉取配置定位该服务条目填充表单（本地/远程面板同构 API） */
+async function startEdit(row: FedRow): Promise<void> {
   editError.value = '';
+  const client = row.remote ? new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!) : null;
+  const name = row.svc.name;
   try {
-    const [detail, cfg] = await Promise.all([fetchServiceDetail(name), fetchConfig()]);
+    const [detail, cfg] = await Promise.all([
+      row.remote ? client!.fetchServiceDetail(name) : fetchServiceDetail(name),
+      row.remote ? client!.fetchConfig() : fetchConfig(),
+    ]);
     /** 配置键是 host（面板 name 可能是 base 地址），从详情取 host 定位 */
     const host = (detail.host as string) ?? name;
     const svc = cfg.services?.[host];
@@ -89,13 +178,13 @@ async function startEdit(name: string): Promise<void> {
       startCommand: svc.commands?.start ?? '',
       stopCommand: svc.commands?.stop ?? '',
     };
-    editingSvc.value = name;
+    editingSvc.value = row.uid;
   } catch (e) {
     editError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
-/** 保存原地编辑：改写配置内该服务条目后整体 PUT（服务/超时变更均可热更） */
+/** 保存原地编辑：改写配置内该服务条目后整体 PUT（服务/超时变更均可热更；远程面板写入对方网关） */
 async function saveEdit(): Promise<void> {
   editError.value = '';
   const f = editForm.value;
@@ -103,9 +192,17 @@ async function saveEdit(): Promise<void> {
     editError.value = '后端地址不能为空';
     return;
   }
+  const row = fedRows.value.find((r) => r.uid === editingSvc.value);
+  if (!row) {
+    editError.value = '编辑目标已不存在';
+    return;
+  }
+  const client = row.remote ? new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!) : null;
+  const getConfig = () => (row.remote ? client!.fetchConfig() : fetchConfig());
+  const putConfig = (cfg: Record<string, any>) => (row.remote ? client!.saveConfig(cfg) : saveConfig(cfg));
   editSaving.value = true;
   try {
-    const cfg = await fetchConfig();
+    const cfg = await getConfig();
     const svc = cfg.services?.[f.host];
     if (!svc) {
       editError.value = `配置中找不到服务 ${f.host}（可能已被外部修改）`;
@@ -124,17 +221,28 @@ async function saveEdit(): Promise<void> {
     else delete svc.commands.start;
     if (f.stopCommand) svc.commands.stop = f.stopCommand;
     else delete svc.commands.stop;
-    const res = await saveConfig(cfg);
+    const res = await putConfig(cfg);
     if (!res.reloaded) {
-      // 含监听地址变更触发网关自重启，等其回来后刷新页面
+      // 含监听地址变更触发网关自重启：远程面板提示后仅收起编辑态，不刷新本页；本地等重启后刷新
+      if (row.remote) {
+        editingSvc.value = '';
+        editError.value = '';
+        error.value = `[${row.panelName}] 保存成功，对方网关正在重启加载新配置…`;
+        setTimeout(() => {
+          error.value = '';
+          refresh();
+        }, 5000);
+        return;
+      }
       editError.value = '保存成功，网关正在重启加载新配置…';
       setTimeout(() => location.reload(), 3000);
       return;
     }
-    const name = editingSvc.value;
+    const uid = editingSvc.value;
     editingSvc.value = '';
     await refresh();
-    if (name && expanded.value.has(name)) await toggleDetail(name);
+    const updated = fedRows.value.find((r) => r.uid === uid);
+    if (updated && expanded.value.has(uid)) await toggleDetail(updated);
   } catch (e) {
     editError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -142,10 +250,11 @@ async function saveEdit(): Promise<void> {
   }
 }
 
-/** 加载服务列表 */
+/** 加载服务列表（本地 + 全部远程面板） */
 async function refresh(): Promise<void> {
   loading.value = true;
   error.value = '';
+  refreshRemote();
   try {
     const data = await fetchServices();
     services.value = data.services ?? [];
@@ -188,27 +297,34 @@ function logout(): void {
   services.value = [];
 }
 
-/** 展开或收起服务详情 */
-async function toggleDetail(name: string): Promise<void> {
-  if (expanded.value.has(name)) {
-    expanded.value.delete(name);
+/** 展开或收起服务详情（按聚合行路由到本地或远程 API） */
+async function toggleDetail(row: FedRow): Promise<void> {
+  const key = row.uid;
+  if (expanded.value.has(key)) {
+    expanded.value.delete(key);
     expanded.value = new Set(expanded.value);
     return;
   }
   try {
-    const detail = await fetchServiceDetail(name);
-    details.value.set(name, detail);
-    expanded.value = new Set(expanded.value).add(name);
+    const detail = row.remote
+      ? await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).fetchServiceDetail(row.svc.name)
+      : await fetchServiceDetail(row.svc.name);
+    details.value.set(key, detail);
+    expanded.value = new Set(expanded.value).add(key);
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
   }
 }
 
 /** 启动服务 */
-async function onStart(name: string): Promise<void> {
-  busy.value = name;
+async function onStart(row: FedRow): Promise<void> {
+  busy.value = row.uid;
   try {
-    await startService(name);
+    if (row.remote) {
+      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).startService(row.svc.name);
+    } else {
+      await startService(row.svc.name);
+    }
     await refresh();
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -218,10 +334,14 @@ async function onStart(name: string): Promise<void> {
 }
 
 /** 停止服务（下次请求会自动按需拉起） */
-async function onStop(name: string): Promise<void> {
-  busy.value = name;
+async function onStop(row: FedRow): Promise<void> {
+  busy.value = row.uid;
   try {
-    await stopService(name);
+    if (row.remote) {
+      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).stopService(row.svc.name);
+    } else {
+      await stopService(row.svc.name);
+    }
     await refresh();
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -231,11 +351,16 @@ async function onStop(name: string): Promise<void> {
 }
 
 /** 彻底关停（停止并禁止按需拉起） */
-async function onDisable(name: string): Promise<void> {
-  if (!(await confirmDialog(`彻底关停 ${name}？之后请求到达不会自动拉起，需手动解除。`, { danger: true, okText: '彻底关停' }))) return;
-  busy.value = name;
+async function onDisable(row: FedRow): Promise<void> {
+  const scope = row.remote ? `远程面板「${row.panelName}」的服务` : '服务';
+  if (!(await confirmDialog(`彻底关停${scope} ${row.svc.name}？之后请求到达不会自动拉起，需手动解除。`, { danger: true, okText: '彻底关停' }))) return;
+  busy.value = row.uid;
   try {
-    await disableService(name);
+    if (row.remote) {
+      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).disableService(row.svc.name);
+    } else {
+      await disableService(row.svc.name);
+    }
     await refresh();
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -245,10 +370,14 @@ async function onDisable(name: string): Promise<void> {
 }
 
 /** 解除彻底关停 */
-async function onEnable(name: string): Promise<void> {
-  busy.value = name;
+async function onEnable(row: FedRow): Promise<void> {
+  busy.value = row.uid;
   try {
-    await enableService(name);
+    if (row.remote) {
+      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).enableService(row.svc.name);
+    } else {
+      await enableService(row.svc.name);
+    }
     await refresh();
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -296,14 +425,33 @@ function idleTitle(svc: ServiceListItem): string {
   return `闲置 ${formatUptime(svc.idleTimeout)} 后自动停止，剩余 ${formatUptime(r)}`;
 }
 
-/** 拉取历史统计（图表） */
+/** 拉取历史统计（图表，本地 + 全部远程面板，键为聚合行 uid） */
 async function refreshStats(): Promise<void> {
+  const next = new Map<string, ServiceStats>();
   try {
     const data = await fetchStats();
-    statsMap.value = new Map((data.services ?? []).map((s) => [s.name, s]));
+    for (const s of data.services ?? []) next.set(`local:${s.name}`, s);
   } catch {
     // 图表数据拉取失败不打断主列表
   }
+  await Promise.all(
+    remotePanels.value.map(async (p) => {
+      try {
+        const data = await new PanelClient(p).fetchStats();
+        for (const s of data.services ?? []) next.set(`${p.id}:${s.name}`, s);
+      } catch {
+        // 远程面板统计失败不影响本地面板图表
+      }
+    }),
+  );
+  statsMap.value = next;
+}
+
+/** 面板列表保存后：重载配置并立即刷新聚合数据 */
+function onPanelsChanged(): void {
+  remotePanels.value = loadPanels();
+  refresh();
+  refreshStats();
 }
 
 /** 配置保存成功（网关自重启后延迟刷新列表与图表） */
@@ -368,18 +516,35 @@ onMounted(() => {
           {{ loading ? '刷新中…' : '手动刷新' }}
         </button>
         <button class="btn" @click="configOpen = !configOpen">配置</button>
+        <button class="btn" @click="panelManagerOpen = !panelManagerOpen">面板管理</button>
         <button class="btn" @click="logout">退出</button>
       </div>
     </header>
 
     <ConfigEditor v-if="configOpen" @close="configOpen = false" @saved="onSaved" />
+    <PanelManager v-if="panelManagerOpen" @close="panelManagerOpen = false" @saved="onPanelsChanged" />
 
     <p v-if="error" class="error">{{ error }}</p>
 
     <table class="service-table">
       <thead>
         <tr>
-          <th>名称</th>
+          <th>
+            <div class="name-filter">
+              <span>名称</span>
+              <input
+                v-model="searchKw"
+                class="search-input"
+                type="search"
+                placeholder="搜索服务名/面板名…"
+              />
+              <select v-model="filterPanel" class="panel-select" title="按面板筛选">
+                <option v-for="o in panelOptions" :key="o.id || 'all'" :value="o.id">
+                  {{ o.name }}（{{ o.count }}）
+                </option>
+              </select>
+            </div>
+          </th>
           <th>状态</th>
           <th>当前存活</th>
           <th>闲置回收</th>
@@ -390,79 +555,80 @@ onMounted(() => {
         </tr>
       </thead>
       <tbody>
-        <template v-for="svc in services" :key="svc.name">
+        <template v-for="row in visibleRows" :key="row.uid">
           <tr>
             <td class="name-cell">
-              <button class="link arrow" :title="expanded.has(svc.name) ? '收起详情' : '展开详情'" @click="toggleDetail(svc.name)">
-                {{ expanded.has(svc.name) ? '▼' : '▶' }}
+              <button class="link arrow" :title="expanded.has(row.uid) ? '收起详情' : '展开详情'" @click="toggleDetail(row)">
+                {{ expanded.has(row.uid) ? '▼' : '▶' }}
               </button>
               <a
-                v-if="serviceUrl(svc)"
+                v-if="serviceUrl(row.svc)"
                 class="svc-link"
-                :href="serviceUrl(svc)!"
+                :href="serviceUrl(row.svc)!"
                 target="_blank"
                 rel="noopener"
-              >{{ svc.name }}</a>
-              <span v-else>{{ svc.name }}</span>
-              <span v-if="svc.socks" class="badge port-badge" title="SOCKS5 代理端口">🧦 :{{ svc.ports?.[0] }}</span>
-              <span v-else-if="svc.ports?.length" class="badge port-badge" title="专属端口">:{{ svc.ports[0] }}</span>
+              >{{ row.svc.name }}</a>
+              <span v-else>{{ row.svc.name }}</span>
+              <span v-if="row.remote" class="badge panel-badge" :title="`来自远程面板 ${row.panelName}`">{{ row.panelName }}</span>
+              <span v-if="row.svc.socks" class="badge port-badge" title="SOCKS5 代理端口">🧦 :{{ row.svc.ports?.[0] }}</span>
+              <span v-else-if="row.svc.ports?.length" class="badge port-badge" title="专属端口">:{{ row.svc.ports[0] }}</span>
             </td>
             <td>
-              <span class="badge" :class="svc.paused ? 'status-disabled' : statusClass(svc.status)">{{ svc.paused ? 'disabled' : svc.status }}</span>
+              <span class="badge" :class="row.svc.paused ? 'status-disabled' : statusClass(row.svc.status)">{{ row.svc.paused ? 'disabled' : row.svc.status }}</span>
             </td>
-            <td>{{ svc.status === 'online' ? formatUptime(svc.uptime) : '-' }}</td>
+            <td>{{ row.svc.status === 'online' ? formatUptime(row.svc.uptime) : '-' }}</td>
             <td>
               <!-- 在线时显示闲置回收倒计时；已停时回退显示历史累计存活 -->
-              <span v-if="svc.status === 'online'" :class="idleClass(svc)" :title="idleTitle(svc)">{{ idleText(svc) }}</span>
-              <span v-else-if="svc.totalUptime" title="历史累计存活时间">总 {{ formatUptime(svc.totalUptime) }}</span>
+              <span v-if="row.svc.status === 'online'" :class="idleClass(row.svc)" :title="idleTitle(row.svc)">{{ idleText(row.svc) }}</span>
+              <span v-else-if="row.svc.totalUptime" title="历史累计存活时间">总 {{ formatUptime(row.svc.totalUptime) }}</span>
               <span v-else>-</span>
             </td>
-            <td>{{ svc.requestCount ?? 0 }}</td>
-            <td>{{ svc.lastStartDurationMs ? formatMs(svc.lastStartDurationMs) : '-' }}</td>
-            <td>{{ svc.activeConnections }}</td>
+            <td>{{ row.svc.requestCount ?? 0 }}</td>
+            <td>{{ row.svc.lastStartDurationMs ? formatMs(row.svc.lastStartDurationMs) : '-' }}</td>
+            <td>{{ row.svc.activeConnections }}</td>
             <td>
               <!-- 启动/停止合二为一：按状态切换文案与样式 -->
               <button
-                v-if="svc.status !== 'online'"
+                v-if="row.svc.status !== 'online'"
                 class="btn btn-start"
-                :disabled="busy === svc.name || !!svc.paused"
-                @click="onStart(svc.name)"
+                :disabled="busy === row.uid || !!row.svc.paused"
+                @click="onStart(row)"
               >启动</button>
               <button
                 v-else
                 class="btn btn-stop"
                 title="停止进程，下次请求到达会自动按需拉起"
-                :disabled="busy === svc.name"
-                @click="onStop(svc.name)"
+                :disabled="busy === row.uid"
+                @click="onStop(row)"
               >停止</button>
               <button
-                v-if="!svc.paused"
+                v-if="!row.svc.paused"
                 class="btn btn-danger"
-                :disabled="busy === svc.name"
+                :disabled="busy === row.uid"
                 title="停止并禁止按需拉起，需手动解除"
-                @click="onDisable(svc.name)"
+                @click="onDisable(row)"
               >彻底关停</button>
               <button
                 v-else
                 class="btn"
-                :disabled="busy === svc.name"
-                @click="onEnable(svc.name)"
+                :disabled="busy === row.uid"
+                @click="onEnable(row)"
               >解除关停</button>
             </td>
           </tr>
-          <tr v-if="expanded.has(svc.name) && details.get(svc.name)">
+          <tr v-if="expanded.has(row.uid) && details.get(row.uid)">
             <td colspan="8" class="detail-cell">
-              <StatsCharts v-if="statsMap.get(svc.name)" :stats="statsMap.get(svc.name)!" />
-              <div v-if="details.get(svc.name)" class="detail-grid" :class="{ editing: editingSvc === svc.name }">
+              <StatsCharts v-if="statsMap.get(row.uid)" :stats="statsMap.get(row.uid)!" />
+              <div v-if="details.get(row.uid)" class="detail-grid" :class="{ editing: editingSvc === row.uid }">
                 <span>后端地址</span>
-                <template v-if="editingSvc === svc.name"><input v-model="editForm.base" placeholder="http://127.0.0.1:41001" /></template>
-                <code v-else>{{ details.get(svc.name)!.base }}</code>
+                <template v-if="editingSvc === row.uid"><input v-model="editForm.base" placeholder="http://127.0.0.1:41001" /></template>
+                <code v-else>{{ details.get(row.uid)!.base }}</code>
                 <span>代理端口</span>
-                <code v-if="svc.socks">🧦 socks5 :{{ svc.ports?.[0] }}（socks5h://127.0.0.1:{{ svc.ports?.[0] }}）</code>
-                <code v-else-if="svc.ports?.length">:{{ svc.ports[0] }}</code>
+                <code v-if="row.svc.socks">🧦 socks5 :{{ row.svc.ports?.[0] }}（socks5h://127.0.0.1:{{ row.svc.ports?.[0] }}）</code>
+                <code v-else-if="row.svc.ports?.length">:{{ row.svc.ports[0] }}</code>
                 <code v-else>-</code>
                 <span>健康检查</span>
-                <template v-if="editingSvc === svc.name">
+                <template v-if="editingSvc === row.uid">
                   <select v-model="editForm.healthType">
                     <option value="">（默认 tcp）</option>
                     <option value="tcp">tcp</option>
@@ -470,29 +636,29 @@ onMounted(() => {
                     <option value="command">command</option>
                   </select>
                 </template>
-                <code v-else>{{ details.get(svc.name)!.healthCheck?.type ?? '-' }}</code>
+                <code v-else>{{ details.get(row.uid)!.healthCheck?.type ?? '-' }}</code>
                 <span>模式</span>
                 <code>
-                  <template v-if="details.get(svc.name)!.proxyOnly">纯代理</template>
-                  <template v-if="details.get(svc.name)!.netns">netns 隔离</template>
-                  <template v-if="details.get(svc.name)!.keepWarm">keepWarm</template>
-                  <template v-if="!details.get(svc.name)!.proxyOnly && !details.get(svc.name)!.netns">常规</template>
+                  <template v-if="details.get(row.uid)!.proxyOnly">纯代理</template>
+                  <template v-if="details.get(row.uid)!.netns">netns 隔离</template>
+                  <template v-if="details.get(row.uid)!.keepWarm">keepWarm</template>
+                  <template v-if="!details.get(row.uid)!.proxyOnly && !details.get(row.uid)!.netns">常规</template>
                 </code>
-                <span>启动次数</span><code>{{ details.get(svc.name)!.startCount }}</code>
-                <span>最后访问</span><code>{{ formatTime(details.get(svc.name)!.lastAccessTime) }}</code>
+                <span>启动次数</span><code>{{ details.get(row.uid)!.startCount }}</code>
+                <span>最后访问</span><code>{{ formatTime(details.get(row.uid)!.lastAccessTime) }}</code>
                 <span>闲置回收</span>
-                <template v-if="editingSvc === svc.name"><div class="inline-field"><input v-model.number="editForm.idleSec" type="number" min="0" /><small class="hint">秒</small></div></template>
-                <code v-else>{{ formatUptime(details.get(svc.name)!.idleTimeout) }}</code>
+                <template v-if="editingSvc === row.uid"><div class="inline-field"><input v-model.number="editForm.idleSec" type="number" min="0" /><small class="hint">秒</small></div></template>
+                <code v-else>{{ formatUptime(details.get(row.uid)!.idleTimeout) }}</code>
                 <span>启动超时</span>
-                <template v-if="editingSvc === svc.name"><div class="inline-field"><input v-model.number="editForm.startSec" type="number" min="1" /><small class="hint">秒</small></div></template>
-                <code v-else>{{ formatUptime(details.get(svc.name)!.startTimeout ?? 0) }}</code>
+                <template v-if="editingSvc === row.uid"><div class="inline-field"><input v-model.number="editForm.startSec" type="number" min="1" /><small class="hint">秒</small></div></template>
+                <code v-else>{{ formatUptime(details.get(row.uid)!.startTimeout ?? 0) }}</code>
                 <span>启动命令</span>
-                <template v-if="editingSvc === svc.name"><textarea v-model="editForm.startCommand" rows="2"></textarea></template>
-                <code v-else class="cmd">{{ details.get(svc.name)!.startCommand || '-' }}</code>
+                <template v-if="editingSvc === row.uid"><textarea v-model="editForm.startCommand" rows="2"></textarea></template>
+                <code v-else class="cmd">{{ details.get(row.uid)!.startCommand || '-' }}</code>
                 <span>停止命令</span>
-                <template v-if="editingSvc === svc.name"><textarea v-model="editForm.stopCommand" rows="2" placeholder="（默认按 pgid 杀进程组）"></textarea></template>
-                <code v-else class="cmd">{{ details.get(svc.name)!.stopCommand || '-' }}</code>
-                <template v-if="editingSvc === svc.name">
+                <template v-if="editingSvc === row.uid"><textarea v-model="editForm.stopCommand" rows="2" placeholder="（默认按 pgid 杀进程组）"></textarea></template>
+                <code v-else class="cmd">{{ details.get(row.uid)!.stopCommand || '-' }}</code>
+                <template v-if="editingSvc === row.uid">
                   <span></span>
                   <div class="edit-actions">
                     <p v-if="editError" class="error" style="margin: 0; flex: 1">{{ editError }}</p>
@@ -501,15 +667,18 @@ onMounted(() => {
                   </div>
                 </template>
               </div>
-              <div v-if="editingSvc !== svc.name" style="display: flex; justify-content: flex-end; margin-top: 6px">
-                <button class="btn" @click="startEdit(svc.name)">编辑配置</button>
+              <div v-if="editingSvc !== row.uid" style="display: flex; justify-content: flex-end; margin-top: 6px">
+                <button class="btn" @click="startEdit(row)">{{ row.remote ? `编辑远程配置` : '编辑配置' }}</button>
               </div>
-              <p v-if="details.get(svc.name)?.lastStartError" class="error">启动失败：{{ details.get(svc.name)!.lastStartError }}</p>
+              <p v-if="details.get(row.uid)?.lastStartError" class="error">启动失败：{{ details.get(row.uid)!.lastStartError }}</p>
             </td>
           </tr>
         </template>
-        <tr v-if="!services.length && !loading">
-          <td colspan="8" class="empty">暂无服务</td>
+        <tr v-for="pe in panelErrors" :key="pe.id">
+          <td colspan="8" class="panel-error">⚠️ 远程面板「{{ pe.name }}」拉取失败：{{ pe.error }}</td>
+        </tr>
+        <tr v-if="!visibleRows.length && !loading">
+          <td colspan="8" class="empty">{{ fedRows.length ? '无匹配服务' : '暂无服务' }}</td>
         </tr>
       </tbody>
     </table>

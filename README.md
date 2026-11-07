@@ -146,7 +146,26 @@ Configure ANY service using bash commands - no limits:
 - Check interval: 3 seconds
 - **Smart connection tracking**: Active long connections (SSE/WebSocket) prevent premature shutdown
 
-### 📊 **High Performance Metrics**
+### �️ **Panel Federation (Aggregated Management)**
+
+The admin panel can connect to other DynaPM gateways, letting you view/start/stop/edit services across all your servers from a single panel:
+
+- **Config-based onboarding**: Fill in the remote gateway's URL + admin token in the panel's "Panel Manager" dialog; stored in browser localStorage, no centralized component needed
+- **Full capability**: Remote service lists, stats charts, service details, start/stop/disable, and in-place remote config editing — same experience as the local panel
+- **Security model**: Cross-origin access is controlled by the `adminApi.corsOrigins` origin whitelist (exact match, **empty by default = all cross-origin requests denied**); auth is still enforced by `adminApi.authToken`
+
+```jsonc
+// Gateway config of the gateway being connected (which panel origins may access the admin API cross-origin)
+{
+  "adminApi": {
+    "authToken": "<token>",
+    "host": "dynapm.example.com",
+    "corsOrigins": ["http://dynapm.localhost", "https://panel.other.com"]
+  }
+}
+```
+
+### �📊 **High Performance Metrics**
 
 ```
 Test Environment: Node.js HTTP Server (autocannon benchmark)

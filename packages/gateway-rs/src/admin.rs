@@ -58,6 +58,49 @@ fn auth_check(uri: &axum::http::Uri, headers: &axum::http::HeaderMap, gw: &Gatew
     None
 }
 
+/// Origin 是否在跨域白名单内（精确匹配；空白名单 = 禁止一切跨域）
+fn cors_allowed(gw: &Gateway, origin: &str) -> bool {
+    let list = gw.admin_cors_origins();
+    !list.is_empty() && list.iter().any(|o| o.eq_ignore_ascii_case(origin))
+}
+
+/// 给响应追加 CORS 头（Origin 不在白名单时不加任何头，浏览器自行拦截读取）
+pub fn apply_cors(gw: &Gateway, origin: Option<&str>, resp: axum::response::Response) -> axum::response::Response {
+    let Some(origin) = origin else { return resp };
+    if !cors_allowed(gw, origin) {
+        return resp;
+    }
+    (
+        [
+            ("Access-Control-Allow-Origin", origin.to_string()),
+            ("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS".to_string()),
+            ("Access-Control-Allow-Headers", "Authorization, Content-Type".to_string()),
+            ("Access-Control-Allow-Max-Age", "600".to_string()),
+            ("Vary", "Origin".to_string()),
+        ],
+        resp,
+    )
+        .into_response()
+}
+
+/// CORS 预检处理：OPTIONS 请求在白名单命中时直接短路返回，不消耗鉴权；
+/// 未命中返回 403。返回 None 表示非预检请求，继续走正常链路
+pub fn cors_preflight(gw: &Gateway, origin: Option<&str>) -> Option<axum::response::Response> {
+    let origin = origin?;
+    let resp = if cors_allowed(gw, origin) {
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .body(Body::empty())
+            .unwrap()
+    } else {
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::FORBIDDEN)
+            .body(Body::from("Origin not allowed"))
+            .unwrap()
+    };
+    Some(apply_cors(gw, Some(origin), resp))
+}
+
 /// GET /_dynapm/api/services
 pub async fn list_services(
     uri: axum::http::Uri,

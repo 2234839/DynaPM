@@ -149,6 +149,10 @@ pub struct AdminApiConfig {
     pub auth_token: Option<String>,
     /// 允许访问的 IP 白名单
     pub allowed_ips: Option<Vec<String>>,
+    /// 允许跨域访问管理 API 的 Origin 白名单（精确匹配）。
+    /// 空或未配置 = 禁止一切跨域（默认，行为与未加 CORS 前一致）；
+    /// 用于其他 DynaPM 管理面板聚合接入本机数据。鉴权仍由 authToken 把关
+    pub cors_origins: Option<Vec<String>>,
 }
 
 /// 超时配置

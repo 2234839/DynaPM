@@ -163,7 +163,30 @@ fn build_main_router(gw: Arc<Gateway>) -> axum::Router {
                     let resp = main_fallback_from_request(req).await;
                     return Ok::<_, std::convert::Infallible>(resp);
                 }
+                // CORS：仅管理面路径生效，Origin 白名单精确匹配（adminApi.corsOrigins，空 = 禁止跨域）。
+                // 预检直接短路；实际请求响应追加白名单头，鉴权仍由各 handler 的 auth_check 把关
+                let origin = req
+                    .headers()
+                    .get(axum::http::header::ORIGIN)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let is_admin_path = req.uri().path().starts_with("/_dynapm");
+                if is_admin_path && req.method() == axum::http::Method::OPTIONS {
+                    let resp = admin::cors_preflight(&gw, origin.as_deref())
+                        .unwrap_or_else(|| {
+                            axum::response::Response::builder()
+                                .status(axum::http::StatusCode::BAD_REQUEST)
+                                .body(Body::empty())
+                                .unwrap()
+                        });
+                    return Ok(resp);
+                }
                 let resp = next.run(req).await;
+                let resp = if is_admin_path {
+                    admin::apply_cors(&gw, origin.as_deref(), resp)
+                } else {
+                    resp
+                };
                 Ok::<_, std::convert::Infallible>(resp)
             }
         }))
@@ -306,6 +329,10 @@ async fn run(cfg: DynaPMConfig, port_explicit: bool) -> Result<(), String> {
         cfg.start_concurrency,
         cfg.admin_api.as_ref().and_then(|a| a.auth_token.clone()),
         cfg.admin_api.as_ref().and_then(|a| a.host.clone()),
+        cfg.admin_api
+            .as_ref()
+            .and_then(|a| a.cors_origins.clone())
+            .unwrap_or_default(),
     );
     // 记录启动期监听地址：配置变更时据此判定可否热更（socket 重绑只能重启）
     gw.set_listener(

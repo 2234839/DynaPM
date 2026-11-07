@@ -14,13 +14,37 @@ use([HeatmapChart, GridComponent, TooltipComponent, VisualMapComponent, CanvasRe
  * 低流量服务不会被高流量服务淹没，无请求的格子天然空白，也不存在堆叠/连线编造过渡的问题
  */
 
-/** 单个服务的统计（仅需分钟请求桶） */
+/** 单个服务的统计（仅需分钟请求桶），remote 时带面板名前缀 */
 interface SeriesStats {
   name: string;
   reqBuckets: [number, number][];
+  /** 所属面板显示名（本地行为空串） */
+  panelName?: string;
 }
 
 const props = defineProps<{ services: SeriesStats[] }>();
+
+/** 服务名/面板名搜索关键字（不区分大小写，空 = 不过滤） */
+const searchKw = ref('');
+/** 面板筛选：空 = 全部；'local' = 仅本地；否则为面板名 */
+const filterPanel = ref('');
+
+/** 面板名列表（去重，供筛选下拉） */
+const panelNames = computed(() =>
+  [...new Set(props.services.map((s) => s.panelName || '').filter(Boolean))].sort(),
+);
+
+/** 搜索 + 面板筛选后的服务序列 */
+const visibleServices = computed(() => {
+  const kw = searchKw.value.trim().toLowerCase();
+  return props.services.filter((s) => {
+    const panel = s.panelName || '';
+    if (filterPanel.value === 'local' && panel) return false;
+    if (filterPanel.value && filterPanel.value !== 'local' && panel !== filterPanel.value) return false;
+    if (kw && !s.name.toLowerCase().includes(kw) && !panel.toLowerCase().includes(kw)) return false;
+    return true;
+  });
+});
 
 /** 当前时间：随父组件数据轮询刷新重新计算（不能用挂载时常量，页面开久了会过滤掉新数据） */
 const now = ref(Date.now());
@@ -39,7 +63,7 @@ const STEPS = (24 * 60) / STEP_MIN;
 
 /** 有流量的服务列表（按 24h 总量降序，流量大的行放上面）及其每桶计数 */
 const rows = computed(() =>
-  props.services
+  visibleServices.value
     .map((s) => {
       const buckets = new Array<number>(STEPS).fill(0);
       const stepNow = Math.floor(now.value / (STEP_MIN * 60_000));
@@ -148,7 +172,24 @@ const chartEl = useEChart(option);
 <template>
   <div class="global-chart">
     <div class="g-head">
-      <h3>请求分布 · 最近 24 小时 <span class="g-total">{{ total24h }} 次请求</span></h3>
+      <h3>
+        请求分布 · 最近 24 小时 <span class="g-total">{{ total24h }} 次请求</span>
+      </h3>
+      <div class="g-filters">
+        <input
+          v-model="searchKw"
+          class="g-search"
+          type="search"
+          placeholder="搜索服务/面板…"
+        />
+        <select v-model="filterPanel" class="g-panel-select" title="按面板筛选">
+          <option value="">全部（{{ props.services.length }}）</option>
+          <option value="local">本地（{{ props.services.filter((s) => !s.panelName).length }}）</option>
+          <option v-for="p in panelNames" :key="p" :value="p">
+            {{ p }}（{{ props.services.filter((s) => s.panelName === p).length }}）
+          </option>
+        </select>
+      </div>
     </div>
     <div ref="chartEl" class="g-chart" :style="{ height: `${Math.max(rows.length, 1) * 26 + 40}px` }" />
     <div v-if="rows.length" class="g-rows">
@@ -168,10 +209,39 @@ const chartEl = useEChart(option);
   border-radius: 6px;
   padding: 12px 14px;
 }
+.g-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .g-head h3 {
   margin: 0 0 6px;
   font-size: 13px;
   color: #1f2328;
+}
+.g-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.g-search {
+  width: 160px;
+  padding: 3px 8px;
+  font-size: 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+}
+.g-search:focus {
+  outline: 2px solid #0969da33;
+  border-color: #0969da;
+}
+.g-panel-select {
+  padding: 3px 6px;
+  font-size: 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #fff;
 }
 .g-total {
   font-weight: 400;
