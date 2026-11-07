@@ -259,19 +259,69 @@ fn cli_admin_base(cfg: &serde_json::Value) -> (String, String) {
     )
 }
 
+/** 候选配置路径列表：显式 DYNAPM_CONFIG 优先，其后 cwd 与用户级默认并行探测 */
+fn candidate_config_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(p) = std::env::var("DYNAPM_CONFIG") {
+        paths.push(std::path::PathBuf::from(p));
+    }
+    paths.push(std::path::PathBuf::from("dynapm.config.json"));
+    // 用户级默认：与 config.rs 的解析规则保持一致（~/.config/dynapm/dynapm.config.json）
+    let home = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .and_then(|u| {
+            let out = std::process::Command::new("getent").arg("passwd").arg(&u).output().ok()?;
+            String::from_utf8_lossy(&out.stdout).split(':').nth(5).map(|s| s.to_string())
+        })
+        .or_else(|| std::env::var("HOME").ok());
+    if let Some(home) = home {
+        paths.push(std::path::Path::new(&home).join(".config/dynapm/dynapm.config.json"));
+    }
+    paths
+}
+
+/**
+ * 探测「实际在运行的网关」的管理面：按候选配置路径依次解析 admin base，
+ * 逐个向 /info 发短超时探测请求，第一个应答的配置即为运行实例所用配置。
+ * 背景：cwd 下存在示例/项目配置而运行实例用的是用户级配置时，
+ * 仅按 cwd 解析会找错实例（探测 3000 失败但实例在 80）。全都不通时返回 None。
+ */
+fn probe_running_admin() -> Option<(String, String, std::path::PathBuf)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+    for path in candidate_config_paths() {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let (base, auth) = cli_admin_base(&cfg);
+        let reachable = client
+            .get(format!("{base}/info"))
+            .header("Authorization", &auth)
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if reachable {
+            return Some((base, auth, path));
+        }
+    }
+    None
+}
+
 /** `dynapm restart`：调 /_dynapm/api/restart 让运行中网关自重启并轮询等它回来 */
 pub fn gateway_restart_cli() {
-    let path = crate::config::config_path();
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| {
-            eprintln!("❌ 读取配置 {} 失败: {e}", path.display());
-            std::process::exit(1);
-        });
-    let cfg: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|e| {
-        eprintln!("❌ 解析配置失败: {e}");
+    // 不再只认 cwd 配置：cwd 有示例配置而实例跑在用户级配置上时（port 3000 vs 80）会找错实例，
+    // 逐个候选配置探测 /info，谁应答谁就是运行实例
+    let Some((base, auth, path)) = probe_running_admin() else {
+        eprintln!("❌ 网关未运行或管理面不可达（已探测 DYNAPM_CONFIG / ./dynapm.config.json / ~/.config/dynapm/dynapm.config.json）");
         std::process::exit(1);
-    });
-    let (base, auth) = cli_admin_base(&cfg);
+    };
+    println!("🔌 运行实例配置: {}", path.display());
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
