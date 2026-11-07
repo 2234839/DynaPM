@@ -21,14 +21,17 @@ DynaPM 是一个**智能网关**：请求到达时按域名/端口找到对应�
 
 ## 怎么用
 
-### 1. 构建
+### 1. 下载
+
+从 [GitHub Releases](https://github.com/2234839/DynaPM/releases) 直接下载预编译二进制 —— 提供 Linux（x86_64 / aarch64，musl 静态链接，零依赖）与 macOS（x86_64 / aarch64）：
 
 ```bash
-git clone https://github.com/2234839/DynaPM.git
-cd DynaPM/packages/gateway-rs
-cargo build --release
-# 产物：target/release/dynapm（单文件二进制，无运行时依赖）
+# 以 Linux x86_64 为例 —— 具体文件名带版本号，见 Releases 页
+wget https://github.com/2234839/DynaPM/releases/download/<tag>/dynapm-<tag>-linux-x86_64.tar.gz
+tar xzf dynapm-*-linux-x86_64.tar.gz && chmod +x dynapm
 ```
+
+想从源码构建的话，在 `packages/gateway-rs` 里 `cargo build --release` 即可得到同样的单文件二进制。
 
 ### 2. 写一份配置
 

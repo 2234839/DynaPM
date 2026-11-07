@@ -1,36 +1,39 @@
 # DynaPM
 
-[中文文档 (Chinese)](./README_zh.md) · [详细技术文档 (Detailed Docs)](./docs/DETAILS.md)
+[English](./README.md) · [中文文档 (Chinese)](./README_zh.md) · [Detailed Docs](./docs/DETAILS.md)
 
-> **Dynamic Process Manager** — 在一台小服务器上跑几百个低频服务，访问时自动拉起，闲置时自动回收。
+> **Dynamic Process Manager** — Run hundreds of low-traffic services on a small server: started on demand when accessed, automatically reclaimed when idle.
 
 ![Tests](https://img.shields.io/badge/tests-5%2F5%20suites%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen) ![Runtime](https://img.shields.io/badge/runtime-Rust%20%2B%20tokio-orange)
 
 ---
 
-## 它解决什么问题
+## The Problem It Solves
 
-你有很多副业项目 / 内部工具 / MCP 服务，它们访问频率低，但得随时可用。每个都常驻运行会把小服务器内存吃光；上 Kubernetes 又太重。
+You have many side projects / internal tools / MCP services. They get little traffic, but must be available at all times. Keeping every one of them running will eat up a small server's memory; Kubernetes is way too heavy for this.
 
-DynaPM 是一个**智能网关**：请求到达时按域名/端口找到对应服务——没启动就自动拉起并转发；服务闲置一段时间后自动停止、释放资源。整个过程对访问者透明。
+DynaPM is a **smart gateway**: when a request arrives, it looks up the target service by domain/port — if the service isn't running, it starts it and then forwards the request; when a service has been idle for a while, it is automatically stopped to free resources. The whole process is transparent to visitors.
 
-- ⚡ **冷启动开销仅 ~25ms**（不含服务自身启动时间），用户基本无感
-- 🚀 **运行时代理延迟 1-2ms**，双向流式转发，SSE / WebSocket 开箱即用
-- 🎛️ **通用**：用 bash 命令即可接入 PM2 / Docker / systemd / 任意裸进程，不锁定基础设施
-- 🖥️ **自带管理面板**：服务列表、统计图表、远程启停、多服务器面板联邦
+- ⚡ **Cold-start overhead is only ~25ms** (excluding the service's own startup time) — virtually imperceptible
+- 🚀 **Runtime proxy latency 1-2ms**, bidirectional streaming, SSE / WebSocket out of the box
+- 🎛️ **Universal**: wire up PM2 / Docker / systemd / any bare process with bash commands — no infrastructure lock-in
+- 🖥️ **Built-in admin panel**: service list, stats charts, remote start/stop, multi-server panel federation
 
-## 怎么用
+## Getting Started
 
-### 1. 构建
+### 1. Download
+
+Grab a prebuilt static binary from [GitHub Releases](https://github.com/2234839/DynaPM/releases) — Linux (x86_64 / aarch64, musl static, zero dependencies) and macOS (x86_64 / aarch64) are available:
 
 ```bash
-git clone https://github.com/2234839/DynaPM.git
-cd DynaPM/packages/gateway-rs
-cargo build --release
-# 产物：target/release/dynapm（单文件二进制，无运行时依赖）
+# Example: Linux x86_64 — check the release page for the exact versioned filename
+wget https://github.com/2234839/DynaPM/releases/download/<tag>/dynapm-<tag>-linux-x86_64.tar.gz
+tar xzf dynapm-*-linux-x86_64.tar.gz && chmod +x dynapm
 ```
 
-### 2. 写一份配置
+Prefer building from source? `cargo build --release` in `packages/gateway-rs` produces the same single binary.
+
+### 2. Write a config
 
 ```jsonc
 {
@@ -38,7 +41,7 @@ cargo build --release
   "services": {
     "app.example.com": {
       "base": "http://127.0.0.1:3001",
-      "idleTimeout": 300000,          // 闲置 5 分钟自动停止
+      "idleTimeout": 300000,          // auto-stop after 5 minutes idle
       "commands": {
         "start": "nohup node /path/to/app.js > logs/app.log 2>&1 &",
         "stop": "lsof -ti:3001 | xargs -r kill -9",
@@ -49,38 +52,38 @@ cargo build --release
 }
 ```
 
-### 3. 启动
+### 3. Run
 
 ```bash
 DYNAPM_CONFIG=./dynapm.config.json ./dynapm
-# 管理面板：http://127.0.0.1:3000/_dynapm/panel
+# Admin panel: http://127.0.0.1:3000/_dynapm/panel
 ```
 
-现在访问 `http://app.example.com:3000`，服务会自动启动。更多配置项（健康检查、端口路由、keepWarm、超时调优等）见[详细文档](./docs/DETAILS.md)与[配置示例](./packages/gateway-rs/dynapm.config.json)。
+Now visiting `http://app.example.com:3000` starts the service automatically. For more options (health checks, port routing, keepWarm, timeout tuning, etc.), see the [detailed docs](./docs/DETAILS.md) and the [sample config](./packages/gateway-rs/dynapm.config.json).
 
-## 适用场景
+## Use Cases
 
-- 👨‍💻 个人副业项目：几十个项目随时可访问，但几乎不占内存
-- 🤖 AI Agent / MCP Server：天然「低频 + 按需」的工具服务弹性托管
-- 🛠️ 内部工具：开发 / 测试环境按需访问
-- 💰 小 VPS 成本优化：用最少的钱跑最多的服务
+- 👨‍💻 Personal side projects: dozens of projects accessible at any time, with almost no memory footprint
+- 🤖 AI Agents / MCP Servers: elastic hosting for naturally "low-frequency + on-demand" tool services
+- 🛠️ Internal tools: on-demand access for dev / staging environments
+- 💰 Small VPS cost optimization: run the most services with the least money
 
-## 鸣谢
+## Acknowledgements
 
-DynaPM 构建在这些优秀的开源项目之上：
+DynaPM is built on these great open-source projects:
 
-- [tokio](https://tokio.rs/) / [axum](https://github.com/tokio-rs/axum) — 异步运行时与 HTTP 框架
-- [reqwest](https://github.com/seanmonstar/reqwest) / [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) — 上游 HTTP 与 WebSocket 客户端
-- [Bun](https://bun.sh/) — 回归测试套件运行时
-- [Vue 3](https://vuejs.org/) / [ECharts](https://echarts.apache.org/) — 管理面板
+- [tokio](https://tokio.rs/) / [axum](https://github.com/tokio-rs/axum) — async runtime and HTTP framework
+- [reqwest](https://github.com/seanmonstar/reqwest) / [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) — upstream HTTP and WebSocket clients
+- [Bun](https://bun.sh/) — runtime for the regression test suites
+- [Vue 3](https://vuejs.org/) / [ECharts](https://echarts.apache.org/) — admin panel
 
-## 社群
+## Community
 
-[![扫码加入开发者社群](https://tsfullstack.heartstack.space/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
+[![Scan to join the developer community](https://tsfullstack.heartstack.space/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
 
-- 🐛 Bug 反馈：[GitHub Issues](https://github.com/2234839/DynaPM/issues)
-- 💡 功能建议：[GitHub Discussions](https://github.com/2234839/DynaPM/discussions)
-- 👤 作者：崮生
+- 🐛 Bug reports: [GitHub Issues](https://github.com/2234839/DynaPM/issues)
+- 💡 Feature requests: [GitHub Discussions](https://github.com/2234839/DynaPM/discussions)
+- 👤 Author: 崮生 (gs)
 
 ---
 
