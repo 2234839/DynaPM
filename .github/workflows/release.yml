@@ -45,10 +45,42 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # musl 目标交叉编译：ring 等带 C 代码的依赖需要 musl-gcc（rustup 工具链不含）
+      - name: Install musl cross toolchain
+        if: contains(matrix.target, 'unknown-linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install aarch64 musl cross compiler
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo/site-packages
+          # cc-rs 按 <arch>-linux-musl-gcc 命名找编译器，软链 gnu 交叉编译器即可（ring 不需要 musl 特有 libc 头，链接由 rustc lld 完成）
+          mkdir -p ~/.local/bin
+          ln -sf $(which aarch64-linux-gnu-gcc) ~/.local/bin/aarch64-unknown-linux-musl-gcc
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # 网关用 include_dir! 在编译期嵌入 admin-ui/dist（dist 被 gitignore），必须先构建前端
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Build admin-ui
+        run: |
+          pnpm install --frozen-lockfile --filter admin-ui
+          pnpm --filter admin-ui build
+
       - name: Build (linux/macos)
         if: runner.os != 'Windows'
         working-directory: packages/gateway-rs
         run: |
+          # aarch64 musl 用 gnu 交叉编译器编 C 依赖，链接参数指向对应工具链
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-gcc
+          fi
           RUSTFLAGS="-C target-feature=+crt-static" \
             cargo build --release --target ${{ matrix.target }}
 
