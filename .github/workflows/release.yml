@@ -32,10 +32,8 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: dynapm-${{ github.ref_name }}-macos-x86_64.tar.gz
-          # Windows：MSVC
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: dynapm-${{ github.ref_name }}-windows-x86_64.zip
+          # Windows 暂不支持：网关依赖 std::os::unix / UnixStream / netns 等 Unix 专属 API，
+          # 移植是独立工程项，待有真实需求再做
 
     steps:
       - uses: actions/checkout@v4
@@ -72,8 +70,7 @@ jobs:
           pnpm install --frozen-lockfile --filter admin-ui
           pnpm --filter admin-ui build
 
-      - name: Build (linux/macos)
-        if: runner.os != 'Windows'
+      - name: Build
         working-directory: packages/gateway-rs
         run: |
           # aarch64 musl 用 gnu 交叉编译器编 C 依赖，链接参数指向对应工具链
@@ -90,26 +87,12 @@ jobs:
         shell: pwsh
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (linux/macos)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
+      - name: Package
           mkdir -p dist
           cp packages/gateway-rs/target/${{ matrix.target }}/release/dynapm dist/
           cp README.md README_zh.md LICENSE dist/
           tar -czf ${{ matrix.archive }} -C dist .
           shasum -a 256 ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item packages/gateway-rs/target/${{ matrix.target }}/release/dynapm.exe dist/
-          Copy-Item README.md, README_zh.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.archive }}
-          $hash = (Get-FileHash ${{ matrix.archive }} -Algorithm SHA256).Hash.ToLower()
-          "$hash  ${{ matrix.archive }}" | Out-File ${{ matrix.archive }}.sha256 -Encoding ascii
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
