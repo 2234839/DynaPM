@@ -509,7 +509,7 @@ Built with amazing open-source tools:
 
 ## 📮 Support
 
-[![扫码加入微信群 / Join our WeChat group](https://tsfullstack.heartstack.space/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
+[![扫码加入微信群 / Join our WeChat group](https://streamhold.heartstack.space/svg/tsfullstack/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
 
 - 🐛 **Bug Reports**: [GitHub Issues](https://github.com/2234839/DynaPM/issues)
 - 💡 **Feature Requests**: [GitHub Discussions](https://github.com/2234839/DynaPM/discussions)

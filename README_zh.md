@@ -91,7 +91,7 @@ DynaPM 构建在这些优秀的开源项目之上：
 
 ## 社群
 
-[![扫码加入开发者社群](https://tsfullstack.heartstack.space/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
+[![扫码加入开发者社群](https://streamhold.heartstack.space/svg/tsfullstack/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
 
 - 🐛 Bug 反馈：[GitHub Issues](https://github.com/2234839/DynaPM/issues)
 - 💡 功能建议：[GitHub Discussions](https://github.com/2234839/DynaPM/discussions)
