@@ -721,17 +721,67 @@ impl Gateway {
         });
     }
 
+    /// 点燃启动：在独立 task 中推进冷启动，与请求生命周期解耦。
+    /// 客户端断开只会取消等待的请求 handler，不会取消启动本身——
+    /// 否则启动推进到一半（Starting 状态 + 已拉起进程）被取消，服务永久卡死且进程成孤儿
+    fn kick_start_detached(self: &Arc<Self>, mapping: Arc<RouteMapping>) {
+        let gw = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = gw.ensure_service_online(&mapping).await {
+                logger::warn(&format!(
+                    "⚠️ [{}] 后台冷启动失败: {}",
+                    mapping.service.config.name, e
+                ));
+            }
+        });
+    }
+
+    /// 等待启动结果：watch 状态机直到 Online / Offline（失败）/ 超时。
+    /// 请求 handler 在这里等待被取消是安全的——启动 task 不受影响，后续请求直接短路命中
+    async fn wait_online(&self, rt: &Arc<ServiceRuntime>) -> Result<(), String> {
+        let mut rx = rt.subscribe();
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(rt.config.start_timeout.saturating_add(2_000));
+        loop {
+            match rt.status() {
+                Status::Online => return Ok(()),
+                Status::Offline => {
+                    let err = rt
+                        .last_start_error
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "Service failed to start".to_string());
+                    return Err(err);
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("服务启动超时".to_string());
+            }
+            // 200ms 轮询兑底 + 状态变化即返回（与 wait_status_leave 同风格）
+            let _ = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
+        }
+    }
+
     /// 按需启动状态机：starting 等待 / stopping 等待 / offline 启动，返回是否可代理
     async fn ensure_ready(self: &Arc<Self>, mapping: &Arc<RouteMapping>) -> Result<(), String> {
         let rt = &mapping.service;
         let cfg = &rt.config;
         match rt.status() {
-            Status::Starting => self.ensure_service_online(mapping).await,
+            Status::Starting => {
+                // 自愈：Starting 可能是之前某次启动被客户端断开取消留下的半途状态，
+                // 补一次点燃（内部的启动锁 + Online 短路保证幂等），然后等结果
+                self.kick_start_detached(Arc::clone(mapping));
+                self.wait_online(rt).await
+            }
             Status::Stopping => {
                 logger::info(&format!("⏳ [{}] 等待服务停止完成...", cfg.name));
                 if wait_status_leave(rt, Status::Stopping, self.params().stop_wait_ms).await {
                     if rt.status() == Status::Offline {
-                        self.ensure_service_online(mapping).await
+                        rt.set_status(Status::Starting);
+                        self.kick_start_detached(Arc::clone(mapping));
+                        self.wait_online(rt).await
                     } else {
                         Ok(())
                     }
@@ -742,7 +792,11 @@ impl Gateway {
             }
             Status::Offline => {
                 logger::info(&format!("🚀 [{}] 启动服务...", cfg.name));
-                self.ensure_service_online(mapping).await
+                // 先同步置 Starting 再点燃：否则后台任务尚未跑到 set_status(Starting) 时，
+                // 下面的 wait_online 会读到 Offline 误判为「启动失败」直接 503（服务实际还在正常拉起）
+                rt.set_status(Status::Starting);
+                self.kick_start_detached(Arc::clone(mapping));
+                self.wait_online(rt).await
             }
             Status::Online => Ok(()),
         }
