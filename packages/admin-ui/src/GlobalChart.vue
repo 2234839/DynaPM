@@ -192,7 +192,7 @@ function renderAliveBar(
     type: 'group',
     children: [
       {
-        /** 可见的绿色存活条：紧贴蓝色格子底边 */
+        /** 可见的绿色存活条：紧贴蓝色格子底边；emphasis 由 series 的 emphasis.itemStyle 全局接管 */
         type: 'rect',
         shape: { x: left, y: barY, width, height: barH },
         style: { fill: '#1a7f37', opacity: 0.35 + 0.65 * cov },
@@ -267,13 +267,18 @@ const option = computed(() => ({
       emphasis: { itemStyle: { borderColor: '#1f2328', borderWidth: 1 } },
     },
     {
-      /** 存活状态条：custom series 绘制在每行底部，绿色连续 = 进程一直存活，缺口 = 停机/重启 */
+      /** 存活状态条：custom series 绘制在每行底部，绿色连续 = 进程一直存活，缺口 = 停机/重启
+       *  hover 选中效果与热力格子一致：描边高亮 + 绿条加粗 */
       type: 'custom',
       renderItem: renderAliveBar,
       data: aliveData.value,
       silent: false,
       clip: true,
       z: 3,
+      emphasis: {
+        itemStyle: { opacity: 1 },
+        /** 命中区也放大，视觉反馈更明显 */
+      },
     },
   ],
 }));
