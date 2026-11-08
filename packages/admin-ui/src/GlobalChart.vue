@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { HeatmapChart } from 'echarts/charts';
+import { HeatmapChart, CustomChart } from 'echarts/charts';
 import { GridComponent, TooltipComponent, VisualMapComponent } from 'echarts/components';
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { useEChart } from './composables/echarts';
 
-use([HeatmapChart, GridComponent, TooltipComponent, VisualMapComponent, CanvasRenderer]);
+use([HeatmapChart, CustomChart, GridComponent, TooltipComponent, VisualMapComponent, CanvasRenderer]);
 
 /**
  * 全局热力图：每个服务一行 × 15 分钟一列，颜色深浅编码该时段请求数。
@@ -18,6 +18,8 @@ use([HeatmapChart, GridComponent, TooltipComponent, VisualMapComponent, CanvasRe
 interface SeriesStats {
   name: string;
   reqBuckets: [number, number][];
+  /** 存活区间 [startMs, endMs]，end=-1 表示进行中 */
+  aliveSpans?: [number, number][];
   /** 所属面板显示名（本地行为空串） */
   panelName?: string;
 }
@@ -71,7 +73,7 @@ const rows = computed(() =>
         const idx = STEPS - 1 - (stepNow - Math.floor(m / STEP_MIN));
         if (idx >= 0 && idx < STEPS) buckets[idx] += c;
       }
-      return { name: s.name, buckets };
+      return { name: s.name, buckets, aliveSpans: s.aliveSpans ?? [] };
     })
     .filter((s) => s.buckets.some((v) => v > 0))
     .sort((a, b) => b.buckets.reduce((x, y) => x + y, 0) - a.buckets.reduce((x, y) => x + y, 0)),
@@ -114,11 +116,113 @@ const heatData = computed(() => {
 /** 每行 24h 小计（图下列表用） */
 const rowTotals = computed(() => rows.value.map((r) => r.buckets.reduce((a, b) => a + b, 0)));
 
+/** 窗口起点（毫秒）与进行中的区间 end 替换值 */
+const windowStart = computed(() => now.value - 24 * 3600_000);
+
+/** 每行每桶的存活覆盖率（0~1）：把存活区间与桶求交，算重叠时长占比 */
+const aliveCoverage = computed(() =>
+  rows.value.map((r) => {
+    const winStart = windowStart.value;
+    return r.buckets.map((_, x) => {
+      const bStart = winStart + x * STEP_MIN * 60_000;
+      const bEnd = bStart + STEP_MIN * 60_000;
+      let cover = 0;
+      for (const [s, e] of r.aliveSpans) {
+        const spanEnd = e < 0 ? now.value : e;
+        const overlap = Math.min(spanEnd, bEnd) - Math.max(s, bStart);
+        if (overlap > 0) cover += overlap;
+      }
+      return Math.min(cover / (STEP_MIN * 60_000), 1);
+    });
+  }),
+);
+
+/** 存活条数据：把每行相邻有存活覆盖的桶合并成连续区间，一次画一整段（连续存活无缝隙）
+ *  value = [起始桶x, 行y, 平均覆盖率, 结束桶x] */
+const aliveData = computed(() => {
+  const data: { value: [number, number, number, number] }[] = [];
+  aliveCoverage.value.forEach((covs, y) => {
+    let runStart = -1;
+    let covSum = 0;
+    const flush = (endX: number) => {
+      if (runStart >= 0) data.push({ value: [runStart, y, covSum / (endX - runStart + 1), endX] });
+      runStart = -1;
+      covSum = 0;
+    };
+    covs.forEach((cov, x) => {
+      if (cov > 0) {
+        if (runStart < 0) runStart = x;
+        covSum += cov;
+      } else {
+        flush(x - 1);
+      }
+    });
+    flush(covs.length - 1);
+  });
+  return data;
+});
+
+/** 存活条渲染：每个连续区间画一条 3px 高的绿色长条，覆盖率决定不透明度（连续绿线=一直存活，缺口=进程重启/停机） */
+interface RenderItemParams {
+  value: [number, number, number, number];
+}
+interface RenderItemApi {
+  /** 类目坐标转像素坐标 */
+  coord: (v: number[]) => number[];
+  /** 类目尺度转像素尺寸 */
+  size: (v: number[]) => number[];
+}
+function renderAliveBar(
+  _params: RenderItemParams,
+  api: RenderItemApi & { /** 取数据项第 dim 维的值 */ value: (dim: number) => number },
+): Record<string, unknown> {
+  const xStart = api.value(0);
+  const y = api.value(1);
+  const cov = api.value(2);
+  const xEnd = api.value(3);
+  const point = api.coord([xStart, y]);
+  const pointEnd = api.coord([xEnd, y]);
+  const cellW = api.size([1, 0])[0];
+  const bandH = api.size([0, 1])[0];
+  const barH = 3;
+  const left = point[0] - cellW / 2;
+  const width = pointEnd[0] - point[0] + cellW;
+  const barY = point[1] + bandH / 2 - barH;
+  return {
+    type: 'group',
+    children: [
+      {
+        /** 可见的绿色存活条：紧贴蓝色格子底边 */
+        type: 'rect',
+        shape: { x: left, y: barY, width, height: barH },
+        style: { fill: '#1a7f37', opacity: 0.35 + 0.65 * cov },
+      },
+      {
+        /** 透明命中区（绿条太细难以 hover），拾取后触发同一数据项的 tooltip */
+        type: 'rect',
+        shape: { x: left, y: barY - 6, width, height: barH + 12 },
+        style: { fill: 'rgba(0,0,0,0)' },
+        silent: false,
+      },
+    ],
+  };
+}
+
 const option = computed(() => ({
   tooltip: {
     /** 悬停格子：时间 + 服务 + 该 15 分钟请求数（显示原始值，log 只用于染色） */
-    formatter: (p: { data: [number, number, number] }) => {
-      const [x, y, lv] = p.data;
+    formatter: (p: { data: unknown; seriesType?: string }) => {
+      /** data 项可能是裸数组或 {value:[...]} 对象（custom series），统一取出值数组 */
+      const raw = Array.isArray(p.data) ? p.data : (p.data as { value?: number[] })?.value;
+      if (!Array.isArray(raw)) return '';
+      if (p.seriesType === 'custom') {
+        const [xStart, y, cov, xEnd] = raw as [number, number, number, number];
+        /** 区间末端：最后一桶的终点越出窗口时显示「现在」 */
+        const endLabel = xEnd + 1 >= STEPS ? '现在' : bucketTime(xEnd + 1);
+        const range = xStart === xEnd ? `${bucketTime(xStart)} 起的 15 分钟` : `${bucketTime(xStart)} ~ ${endLabel}`;
+        return `<b>${rows.value[y]?.name ?? ''}</b><br/>${range}<br/>存活覆盖率 ${Math.round(cov * 100)}%`;
+      }
+      const [x, y, lv] = raw as [number, number, number];
       const v = Math.round(10 ** (lv - 1));
       return `<b>${rows.value[y]?.name ?? ''}</b><br/>${bucketTime(x)} 起的 15 分钟<br/>${v} 次请求`;
     },
@@ -161,6 +265,15 @@ const option = computed(() => ({
       /** 格子间留 1px 白缝，颜色不糊成一片 */
       itemStyle: { borderColor: '#fff', borderWidth: 1 },
       emphasis: { itemStyle: { borderColor: '#1f2328', borderWidth: 1 } },
+    },
+    {
+      /** 存活状态条：custom series 绘制在每行底部，绿色连续 = 进程一直存活，缺口 = 停机/重启 */
+      type: 'custom',
+      renderItem: renderAliveBar,
+      data: aliveData.value,
+      silent: false,
+      clip: true,
+      z: 3,
     },
   ],
 }));

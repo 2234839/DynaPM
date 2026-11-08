@@ -104,6 +104,7 @@ const globalSeries = computed(() =>
   fedRows.value.map((r) => ({
     name: r.remote ? `${r.panelName}/${r.svc.name}` : r.svc.name,
     reqBuckets: statsMap.value.get(r.uid)?.reqBuckets ?? [],
+    aliveSpans: statsMap.value.get(r.uid)?.aliveSpans ?? [],
     panelName: r.remote ? r.panelName : '',
   })),
 );
