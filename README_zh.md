@@ -2,9 +2,9 @@
 
 [English](./README.md) · [详细技术文档](./docs/DETAILS_zh.md)
 
-> **动态进程管理器** — 在一台小服务器上跑几百个低频服务，访问时自动拉起，闲置时自动回收。
+> **动态进程管理器** — 在一台小服务器上跑**上万**个低频服务，访问时自动拉起，闲置时自动回收。
 
-![Tests](https://img.shields.io/badge/tests-5%2F5%20suites%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen) ![Runtime](https://img.shields.io/badge/runtime-Rust%20%2B%20tokio-orange)
+![Tests](https://img.shields.io/badge/tests-5%2F5%20suites%20passing-green) ![Performance](https://img.shields.io/badge/overhead-25ms-brightgreen) ![Scale](https://img.shields.io/badge/benchmark-10k%20services%20%40%206.4%25%20concurrency-blue) ![Runtime](https://img.shields.io/badge/runtime-Rust%20%2B%20tokio-orange)
 
 ---
 
@@ -16,8 +16,9 @@ DynaPM 是一个**智能网关**：请求到达时按域名/端口找到对应�
 
 - ⚡ **冷启动开销仅 ~25ms**（不含服务自身启动时间），用户基本无感
 - 🚀 **运行时代理延迟 1-2ms**，双向流式转发，SSE / WebSocket 开箱即用
+- 📈 **万级实测**：10,000 个真实启停实例压测，成功率 99.97%，Zipf 访问分布下并发进程峰值仅 6.4%，网关内存 <700MB
 - 🎛️ **通用**：用 bash 命令即可接入 PM2 / Docker / systemd / 任意裸进程，不锁定基础设施
-- 🖥️ **自带管理面板**：服务列表、统计图表、远程启停、多服务器面板联邦
+- 🖥️ **自带管理面板**：服务列表、统计图表、远程启停、多服务器面板联邦，万级规模下筛选/排序/分页保持流畅
 
 ## 怎么用
 
@@ -67,6 +68,17 @@ DYNAPM_CONFIG=./dynapm.config.json ./dynapm
 - 🤖 AI Agent / MCP Server：天然「低频 + 按需」的工具服务弹性托管
 - 🛠️ 内部工具：开发 / 测试环境按需访问
 - 💰 小 VPS 成本优化：用最少的钱跑最多的服务
+
+## 压测数据
+
+复现命令在 `packages/gateway-rs/test/`：
+
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 万级转发吞吐 | `bun test/bench-10k.ts --services 10000 --concurrency 20` | 14,638 req/s，p99 7.2ms，管理面板 API gzip 后 2.6KB |
+| 万实例真实启停 | `bun test/bench-churn-10k.ts --services 10000 --users 100` | 120s 内 31k 请求成功率 99.97%，6,500+ 次真实冷启动 p50 1.3s，并发进程峰值 6.4%，无泄漏 |
+
+> 万级成立的前提是「低频 + 长尾」访问分布（Zipf）；瞬时万级冷启动受启动并发上限保护会排队。单机压测环境：Linux x86_64 / WSL2。
 
 ## 鸣谢
 
