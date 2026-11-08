@@ -858,13 +858,10 @@ impl Gateway {
         let cfg = &rt.config;
         rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
         rt.active_connections.fetch_add(1, Ordering::Relaxed);
-        struct ConnGuard(Arc<ServiceRuntime>);
-        impl Drop for ConnGuard {
-            fn drop(&mut self) {
-                self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        let _guard = ConnGuard(Arc::clone(rt));
+        // 连接计数守卫：不能只挂在函数作用域——本函数返回后 body 仍在流式泵送，
+        // 若此刻就减计数，闲置回收会把「响应头已回、body 未传完」的服务误判为闲置
+        // （典型受害者：秒回 chunked 后长流式输出的服务），故把守卫移交给响应体流
+        let guard = ConnGuardForStream(Arc::clone(rt));
         let proxy_started_at = std::time::Instant::now();
 
         let scheme = if mapping.target_https { "https" } else { "http" };
@@ -1084,6 +1081,18 @@ impl Gateway {
         } else {
             body
         };
+        // 连接计数守卫移交给 body 流：body 传完（或客户端断开导致 stream drop）才减计数
+        let body = Body::from_stream(ConnectionGuardStream {
+            inner: body.into_data_stream(),
+            _guard: Some(guard),
+        });
+        // 流式 body 期间持续续命：每收到一块上游字节就刷新 last_access，
+        // 长流式响应（chunked padding/SSE）期间闲置回收器不会误杀服务
+        let rt_for_stream = Arc::clone(rt);
+        let body = Body::from_stream(body.into_data_stream().map(move |item| {
+            rt_for_stream.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
+            item
+        }));
         let mut out = axum::response::Response::builder().status(status_code);
         for (name, value) in response_headers.iter() {
             out = out.header(name, value);
@@ -1681,6 +1690,49 @@ impl tokio::io::AsyncWrite for WsUpstreamStream {
             WsUpstreamStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             WsUpstreamStream::Uds(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
+    }
+}
+
+/// 连接计数守卫流：把 proxy_request 的连接计数守卫挂在响应体流上，
+/// body 传完或流被 drop（客户端断开/出错）时才释放计数。
+/// 函数作用域守卫会在「响应头返回即 return」时提前释放，导致长流式响应
+/// 期间服务被闲置回收器误杀（active_connections==0 但流仍在传输）
+struct ConnectionGuardStream<S> {
+    inner: S,
+    _guard: Option<ConnGuardForStream>,
+}
+
+/// 守卫句柄类型（与 proxy_request 内部 ConnGuard 同构，独立定义避免作用域纠缠）
+struct ConnGuardForStream(Arc<ServiceRuntime>);
+impl Drop for ConnGuardForStream {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl<S> futures_util::Stream for ConnectionGuardStream<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+{
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // 流结束即释放守卫（正常传完或上游结束）
+        let item = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(item, std::task::Poll::Ready(None)) {
+            self._guard.take();
+        }
+        item
+    }
+}
+
+impl<S> Drop for ConnectionGuardStream<S> {
+    fn drop(&mut self) {
+        // 客户端断开等场景 stream 被提前 drop：Drop Option 内的句柄完成减计数
+        self._guard.take();
     }
 }
 
