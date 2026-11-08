@@ -38,6 +38,23 @@ const serviceKeys = computed(() => {
     return terms.every((t) => hay.includes(t));
   });
 });
+/** 服务卡片分页：万级服务一次性渲染会冻结主线程 */
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
+const pageSize = ref(20);
+const pageNo = ref(1);
+const totalPages = computed(() => Math.max(1, Math.ceil(serviceKeys.value.length / pageSize.value)));
+/** 当前页的服务 key（只渲染这一页的卡片） */
+const renderedKeys = computed(() =>
+  serviceKeys.value.slice((pageNo.value - 1) * pageSize.value, pageNo.value * pageSize.value),
+);
+/** 过滤条件/页大小变化时回到第一页 */
+watch([search, pageSize], () => {
+  pageNo.value = 1;
+});
+/** 翻页并夹紧到有效范围 */
+function gotoPage(p: number): void {
+  pageNo.value = Math.min(totalPages.value, Math.max(1, p));
+}
 /** 健康检查类型选项 */
 const hcTypes = ['tcp', 'http', 'command', 'none'];
 
@@ -63,6 +80,13 @@ function loadForm(cfg: Record<string, any>): void {
   form.aggressiveReclaim = cfg.aggressiveReclaim ?? false;
   form.memReclaimThresholdPct = cfg.memReclaimThresholdPct ?? 15;
   form.services = cfg.services ?? {};
+  // 补齐缺失的嵌套对象，避免表单绑定读 undefined（proxyOnly 等精简配置可能没有这些字段）
+  for (const s of Object.values(form.services) as Record<string, any>[]) {
+    if (!s.commands) s.commands = { start: '', stop: '' };
+    if (s.commands.start === undefined) s.commands.start = '';
+    if (s.commands.stop === undefined) s.commands.stop = '';
+    if (!s.healthCheck) s.healthCheck = { type: 'none' };
+  }
 }
 
 /** 拉取配置 */
@@ -88,7 +112,9 @@ function syncJson(): void {
   out.aggressiveReclaim = form.aggressiveReclaim || undefined;
   out.memReclaimThresholdPct = form.aggressiveReclaim ? form.memReclaimThresholdPct : undefined;
   out.services = { ...form.services };
-  jsonText.value = JSON.stringify(out, null, 2);
+  // 大配置（服务多）用紧凑格式：pretty-print 会把 textarea 撑到数 MB 卡死主线程
+  const compact = Object.keys(out.services).length > 200;
+  jsonText.value = JSON.stringify(out, null, compact ? 0 : 2);
 }
 
 /** JSON 文本 → 表单（切换回可视化时同步） */
@@ -245,7 +271,7 @@ onUnmounted(() => clearInterval(pollTimer));
         已过滤，仅显示命中的 {{ serviceKeys.length }} 个服务
       </p>
 
-      <div v-for="key in serviceKeys" :key="key" class="svc-card">
+      <div v-for="key in renderedKeys" :key="key" class="svc-card">
         <div class="svc-card-head">
           <b>{{ key }}</b>
           <div>
@@ -277,6 +303,24 @@ onUnmounted(() => clearInterval(pollTimer));
         </div>
       </div>
       <p v-if="!serviceKeys.length" class="empty">暂无服务，点击「添加服务」</p>
+
+      <!-- 服务分页 -->
+      <div v-if="totalPages > 1 || serviceKeys.length > PAGE_SIZE_OPTIONS[0]" class="cfg-pager">
+        <button class="btn" :disabled="pageNo <= 1" @click="gotoPage(pageNo - 1)">上一页</button>
+        <span class="cfg-pager-info">第 {{ pageNo }} / {{ totalPages }} 页（{{ serviceKeys.length }} 个服务）</span>
+        <input
+          class="cfg-input cfg-pager-jump"
+          type="number"
+          min="1"
+          :max="totalPages"
+          :value="pageNo"
+          @change="gotoPage(parseInt(($event.target as HTMLInputElement).value) || 1)"
+        />
+        <button class="btn" :disabled="pageNo >= totalPages" @click="gotoPage(pageNo + 1)">下一页</button>
+        <select v-model.number="pageSize" class="cfg-input">
+          <option v-for="n in PAGE_SIZE_OPTIONS" :key="n" :value="n">{{ n }} 条/页</option>
+        </select>
+      </div>
     </div>
 
     <!-- JSON 模式 -->
@@ -289,6 +333,15 @@ onUnmounted(() => clearInterval(pollTimer));
 <style scoped>
 /* 毫秒输入旁的友好时长提示 */
 .ms-hint { color: #0969da; font-weight: 600; white-space: nowrap; }
+/* 服务列表分页条 */
+.cfg-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.cfg-pager-info { color: #57606a; font-size: 12px; }
+.cfg-pager-jump { width: 64px; }
 /* 输入框与右侧提示同行排布 */
 .cfg-row { display: flex; align-items: center; gap: 6px; }
 .mode-tabs {

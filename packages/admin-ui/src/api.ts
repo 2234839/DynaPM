@@ -110,23 +110,49 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/** 单个服务历史统计（分钟请求桶 + 存活区间） */
+/** 单个服务历史统计（服务端已按窗口裁剪 + step 聚合 + 扁平编码） */
 export interface ServiceStats {
   name: string;
-  /** 分钟桶 [minuteEpoch, count] */
-  reqBuckets: [number, number][];
-  /** 存活区间 [startMs, endMs]，end=-1 表示进行中 */
-  aliveSpans: [number, number][];
+  /** 聚合分钟桶扁平数组 [minuteEpoch, count, minuteEpoch, count, …]（分钟已对齐 step） */
+  reqBuckets: number[];
+  /** 存活区间扁平数组 [startMs, endMs, startMs, endMs, …]，已裁剪到请求窗口 */
+  aliveSpans: number[];
 }
 
-/** 获取服务列表 */
-export function fetchServices(): Promise<{ services: ServiceListItem[] }> {
-  return api('/_dynapm/api/services');
+/** stats 接口分页响应（按服务名排序，offset 游标翻页；旧版后端无这些字段时 services 仍可用） */
+export interface StatsPage {
+  total?: number;
+  hasMore?: boolean;
+  nextOffset?: number;
+  services: ServiceStats[];
 }
 
-/** 获取各服务历史统计（供图表） */
-export function fetchStats(): Promise<{ services: ServiceStats[] }> {
-  return api('/_dynapm/api/stats');
+/** 获取服务列表（epoch 游标：代数未变时服务列表为空数组，调用方沿用旧数据跳过重渲染） */
+export function fetchServices(epoch?: number): Promise<{ epoch?: number; services: ServiceListItem[] }> {
+  return api(`/_dynapm/api/services${epoch != null ? `?epoch=${epoch}` : ''}`);
+}
+
+/** stats 单页大小：有数据的服务通常远小于服务总数，单页足够；超出时分页拉全 */
+const STATS_PAGE_LIMIT = 500;
+
+/** 获取各服务历史统计（自动翻页聚合到完整结果；from/to 分钟 epoch 窗口，step 聚合粒度） */
+export async function fetchStats(fromMin?: number, toMin?: number, step = 15): Promise<{ services: ServiceStats[] }> {
+  const q = new URLSearchParams();
+  if (fromMin != null) q.set('from', String(fromMin));
+  if (toMin != null) q.set('to', String(toMin));
+  q.set('step', String(step));
+  q.set('limit', String(STATS_PAGE_LIMIT));
+  const all: ServiceStats[] = [];
+  let offset = 0;
+  // 有界翻页：防御性上限，避免后端异常时死循环
+  for (let guard = 0; guard < 100; guard++) {
+    q.set('offset', String(offset));
+    const page = await api<StatsPage>(`/_dynapm/api/stats?${q.toString()}`);
+    all.push(...(page.services ?? []));
+    if (!page.hasMore || !(page.services ?? []).length) break;
+    offset = page.nextOffset ?? offset + (page.services ?? []).length;
+  }
+  return { services: all };
 }
 
 /** 获取配置文件（authToken 已脱敏，附带 _mtime 用于外部修改检测） */

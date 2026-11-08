@@ -5,7 +5,7 @@ use crate::executor::{self, CommandOptions};
 use crate::stats::StatsFile;
 use crate::{health, logger};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -63,8 +63,10 @@ pub struct ServiceRuntime {
     pub request_count: AtomicU64,
     /// 累计上游响应耗时（毫秒，从转发开始到上游响应头返回）
     pub total_request_ms: AtomicI64,
-    /** 持久化历史统计（mmap 文件，30 天分钟请求桶 + 存活区间；打开失败为 None） */
-    pub stats: Option<StatsFile>,
+    /** 持久化历史统计（mmap 文件，30 天分钟请求桶 + 存活区间）。
+     *  懒打开：首次写入/读取时才 mmap；服务转为 offline 时卸载映射，万级闲置实例不占驻留内存。
+     *  打开失败不重试（永久 None），数据丢失可接受（统计降级） */
+    stats: RwLock<Option<Arc<StatsFile>>>,
     /// 最近一次启动失败的开始时刻（unix 毫秒，0 = 无失败记录）
     pub last_start_fail_ms: AtomicI64,
     /// 连续启动失败次数（成功启动清零；冷却时长按次数指数退避）
@@ -78,7 +80,6 @@ impl ServiceRuntime {
     pub fn new(config: ServiceConfig) -> Arc<Self> {
         let initial = if config.proxy_only { Status::Online } else { Status::Offline };
         let paused = crate::procreg::is_paused(&config.name);
-        let stats = crate::stats::open_for(&config.name);
         let (tx, rx) = watch::channel(initial);
         let now = now_ms();
         Arc::new(Self {
@@ -98,7 +99,7 @@ impl ServiceRuntime {
             paused: AtomicBool::new(paused),
             request_count: AtomicU64::new(0),
             total_request_ms: AtomicI64::new(0),
-            stats,
+            stats: RwLock::new(None),
             proc_cpu_last: Mutex::new(None),
             last_start_fail_ms: AtomicI64::new(0),
             start_fail_streak: AtomicU64::new(0),
@@ -140,10 +141,42 @@ impl ServiceRuntime {
         *self.status_tx.borrow()
     }
 
-    /// 设置状态并通知所有等待者（同步记录存活区间到持久层）
+    /// 取统计文件用于写入（懒打开，文件不存在则创建；失败返回 None 且不重试）。
+    /// 并发首写放写锁内保证只 mmap 一次
+    fn stats_file_for_write(&self) -> Option<Arc<StatsFile>> {
+        let guard = self.stats.read().unwrap();
+        if let Some(st) = guard.as_ref() {
+            return Some(Arc::clone(st));
+        }
+        drop(guard);
+        let mut wguard = self.stats.write().unwrap();
+        if wguard.is_none() {
+            *wguard = crate::stats::open_for(&self.config.name).map(Arc::new);
+        }
+        wguard.as_ref().map(Arc::clone)
+    }
+
+    /// 取统计文件用于读取（面板轮询）：只打开磁盘上已存在的文件。
+    /// 万级实例下从没跑过的服务没有统计文件，轮询绝不为其凭空创建 mmap（内存优化关键路径）
+    pub fn stats_file_readonly(&self) -> Option<Arc<StatsFile>> {
+        if let Some(st) = self.stats.read().unwrap().as_ref() {
+            return Some(Arc::clone(st));
+        }
+        if !crate::stats::exists_for(&self.config.name) {
+            return None;
+        }
+        self.stats_file_for_write()
+    }
+
+    /// 设置状态并通知所有等待者（同步记录存活区间到持久层；转 offline 时卸载映射）
     pub fn set_status(&self, s: Status) {
-        if let Some(st) = &self.stats {
-            st.record_status(s == Status::Online);
+        let online = s == Status::Online;
+        if let Some(st) = self.stats_file_for_write() {
+            st.record_status(online);
+        }
+        if !online {
+            // 离线后不再有写入方，卸载 mmap 释放驻留内存（下次启动重新打开，数据在磁盘上）
+            *self.stats.write().unwrap() = None;
         }
         let _ = self.status_tx.send(s);
     }
@@ -151,7 +184,7 @@ impl ServiceRuntime {
     /// 记录一次请求（计数 + 持久层分钟桶）
     pub fn record_request(&self) {
         self.request_count.fetch_add(1, Ordering::Relaxed);
-        if let Some(st) = &self.stats {
+        if let Some(st) = self.stats_file_for_write() {
             st.record_request();
         }
     }

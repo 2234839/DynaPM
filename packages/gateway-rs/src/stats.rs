@@ -46,7 +46,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/** mmap 持久化统计文件（生命周期与进程一致，不 munmap） */
+/** mmap 持久化统计文件（Drop 时 munmap，停止的服务不占驻留内存） */
 pub struct StatsFile {
     ptr: *mut u8,
 }
@@ -54,6 +54,14 @@ pub struct StatsFile {
 // mmap 指针跨线程共享；写入均为原子槽写，无数据竞争
 unsafe impl Send for StatsFile {}
 unsafe impl Sync for StatsFile {}
+
+impl Drop for StatsFile {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr.cast(), FILE_SIZE);
+        }
+    }
+}
 
 impl StatsFile {
     /// 打开（不存在则创建初始化）统计文件；失败返回 None（统计降级为不可用）
@@ -204,8 +212,13 @@ impl StatsFile {
             return Vec::new();
         }
         let start = since_minute.saturating_sub(base) as usize;
+        // 扫描上界用 last_minute 夹紧：环形数组在当前分钟之后是空洞，
+        // 万级服务逐个全环扫描是每次轮询上亿次 volatile 读的纯 CPU 热点
+        let last = self.rd_u64(OFF_LAST_MIN);
+        let end = (last.saturating_sub(base) as usize + 1).min(BUCKETS);
+        let start = start.min(end);
         let mut out = Vec::new();
-        for i in start..BUCKETS {
+        for i in start..end {
             let c = self.rd_u32(OFF_COUNTS + i * 4);
             if c > 0 {
                 out.push((base + i as u64, c));
@@ -226,6 +239,39 @@ impl StatsFile {
         }
         out
     }
+
+    /// 窗口 [from, to]（分钟）内是否有任何数据（请求桶非零或有存活段）。
+    /// 供 stats 接口过滤零数据服务：万级实例下长尾服务连序列化都不该发生
+    pub fn has_data_in_window(&self, from_minute: u64, to_minute: u64) -> bool {
+        let base = self.rd_u64(OFF_BASE_MIN);
+        if base != 0 {
+            let start = from_minute.saturating_sub(base) as usize;
+            let last = self.rd_u64(OFF_LAST_MIN);
+            let end = (last.saturating_sub(base) as usize + 1).min(BUCKETS);
+            let end = end.min((to_minute.saturating_sub(base) as usize + 1).max(start));
+            for i in start..end {
+                if self.rd_u32(OFF_COUNTS + i * 4) > 0 {
+                    return true;
+                }
+            }
+        }
+        // 存活段与窗口求交（SPAN_OPEN 视为延伸到现在）
+        let now = now_ms();
+        let from_ms = from_minute * 60_000;
+        let to_ms = to_minute * 60_000;
+        let head = self.rd_u32(OFF_SPAN_HEAD) as usize;
+        let len = self.rd_u32(OFF_SPAN_LEN) as usize;
+        for i in 0..len {
+            let idx = (head + SPANS - len + i) % SPANS;
+            let s = self.rd_u64(OFF_SPANS + idx * 16);
+            let e_raw = self.rd_u64(OFF_SPANS + idx * 16 + 8);
+            let e = if e_raw == SPAN_OPEN { now } else { e_raw };
+            if e >= from_ms && s <= to_ms {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 use std::os::unix::io::AsRawFd;
@@ -237,6 +283,15 @@ pub fn stats_file_for(dir: &std::path::Path, name: &str) -> PathBuf {
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
         .collect();
     dir.join(format!("{safe}.bin"))
+}
+
+/** 该服务的统计文件是否已存在（从未写入过则不存在）。
+ *  读取侧先查这个再懒打开：避免面板轮询把万级从未访问服务的文件 mmap 出来（甚至凭空创建文件） */
+pub fn exists_for(name: &str) -> bool {
+    match STATS_DIR.get().and_then(|d| d.as_ref()) {
+        Some(dir) => stats_file_for(dir, name).exists(),
+        None => false,
+    }
 }
 
 /** 打开（或降级返回 None）某服务的持久化统计 */

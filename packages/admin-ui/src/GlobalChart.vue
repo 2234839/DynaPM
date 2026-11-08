@@ -5,6 +5,7 @@ import { GridComponent, TooltipComponent, VisualMapComponent } from 'echarts/com
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { useEChart } from './composables/echarts';
+import { persistedRef } from './persistedRef';
 
 use([HeatmapChart, CustomChart, GridComponent, TooltipComponent, VisualMapComponent, CanvasRenderer]);
 
@@ -28,8 +29,8 @@ const props = defineProps<{ services: SeriesStats[] }>();
 
 /** 服务名/面板名搜索关键字（不区分大小写，空 = 不过滤） */
 const searchKw = ref('');
-/** 面板筛选：空 = 全部；'local' = 仅本地；否则为面板名 */
-const filterPanel = ref('');
+/** 面板筛选：空 = 全部；'local' = 仅本地；否则为面板名（用户选择本地持久化） */
+const filterPanel = persistedRef('chart.filterPanel', '');
 
 /** 面板名列表（去重，供筛选下拉） */
 const panelNames = computed(() =>
@@ -63,21 +64,35 @@ const STEP_MIN = 15;
 /** 24h 共 96 个桶 */
 const STEPS = (24 * 60) / STEP_MIN;
 
-/** 有流量的服务列表（按 24h 总量降序，流量大的行放上面）及其每桶计数 */
+/** 有流量的服务列表（按 24h 总量降序，流量大的行放上面）及其每桶计数。
+ *  万级服务下 canvas 数据项数 = 行数 × 96，不限制会把图表渲染拖到数十秒；
+ *  只画流量 Top-K，搜索/筛选命中后仍可定位任意服务 */
+/** 可选展示行数与默认值：行数 × 96 个 canvas 数据项，过大拖慢渲染（用户选择本地持久化） */
+const ROW_OPTIONS = [10, 20, 50, 100, 200];
+const maxRows = persistedRef('chart.maxRows', 50);
+/** 未进上限的低流量服务数（截断提示用） */
+const truncatedCount = computed(() => rows.value.length - topRows.value.length);
 const rows = computed(() =>
   visibleServices.value
     .map((s) => {
       const buckets = new Array<number>(STEPS).fill(0);
       const stepNow = Math.floor(now.value / (STEP_MIN * 60_000));
-      for (const [m, c] of s.reqBuckets) {
+      // 后端扁平编码 [minute, count, …]，分钟已按 step 对齐
+      for (let i = 0; i + 1 < s.reqBuckets.length; i += 2) {
+        const m = s.reqBuckets[i]!;
+        const c = s.reqBuckets[i + 1]!;
         const idx = STEPS - 1 - (stepNow - Math.floor(m / STEP_MIN));
         if (idx >= 0 && idx < STEPS) buckets[idx] += c;
       }
-      return { name: s.name, buckets, aliveSpans: s.aliveSpans ?? [] };
+      const spans: [number, number][] = [];
+      for (let i = 0; i + 1 < s.aliveSpans.length; i += 2) spans.push([s.aliveSpans[i]!, s.aliveSpans[i + 1]!]);
+      return { name: s.name, buckets, aliveSpans: spans };
     })
     .filter((s) => s.buckets.some((v) => v > 0))
     .sort((a, b) => b.buckets.reduce((x, y) => x + y, 0) - a.buckets.reduce((x, y) => x + y, 0)),
 );
+/** 实际绘制的行（Top-K 截断后） */
+const topRows = computed(() => rows.value.slice(0, maxRows.value));
 
 /** 桶起始时间文本（tooltip 用）：由桶索引反推 HH:MM */
 const bucketTime = (x: number) => {
@@ -99,13 +114,13 @@ const xLabels = computed(() => {
 /** 24h 总请求数 */
 const total24h = computed(() => rows.value.reduce((acc, r) => acc + r.buckets.reduce((a, b) => a + b, 0), 0));
 
-/** 单格最大计数（色阶上限） */
-const maxCell = computed(() => rows.value.reduce((acc, r) => Math.max(acc, ...r.buckets), 0));
+/** 单格最大计数（色阶上限，基于绘制中的 Top-K 行） */
+const maxCell = computed(() => topRows.value.reduce((acc, r) => Math.max(acc, ...r.buckets), 0));
 
 /** 热力图数据：[列索引, 行索引, log 变换后的计数]，0 桶不给数据（保持空白）。log 变换拉开低值区分度，否则 1~10 次的格子全被挤在最浅一档分不清 */
 const heatData = computed(() => {
   const data: [number, number, number][] = [];
-  rows.value.forEach((r, y) => {
+  topRows.value.forEach((r, y) => {
     r.buckets.forEach((v, x) => {
       if (v > 0) data.push([x, y, Math.log10(v) + 1]);
     });
@@ -114,14 +129,14 @@ const heatData = computed(() => {
 });
 
 /** 每行 24h 小计（图下列表用） */
-const rowTotals = computed(() => rows.value.map((r) => r.buckets.reduce((a, b) => a + b, 0)));
+const rowTotals = computed(() => topRows.value.map((r) => r.buckets.reduce((a, b) => a + b, 0)));
 
 /** 窗口起点（毫秒）与进行中的区间 end 替换值 */
 const windowStart = computed(() => now.value - 24 * 3600_000);
 
 /** 每行每桶的存活覆盖率（0~1）：把存活区间与桶求交，算重叠时长占比 */
 const aliveCoverage = computed(() =>
-  rows.value.map((r) => {
+  topRows.value.map((r) => {
     const winStart = windowStart.value;
     return r.buckets.map((_, x) => {
       const bStart = winStart + x * STEP_MIN * 60_000;
@@ -220,11 +235,11 @@ const option = computed(() => ({
         /** 区间末端：最后一桶的终点越出窗口时显示「现在」 */
         const endLabel = xEnd + 1 >= STEPS ? '现在' : bucketTime(xEnd + 1);
         const range = xStart === xEnd ? `${bucketTime(xStart)} 起的 15 分钟` : `${bucketTime(xStart)} ~ ${endLabel}`;
-        return `<b>${rows.value[y]?.name ?? ''}</b><br/>${range}<br/>存活覆盖率 ${Math.round(cov * 100)}%`;
+        return `<b>${topRows.value[y]?.name ?? ''}</b><br/>${range}<br/>存活覆盖率 ${Math.round(cov * 100)}%`;
       }
       const [x, y, lv] = raw as [number, number, number];
       const v = Math.round(10 ** (lv - 1));
-      return `<b>${rows.value[y]?.name ?? ''}</b><br/>${bucketTime(x)} 起的 15 分钟<br/>${v} 次请求`;
+      return `<b>${topRows.value[y]?.name ?? ''}</b><br/>${bucketTime(x)} 起的 15 分钟<br/>${v} 次请求`;
     },
   },
   grid: { left: 96, right: 56, top: 8, bottom: 24 },
@@ -238,7 +253,7 @@ const option = computed(() => ({
   },
   yAxis: {
     type: 'category',
-    data: rows.value.map((r) => r.name),
+    data: topRows.value.map((r) => r.name),
     axisLabel: { fontSize: 11, color: '#57606a' },
     axisTick: { show: false },
     axisLine: { show: false },
@@ -307,15 +322,19 @@ const chartEl = useEChart(option);
             {{ p }}（{{ props.services.filter((s) => s.panelName === p).length }}）
           </option>
         </select>
+        <select v-model.number="maxRows" class="g-panel-select" title="展示流量最高的前 N 个服务">
+          <option v-for="n in ROW_OPTIONS" :key="n" :value="n">Top {{ n }}</option>
+        </select>
       </div>
     </div>
-    <div ref="chartEl" class="g-chart" :style="{ height: `${Math.max(rows.length, 1) * 26 + 40}px` }" />
-    <div v-if="rows.length" class="g-rows">
-      <span v-for="(r, i) in rows" :key="r.name" class="g-row-item">
+    <div ref="chartEl" class="g-chart" :style="{ height: `${Math.max(topRows.length, 1) * 26 + 40}px` }" />
+    <p v-if="truncatedCount > 0" class="g-empty" style="margin: 0 0 4px">仅绘制流量 Top-{{ Math.min(maxRows, topRows.length) }}，其余 {{ truncatedCount }} 个低流量服务未展示（可搜索定位）</p>
+    <div v-if="topRows.length" class="g-rows">
+      <span v-for="(r, i) in topRows" :key="r.name" class="g-row-item">
         {{ r.name }} <b>{{ rowTotals[i] }}</b>
       </span>
     </div>
-    <p v-if="!rows.length" class="g-empty">最近 24 小时暂无请求数据</p>
+    <p v-if="!topRows.length" class="g-empty">最近 24 小时暂无请求数据</p>
   </div>
 </template>
 

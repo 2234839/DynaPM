@@ -76,9 +76,22 @@ export class PanelClient {
     return this.api('/services');
   }
 
-  /** 各服务历史统计 */
-  fetchStats(): Promise<{ services: import('./api').ServiceStats[] }> {
-    return this.api('/stats');
+  /** 各服务历史统计（与 api.ts 同款分页拉取；远程网关若为旧版无分页字段也能兼容：单页即全量） */
+  async fetchStats(fromMin?: number): Promise<{ services: import('./api').ServiceStats[] }> {
+    const q = new URLSearchParams();
+    if (fromMin != null) q.set('from', String(fromMin));
+    q.set('step', '15');
+    q.set('limit', '500');
+    const all: import('./api').ServiceStats[] = [];
+    let offset = 0;
+    for (let guard = 0; guard < 100; guard++) {
+      q.set('offset', String(offset));
+      const page = await this.api<import('./api').StatsPage>(`/stats?${q.toString()}`);
+      all.push(...(page.services ?? []));
+      if (!page.hasMore || !(page.services ?? []).length) break;
+      offset = page.nextOffset ?? offset + (page.services ?? []).length;
+    }
+    return { services: all };
   }
 
   /** 服务详情 */

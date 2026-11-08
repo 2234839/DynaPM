@@ -25,6 +25,7 @@ tower-service = "0.3"
 include_dir = "0.7"
 libc = "0.2"
 arc-swap = "1"
+flate2 = "1"
 
 [profile.release]
 lto = true

@@ -422,3 +422,35 @@ h1 {
   color: #0969da;
   margin: 8px 0 0;
 }
+
+/* 表头排序按钮：不改变表头布局，仅指示符可点击 */
+.th-sort {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: #8b949e;
+  padding: 0 2px;
+  font-size: 12px;
+}
+.th-sort:hover {
+  color: #0969da;
+}
+
+/* 分页栏 */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+.pager-info {
+  font-size: 13px;
+  color: #57606a;
+}
+.pager-jump {
+  width: 64px;
+  padding: 4px 6px;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  font-size: 13px;
+}

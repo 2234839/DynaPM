@@ -4,6 +4,7 @@
 //! 配置格式：与 Bun 版字段一致（JSON），loader 语义对齐
 
 mod admin;
+mod admin_http;
 mod cli;
 mod config;
 mod executor;
@@ -123,7 +124,9 @@ fn build_main_router(gw: Arc<Gateway>) -> axum::Router {
         }
     };
 
-    let admin_router = axum::Router::new()
+    // admin API 路由单独建 router：鉴权与 gzip 压缩作为横切层只作用于 API，
+    // 面板静态资源与代理转发不经过（面板登录门禁在页面侧，静态资源无需 token）
+    let api_router = axum::Router::new()
         .route("/_dynapm/api/services", get(admin::list_services))
         .route("/_dynapm/api/services/{name}", get(admin::service_detail))
         .route("/_dynapm/api/services/{name}/stop", post(admin::stop_service))
@@ -136,6 +139,9 @@ fn build_main_router(gw: Arc<Gateway>) -> axum::Router {
         .route("/_dynapm/api/reload", post(admin::reload_config))
         .route("/_dynapm/api/info", get(admin::get_info))
         .route("/_dynapm/api/restart", post(admin::restart_gateway))
+        .layer(middleware::from_fn(admin_http::gzip))
+        .layer(middleware::from_fn(admin_http::auth));
+    let admin_router = api_router
         .route("/_dynapm/panel", get(panel::panel))
         .route("/_dynapm/panel/", get(panel::panel))
         .route("/_dynapm/panel/{*rest}", get(panel::panel));
@@ -165,7 +171,7 @@ fn build_main_router(gw: Arc<Gateway>) -> axum::Router {
                     return Ok::<_, std::convert::Infallible>(resp);
                 }
                 // CORS：仅管理面路径生效，Origin 白名单精确匹配（adminApi.corsOrigins，空 = 禁止跨域）。
-                // 预检直接短路；实际请求响应追加白名单头，鉴权仍由各 handler 的 auth_check 把关
+                // 预检直接短路；实际请求响应追加白名单头，API 鉴权由 admin_http::auth 层统一把关
                 let origin = req
                     .headers()
                     .get(axum::http::header::ORIGIN)

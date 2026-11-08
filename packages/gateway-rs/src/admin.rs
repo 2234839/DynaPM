@@ -5,6 +5,8 @@
 //! - POST   /_dynapm/api/services/:name/stop
 //! - POST   /_dynapm/api/services/:name/start
 //! - GET    /_dynapm/api/events           SSE 事件流
+//!
+//! 鉴权与 gzip 压缩下沉到 admin_http 中间件层，handler 只含业务逻辑
 
 use crate::gateway::Gateway;
 use crate::logger;
@@ -15,48 +17,6 @@ use axum::response::IntoResponse;
 use futures_util::Stream;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-
-/// 认证校验：配置了 authToken 时要求 Bearer 头或 ?token= 查询参数匹配
-/// （query 方式供 EventSource SSE 使用——无法自定义请求头；全链路 HTTPS 下中间服务器只见密文）
-fn is_authorized(uri: &axum::http::Uri, headers: &axum::http::HeaderMap, token: Option<&String>) -> bool {
-    match token {
-        None => true,
-        Some(t) => {
-            let bearer_ok = headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .map(|h| h.trim_start_matches("Bearer ").trim() == t.trim())
-                .unwrap_or(false);
-            if bearer_ok {
-                return true;
-            }
-            uri.query()
-                .and_then(|q| {
-                    q.split('&').find_map(|kv| {
-                        let (k, v) = kv.split_once('=')?;
-                        (k == "token").then(|| v.to_string())
-                    })
-                })
-                .map(|v| v == t.trim())
-                .unwrap_or(false)
-        }
-    }
-}
-
-/// 通用鉴权入口（不匹配返回 Some(错误响应)）
-fn auth_check(uri: &axum::http::Uri, headers: &axum::http::HeaderMap, gw: &Gateway) -> Option<axum::response::Response> {
-    let token = gw.admin_auth_token();
-    if !is_authorized(uri, headers, token.as_ref()) {
-        return Some(
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::UNAUTHORIZED)
-                .header("WWW-Authenticate", "Bearer")
-                .body(Body::from("Unauthorized"))
-                .unwrap(),
-        );
-    }
-    None
-}
 
 /// Origin 是否在跨域白名单内（精确匹配；空白名单 = 禁止一切跨域）
 fn cors_allowed(gw: &Gateway, origin: &str) -> bool {
@@ -102,13 +62,17 @@ pub fn cors_preflight(gw: &Gateway, origin: Option<&str>) -> Option<axum::respon
 }
 
 /// GET /_dynapm/api/services
+/// 支持 ?epoch=N 游标：代数未变时返回空列表（面板沿用旧数据，避免万级服务的无效重建与重渲染）
 pub async fn list_services(
     uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
+    let epoch = gw.epoch.load(Ordering::Relaxed);
+    if query_param(&uri, "epoch").and_then(|v| v.parse::<u64>().ok()) == Some(epoch) {
+        return json_response(
+            axum::http::StatusCode::OK,
+            &serde_json::json!({ "epoch": epoch, "services": [] }),
+        );
     }
     let mut services = Vec::new();
     // 收集各服务的域名路由（供面板生成跳转链接）
@@ -166,7 +130,18 @@ pub async fn list_services(
             "lastStartDurationMs": rt.last_start_duration_ms.load(Ordering::Relaxed),
         }));
     }
-    json_response(axum::http::StatusCode::OK, &serde_json::json!({ "services": services }))
+    json_response(
+        axum::http::StatusCode::OK,
+        &serde_json::json!({ "epoch": epoch, "services": services }),
+    )
+}
+
+/// 读取 URI 查询参数
+fn query_param(uri: &axum::http::Uri, key: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| v.to_string())
+    })
 }
 
 /// 解析 /proc/<pid>/stat：返回 (pgid, utime+stime jiffies)（从最后一个 ')' 后按字段定位）
@@ -241,14 +216,7 @@ fn config_path() -> std::path::PathBuf {
 }
 
 /// GET /_dynapm/api/config：返回配置文件 JSON（adminApi.authToken 脱敏）
-pub async fn get_config(
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
-    axum::Extension(gw): axum::Extension<Arc<Gateway>>,
-) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
+pub async fn get_config() -> axum::response::Response {
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(config_path()).unwrap_or_default()) else {
         return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": "读取配置文件失败" }));
     };
@@ -271,14 +239,9 @@ pub async fn get_config(
 /// PUT /_dynapm/api/config：校验并写回配置文件，然后网关自重启（systemd 拉起）
 /// body：完整配置 JSON（authToken 为脱敏占位时回填原值）
 pub async fn put_config(
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
     body: String,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     // 解析 + 脱敏还原
     let mut v: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -357,14 +320,7 @@ pub async fn put_config(
 /// GET /_dynapm/api/info：网关实例信息。
 /// CLI 用 binaryMtime/startedAt 判断运行实例是否为旧版本（cargo build 原地替换二进制后，
 /// 运行中进程的启动时刻早于新二进制 mtime 即为旧实例）
-pub async fn get_info(
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
-    axum::Extension(gw): axum::Extension<Arc<Gateway>>,
-) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
+pub async fn get_info() -> axum::response::Response {
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let mtime = std::env::current_exe()
         .ok()
@@ -387,13 +343,8 @@ pub async fn get_info(
 /// （进程以普通用户运行时无权 systemctl restart 系统单元，唯一可靠路径就是自己退出）；
 /// 裸跑（开发机直接启动）→ 短暂延迟后 spawn 自身新实例接管端口，再退出
 pub async fn restart_gateway(
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         logger::info("🔄 收到重启指令（二进制已更新），网关自重启...");
@@ -418,13 +369,8 @@ pub async fn restart_gateway(
 
 /** POST /_dynapm/api/reload：从磁盘重读配置并热加载（供 CLI/外部文件 watch 触发） */
 pub async fn reload_config(
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     let cfg = match crate::config::load_config() {
         Ok(c) => c,
         Err(e) => return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": format!("配置读取失败: {e}") })),
@@ -448,53 +394,101 @@ pub async fn reload_config(
 }
 
 /// GET /_dynapm/api/stats：各服务历史统计（分钟请求桶 + 存活区间 + 进程资源），供面板图表
+///
+/// 万级服务下的体积控制（全部为服务端裁剪，前端无需感知）：
+/// - 只返回窗口内有数据的服务（无统计文件或窗口内零桶的直接跳过，长尾零开销）
+/// - 服务端按 step 分钟聚合请求桶（默认 15，对齐图表粒度，比分钟级原始桶小 15 倍）
+/// - 存活区间裁剪到窗口内（截断到 [from,to]），超出窗口的历史不下发
+/// - 分页：?limit（默认 500）+ ?offset（按服务名排序的偏移），响应带 total/hasMore/nextOffset
+/// - 扁平编码：reqBuckets=[m0,c0,m1,c1,…]，aliveSpans=[s0,e0,s1,e1,…]，省每对一层数组开销
 pub async fn stats(
     uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
+    let now_min = crate::state::now_ms() / 60_000;
+    let from_min = query_param(&uri, "from").and_then(|v| v.parse::<u64>().ok()).unwrap_or(now_min.saturating_sub(8 * 24 * 60));
+    let to_min = query_param(&uri, "to").and_then(|v| v.parse::<u64>().ok()).unwrap_or(now_min);
+    let step_min = query_param(&uri, "step").and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0).unwrap_or(15);
+    let limit = query_param(&uri, "limit").and_then(|v| v.parse::<usize>().ok()).filter(|&l| l > 0).unwrap_or(500);
+    let offset = query_param(&uri, "offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+
+    // 窗口内有数据的服务才进入结果（按服务名排序保证分页稳定）
+    let mut with_data: Vec<_> = gw
+        .all_runtimes()
+        .into_iter()
+        .filter(|rt| {
+            match rt.stats_file_readonly() {
+                Some(st) => st.has_data_in_window(from_min, to_min),
+                None => false,
+            }
+        })
+        .collect();
+    with_data.sort_by(|a, b| a.config.name.cmp(&b.config.name));
+
+    let total = with_data.len();
     let mut services = Vec::new();
-    // 请求桶只返回最近 8 天（面板热力图 7 天 + 余量），减小响应体
-    let since_min = crate::state::now_ms() / 60_000 - 8 * 24 * 60;
-    for rt in gw.all_runtimes() {
-        let (req_buckets, alive_spans) = match &rt.stats {
-            Some(st) => (
-                st.buckets_since(since_min),
-                st.alive_spans(),
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
-        // /proc 扫描是同步文件 IO（数百次 open+read），必须放阻塞线程池，
-        // 面板轮询期间跑在 worker 上会钉死线程
-        let proc = {
+    for rt in with_data.into_iter().skip(offset).take(limit) {
+        // 只在线上服务跑 /proc 扫描（同步文件 IO）；离线服务没有进程，扫了也是空，
+        // 且不能把扫描任务一次性投递进阻塞线程池（万级会把池挤爆），逐个 await 限流
+        let online = rt.status() == crate::state::Status::Online;
+        let proc = if online {
             let rt2 = Arc::clone(&rt);
             tokio::task::spawn_blocking(move || proc_metrics(&rt2))
                 .await
                 .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
         };
+        let st = rt.stats_file_readonly().expect("已过滤有数据服务");
+        // 服务端聚合到 step 分钟：step_step = 服务端桶对齐后的 (分钟, 计数)
+        let mut flat_buckets: Vec<u64> = Vec::new();
+        for (m, c) in st.buckets_since(from_min) {
+            if m > to_min {
+                continue;
+            }
+            let agg = m - (m % step_min);
+            let n = flat_buckets.len();
+            if n >= 2 && flat_buckets[n - 2] == agg {
+                flat_buckets[n - 1] += c as u64;
+            } else {
+                flat_buckets.extend([agg, c as u64]);
+            }
+        }
+        // 存活区间裁剪到窗口（end < from 或 start > to 的整段丢弃，其余截断）
+        let mut flat_spans: Vec<i64> = Vec::new();
+        let from_ms = (from_min * 60_000) as i64;
+        let to_ms = (to_min.saturating_mul(60_000)).min(i64::MAX as u64) as i64;
+        for (s, e) in st.alive_spans() {
+            let s = (s as i64).max(from_ms);
+            let e = (e.min(u64::MAX - 1) as i64).min(to_ms);
+            if s < e {
+                flat_spans.extend([s, e]);
+            }
+        }
         services.push(serde_json::json!({
             "name": rt.config.name,
-            "reqBuckets": req_buckets.iter().map(|(m, c)| [*m, *c as u64]).collect::<Vec<[u64; 2]>>(),
-            "aliveSpans": alive_spans.iter().map(|(s, e)| [*s as i64, (*e as i64).min(i64::MAX)]).collect::<Vec<_>>(),
+            "reqBuckets": flat_buckets,
+            "aliveSpans": flat_spans,
             "proc": proc,
         }));
     }
-    json_response(axum::http::StatusCode::OK, &serde_json::json!({ "services": services }))
+    let has_more = offset + services.len() < total;
+    json_response(
+        axum::http::StatusCode::OK,
+        &serde_json::json!({
+            "total": total,
+            "hasMore": has_more,
+            "nextOffset": if has_more { offset + services.len() } else { offset },
+            "services": services,
+        }),
+    )
 }
 
 /// GET /_dynapm/api/services/:name
 pub async fn service_detail(
     Path(name): Path<String>,
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     let rt = match gw.runtime(&name) {
         Some(r) => r,
         None => {
@@ -536,13 +530,8 @@ pub async fn service_detail(
 /// POST /_dynapm/api/services/:name/stop
 pub async fn stop_service(
     Path(name): Path<String>,
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     let rt = match gw.runtime(&name) {
         Some(r) => r,
         None => {
@@ -564,13 +553,8 @@ pub async fn stop_service(
 /// POST /_dynapm/api/services/:name/start
 pub async fn start_service(
     Path(name): Path<String>,
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     let rt = match gw.runtime(&name) {
         Some(r) => r,
         None => {
@@ -599,13 +583,8 @@ pub async fn start_service(
 /// POST /_dynapm/api/services/:name/disable — 彻底关停：停止进程 + 禁止按需/手动拉起
 pub async fn disable_service(
     Path(name): Path<String>,
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     let rt = match gw.runtime(&name) {
         Some(r) => r,
         None => {
@@ -620,6 +599,7 @@ pub async fn disable_service(
     match gw.stop_service(rt).await {
         Ok(()) => {
             logger::info(&format!("🛑 [{}] 已彻底关停（禁止按需拉起）", name));
+            gw.publish_event(format!(r#"{{"type":"disable","service":"{}"}}"#, name));
             json_response(axum::http::StatusCode::OK, &serde_json::json!({ "success": true, "paused": true }))
         }
         Err(e) => json_response(
@@ -632,13 +612,8 @@ pub async fn disable_service(
 /// POST /_dynapm/api/services/:name/enable — 解除彻底关停（恢复可按需拉起，不立即启动）
 pub async fn enable_service(
     Path(name): Path<String>,
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     let rt = match gw.runtime(&name) {
         Some(r) => r,
         None => {
@@ -651,18 +626,14 @@ pub async fn enable_service(
     rt.paused.store(false, Ordering::Relaxed);
     crate::procreg::set_paused(&name, false);
     logger::info(&format!("✅ [{}] 已解除彻底关停", name));
+    gw.publish_event(format!(r#"{{"type":"enable","service":"{}"}}"#, name));
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "success": true, "paused": false }))
 }
 
 /// GET /_dynapm/api/events — SSE 事件流
 pub async fn events(
-    uri: axum::http::Uri,
-    headers: axum::http::HeaderMap,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    if let Some(resp) = auth_check(&uri, &headers, &gw) {
-        return resp;
-    }
     let rx = gw.subscribe_events();
     let stream = tokio_stream_wrapped(rx);
     let body = Body::from_stream(stream);

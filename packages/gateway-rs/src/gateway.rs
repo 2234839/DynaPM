@@ -120,6 +120,8 @@ pub struct Gateway {
     pub uds_clients: Mutex<HashMap<String, crate::netns::UdsClient>>,
     /// 服务生命周期事件广播（admin SSE 用）
     pub events: broadcast::Sender<String>,
+    /// 服务列表变更代数：任何启动/停止/关停事件自增，面板用游标避免无效全量拉取与重渲染
+    pub epoch: std::sync::atomic::AtomicU64,
 }
 
 impl Gateway {
@@ -196,6 +198,7 @@ impl Gateway {
             http_client,
             uds_clients: Mutex::new(HashMap::new()),
             events,
+            epoch: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -230,8 +233,9 @@ impl Gateway {
         table.admin_host.as_deref() == Some(host)
     }
 
-    /// 发布服务生命周期事件
+    /// 发布服务生命周期事件（同时推进变更代数，面板据此感知需要刷新）
     pub fn publish_event(&self, msg: String) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         let _ = self.events.send(msg);
     }
 

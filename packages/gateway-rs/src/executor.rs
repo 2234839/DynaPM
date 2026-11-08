@@ -95,6 +95,8 @@ pub async fn execute(command: &str, options: &CommandOptions) -> CommandResult {
     let pgid = child.id().unwrap_or(0);
 
     // 管道后台 drain：防写满阻塞 bash，同时尽力收集输出
+    // 单流收集上限：异常命令（如 check 里 cat 大文件）30s 内可产出 GB 级输出，截断保护堆
+    const DRAIN_MAX: usize = 1 << 20; // 1MB
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
     let drain = tokio::spawn(async move {
@@ -102,9 +104,11 @@ pub async fn execute(command: &str, options: &CommandOptions) -> CommandResult {
         let mut stderr_buf = Vec::new();
         if let Some(p) = stdout_pipe.as_mut() {
             let _ = p.read_to_end(&mut stdout_buf).await;
+            stdout_buf.truncate(DRAIN_MAX);
         }
         if let Some(p) = stderr_pipe.as_mut() {
             let _ = p.read_to_end(&mut stderr_buf).await;
+            stderr_buf.truncate(DRAIN_MAX);
         }
         (stdout_buf, stderr_buf)
     });

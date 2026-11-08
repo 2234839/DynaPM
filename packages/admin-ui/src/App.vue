@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   fetchServices,
   fetchServiceDetail,
@@ -17,6 +17,7 @@ import {
   type ServiceStats,
 } from './api';
 import { fetchConfig, saveConfig } from './api';
+import { persistedRef } from './persistedRef';
 import StatsCharts from './StatsCharts.vue';
 import GlobalChart from './GlobalChart.vue';
 import ConfigEditor from './ConfigEditor.vue';
@@ -44,6 +45,11 @@ const busy = ref('');
 const expanded = ref<Set<string>>(new Set());
 /** 各服务历史统计（图表数据，键为聚合行 uid） */
 const statsMap = ref<Map<string, ServiceStats>>(new Map());
+/** 服务列表变更代数游标：未变时网关返回空列表，跳过万级服务的整表重渲染 */
+let epochCursor: number | undefined;
+/** SSE 订阅与刷新防抖句柄 */
+let eventSource: EventSource | null = null;
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 远程面板列表（localStorage 持久化） */
 const remotePanels = ref<RemotePanel[]>(loadPanels());
@@ -111,8 +117,22 @@ const globalSeries = computed(() =>
 
 /** 服务名搜索关键字（不区分大小写，空串 = 不过滤） */
 const searchKw = ref('');
-/** 面板筛选：空串 = 全部；'local' = 仅本地；否则为面板 id */
-const filterPanel = ref('');
+/** 面板筛选：空串 = 全部；'local' = 仅本地；否则为面板 id（用户选择本地持久化） */
+const filterPanel = persistedRef('table.filterPanel', '');
+/** 状态筛选：空串 = 全部；否则为 online/offline/starting/stopping/disabled（用户选择本地持久化） */
+const statusFilter = persistedRef('table.statusFilter', '');
+/** 状态筛选选项（含当前计数，空串代表全部） */
+const statusOptions = computed(() => {
+  const count = (s: string) => fedRows.value.filter((r) => (r.svc.paused ? 'disabled' : r.svc.status) === s).length;
+  return [
+    { id: '', name: '全部' },
+    { id: 'online', name: `在线 ${count('online')}` },
+    { id: 'offline', name: `离线 ${count('offline')}` },
+    { id: 'starting', name: `启动中 ${count('starting')}` },
+    { id: 'stopping', name: `停止中 ${count('stopping')}` },
+    { id: 'disabled', name: `已关停 ${count('disabled')}` },
+  ];
+});
 
 /** 筛选下拉选项：本地 + 各远程面板（含服务计数） */
 const panelOptions = computed(() => [
@@ -125,16 +145,74 @@ const panelOptions = computed(() => [
   })),
 ]);
 
-/** 搜索 + 面板筛选后的聚合行 */
+/** 搜索 + 面板/状态筛选后的聚合行 */
 const visibleRows = computed(() => {
   const kw = searchKw.value.trim().toLowerCase();
   return fedRows.value.filter((r) => {
     if (filterPanel.value === 'local' && r.remote) return false;
     if (filterPanel.value && filterPanel.value !== 'local' && r.panelId !== filterPanel.value) return false;
+    if (statusFilter.value && (r.svc.paused ? 'disabled' : r.svc.status) !== statusFilter.value) return false;
     if (kw && !r.svc.name.toLowerCase().includes(kw) && !(r.remote && r.panelName.toLowerCase().includes(kw))) return false;
     return true;
   });
 });
+/** 排序字段（svc 属性名）与方向；空字段 = 默认顺序（用户选择本地持久化） */
+const sortKey = persistedRef('table.sortKey', '');
+const sortAsc = persistedRef('table.sortAsc', true);
+/** 排序键取值：status 按运行状态优先级，其余按数值/字符串通比较 */
+const STATUS_ORDER: Record<string, number> = { online: 0, starting: 1, stopping: 2, offline: 3, disabled: 4 };
+function sortValue(r: FedRow, key: string): number | string {
+  const s = r.svc as unknown as Record<string, unknown>;
+  if (key === 'status') return STATUS_ORDER[r.svc.paused ? 'disabled' : r.svc.status] ?? 9;
+  const v = s[key];
+  return typeof v === 'number' ? v : String(v ?? '');
+}
+/** 排序后的行（分页前） */
+const sortedRows = computed(() => {
+  if (!sortKey.value) return visibleRows.value;
+  const key = sortKey.value;
+  const dir = sortAsc.value ? 1 : -1;
+  return [...visibleRows.value].sort((a, b) => {
+    const va = sortValue(a, key);
+    const vb = sortValue(b, key);
+    if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir;
+    return String(va).localeCompare(String(vb)) * dir;
+  });
+});
+/** 每页行数选项与默认值：万级服务全量渲染会拖死主线程，分页控制单次 DOM 规模 */
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200];
+/** 每页行数（用户选择本地持久化） */
+const pageSize = persistedRef('table.pageSize', 50);
+/** 当前页（1 起）；筛选/搜索/排序/页大小变化时重置到第一页 */
+const pageNo = ref(1);
+const totalPages = computed(() => Math.max(Math.ceil(sortedRows.value.length / pageSize.value), 1));
+watch([visibleRows, () => searchKw.value, () => filterPanel.value, () => statusFilter.value, sortKey, pageSize], () => {
+  pageNo.value = 1;
+});
+/** 当前页实际渲染的行 */
+const renderedRows = computed(() =>
+  sortedRows.value.slice((pageNo.value - 1) * pageSize.value, pageNo.value * pageSize.value),
+);
+/** 翻页：n 越界自动夹紧 */
+function gotoPage(n: number): void {
+  pageNo.value = Math.min(Math.max(n, 1), totalPages.value);
+}
+/** 点击表头切换排序：同列循环 升序→降序→取消 */
+function toggleSort(key: string): void {
+  if (sortKey.value !== key) {
+    sortKey.value = key;
+    sortAsc.value = true;
+  } else if (sortAsc.value) {
+    sortAsc.value = false;
+  } else {
+    sortKey.value = '';
+  }
+}
+/** 表头排序指示符 */
+function sortMark(key: string): string {
+  if (sortKey.value !== key) return '↕';
+  return sortAsc.value ? '↑' : '↓';
+}
 /** 配置编辑器可见性 */
 const configOpen = ref(false);
 /** 正在原地编辑配置的服务（聚合行 uid，detail-grid 直接切输入态） */
@@ -251,14 +329,18 @@ async function saveEdit(): Promise<void> {
   }
 }
 
-/** 加载服务列表（本地 + 全部远程面板） */
+/** 加载服务列表（本地 + 全部远程面板；本地侧用 epoch 游标，无变更时沿用旧数据跳过重渲染） */
 async function refresh(): Promise<void> {
   loading.value = true;
   error.value = '';
   refreshRemote();
   try {
-    const data = await fetchServices();
-    services.value = data.services ?? [];
+    const data = await fetchServices(epochCursor);
+    const unchanged = data.epoch != null && epochCursor === data.epoch && !data.services.length;
+    if (!unchanged) {
+      services.value = data.services ?? [];
+      epochCursor = data.epoch;
+    }
     authed.value = true;
   } catch (e) {
     if (e instanceof Error && e.message === 'UNAUTHORIZED') {
@@ -271,6 +353,29 @@ async function refresh(): Promise<void> {
   }
 }
 
+/** 订阅网关 SSE 事件流：服务启停/关停等变更到达时防抖 500ms 刷新列表，
+ *  替代高频轮询——万级服务下轮询意味着每次全量重建响应式数据 */
+function subscribeEvents(): void {
+  eventSource?.close();
+  const token = getToken();
+  eventSource = new EventSource(`/_dynapm/api/events${token ? `?token=${encodeURIComponent(token)}` : ''}`);
+  eventSource.onmessage = () => {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refresh, 500);
+  };
+  // 连接断开时依赖 30s 兜底轮询恢复，无需重连逻辑（EventSource 自动重连）
+}
+
+/** 退出登录 */
+function logout(): void {
+  clearToken();
+  authed.value = false;
+  services.value = [];
+  epochCursor = undefined;
+  eventSource?.close();
+  eventSource = null;
+}
+
 /** 手动输入令牌登录：先存再验证 */
 async function login(): Promise<void> {
   error.value = '';
@@ -281,6 +386,7 @@ async function login(): Promise<void> {
   try {
     const data = await fetchServices();
     services.value = data.services ?? [];
+    epochCursor = data.epoch;
     authed.value = true;
     tokenInput.value = '';
   } catch (e) {
@@ -289,13 +395,6 @@ async function login(): Promise<void> {
   } finally {
     loading.value = false;
   }
-}
-
-/** 退出登录 */
-function logout(): void {
-  clearToken();
-  authed.value = false;
-  services.value = [];
 }
 
 /** 展开或收起服务详情（按聚合行路由到本地或远程 API） */
@@ -424,11 +523,13 @@ function idleClass(svc: ServiceListItem): string {
   return r != null && r <= 60_000 ? 'idle-soon' : 'idle-far';
 }
 
-/** 拉取历史统计（图表，本地 + 全部远程面板，键为聚合行 uid） */
+/** 拉取历史统计（图表，本地 + 全部远程面板，键为聚合行 uid）。
+ *  只拉热力图需要的 24h 窗口，万级服务下全量 8 天桶体积/解析成本不可接受 */
 async function refreshStats(): Promise<void> {
   const next = new Map<string, ServiceStats>();
+  const fromMin = Math.floor(Date.now() / 60_000) - 25 * 60;
   try {
-    const data = await fetchStats();
+    const data = await fetchStats(fromMin);
     for (const s of data.services ?? []) next.set(`local:${s.name}`, s);
   } catch {
     // 图表数据拉取失败不打断主列表
@@ -436,7 +537,7 @@ async function refreshStats(): Promise<void> {
   await Promise.all(
     remotePanels.value.map(async (p) => {
       try {
-        const data = await new PanelClient(p).fetchStats();
+        const data = await new PanelClient(p).fetchStats(fromMin);
         for (const s of data.services ?? []) next.set(`${p.id}:${s.name}`, s);
       } catch {
         // 远程面板统计失败不影响本地面板图表
@@ -477,11 +578,13 @@ function serviceUrl(svc: ServiceListItem): string | null {
 onMounted(() => {
   refresh();
   refreshStats();
-  const timer = setInterval(refresh, 5000);
+  subscribeEvents();
+  // SSE 主通道 + 30s 兜底轮询（断连/漏事件时恢复）
   const statsTimer = setInterval(refreshStats, 30_000);
   onUnmounted(() => {
-    clearInterval(timer);
     clearInterval(statsTimer);
+    eventSource?.close();
+    eventSource = null;
   });
 });
 </script>
@@ -545,16 +648,20 @@ onMounted(() => {
               </div>
             </div>
           </th>
-          <th>状态</th>
-          <th>存活 / 回收</th>
-          <th>请求数</th>
-          <th title="最近一次冷启动耗时">启动耗时</th>
-          <th>连接数</th>
+          <th>
+            <select v-model="statusFilter" class="panel-select" title="按状态筛选">
+              <option v-for="o in statusOptions" :key="o.id || 'all'" :value="o.id">{{ o.name }}</option>
+            </select>
+          </th>
+          <th>存活 / 回收 <button class="th-sort" title="按存活时长排序" @click="toggleSort('uptime')">{{ sortMark('uptime') }}</button></th>
+          <th>请求数 <button class="th-sort" title="按累计请求数排序" @click="toggleSort('requestCount')">{{ sortMark('requestCount') }}</button></th>
+          <th title="最近一次冷启动耗时">启动耗时 <button class="th-sort" title="按最近启动耗时排序" @click="toggleSort('lastStartDurationMs')">{{ sortMark('lastStartDurationMs') }}</button></th>
+          <th>连接数 <button class="th-sort" title="按活跃连接数排序" @click="toggleSort('activeConnections')">{{ sortMark('activeConnections') }}</button></th>
           <th>操作</th>
         </tr>
       </thead>
       <tbody>
-        <template v-for="row in visibleRows" :key="row.uid">
+        <template v-for="row in renderedRows" :key="row.uid">
           <tr>
             <td class="name-cell">
               <button class="link arrow" :title="expanded.has(row.uid) ? '收起详情' : '展开详情'" @click="toggleDetail(row)">
@@ -673,11 +780,36 @@ onMounted(() => {
         <tr v-for="pe in panelErrors" :key="pe.id">
           <td colspan="8" class="panel-error">⚠️ 远程面板「{{ pe.name }}」拉取失败：{{ pe.error }}</td>
         </tr>
+        <tr v-if="hiddenRowCount > 0">
+          <td colspan="8" class="empty">
+            已隐藏 {{ hiddenRowCount }} 个服务（大列表全量渲染会拖慢页面），用上方搜索定位目标，或
+            <button class="btn" @click="showAll = true">显示全部</button>
+          </td>
+        </tr>
         <tr v-if="!visibleRows.length && !loading">
           <td colspan="8" class="empty">{{ fedRows.length ? '无匹配服务' : '暂无服务' }}</td>
         </tr>
       </tbody>
     </table>
+
+    <!-- 分页栏：筛选/搜索/排序结果集分页浏览（每页 50 行，控制单次 DOM 规模） -->
+    <div v-if="totalPages > 1" class="pager">
+      <button class="btn" :disabled="pageNo <= 1" @click="gotoPage(pageNo - 1)">上一页</button>
+      <span class="pager-info">第 {{ pageNo }} / {{ totalPages }} 页 · 共 {{ sortedRows.length }} 个服务</span>
+      <button class="btn" :disabled="pageNo >= totalPages" @click="gotoPage(pageNo + 1)">下一页</button>
+      <input
+        class="pager-jump"
+        type="number"
+        min="1"
+        :max="totalPages"
+        :model-value="pageNo"
+        @change="gotoPage(Number(($event.target as HTMLInputElement).value) || 1)"
+        title="跳转到指定页"
+      />
+      <select v-model.number="pageSize" class="panel-select" title="每页行数">
+        <option v-for="n in PAGE_SIZE_OPTIONS" :key="n" :value="n">{{ n }} 条/页</option>
+      </select>
+    </div>
 
     <GlobalChart :services="globalSeries" />
   </div>

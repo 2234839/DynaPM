@@ -16,15 +16,28 @@ interface ProcMetrics {
   rssMb: number;
 }
 
-/** 单个服务的历史统计 */
+/** 单个服务的历史统计（与 api.ts 同构；扁平编码） */
 export interface ServiceStats {
   name: string;
-  /** 分钟桶 [minuteEpoch, count] */
-  reqBuckets: [number, number][];
-  /** 存活区间 [startMs, endMs]，end=-1 表示进行中 */
-  aliveSpans: [number, number][];
+  /** 聚合分钟桶扁平数组 [minuteEpoch, count, …] */
+  reqBuckets: number[];
+  /** 存活区间扁平数组 [startMs, endMs, …]，进行中由后端裁剪到窗口末尾 */
+  aliveSpans: number[];
   /** 进程资源（不在线为 null） */
   proc?: ProcMetrics | null;
+}
+
+/** 扁平区间数组 → [start,end] 对（后端已裁剪到窗口，不再需要 end<0 哨兵） */
+function spanPairs(flat: number[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) out.push([flat[i]!, flat[i + 1]!]);
+  return out;
+}
+/** 扁平分钟桶数组 → [minute,count] 对 */
+function bucketPairs(flat: number[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) out.push([flat[i]!, flat[i + 1]!]);
+  return out;
 }
 
 const props = defineProps<{ stats: ServiceStats }>();
@@ -36,7 +49,7 @@ const now = Date.now();
 const timeline = computed(() => {
   const winStart = now - 24 * 3600_000;
   const total = 24 * 3600_000;
-  return props.stats.aliveSpans
+  return spanPairs(props.stats.aliveSpans)
     .map(([s, e]) => {
       const end = e < 0 ? now : e;
       return [Math.max(s, winStart), Math.min(end, now)] as [number, number];
@@ -52,7 +65,7 @@ const timeline = computed(() => {
 const aliveHours24h = computed(() => {
   const winStart = now - 24 * 3600_000;
   return (
-    props.stats.aliveSpans.reduce((acc, [s, e]) => {
+    spanPairs(props.stats.aliveSpans).reduce((acc, [s, e]) => {
       const end = e < 0 ? now : e;
       return acc + Math.max(0, Math.min(end, now) - Math.max(s, winStart));
     }, 0) / 3600_000
@@ -63,7 +76,7 @@ const aliveHours24h = computed(() => {
 const hourBuckets = computed(() => {
   const map = new Map<number, number>();
   const hourNow = Math.floor(now / 3600_000);
-  for (const [m, c] of props.stats.reqBuckets) {
+  for (const [m, c] of bucketPairs(props.stats.reqBuckets)) {
     const h = Math.floor(m / 60);
     if (h > hourNow) continue;
     map.set(h, (map.get(h) ?? 0) + c);
@@ -89,7 +102,7 @@ const heatCells = computed(() => {
 const total24h = computed(() => {
   const hourNow = Math.floor(now / 3600_000);
   let sum = 0;
-  for (const [m, c] of props.stats.reqBuckets) if (Math.floor(m / 60) > hourNow - 24) sum += c;
+  for (const [m, c] of bucketPairs(props.stats.reqBuckets)) if (Math.floor(m / 60) > hourNow - 24) sum += c;
   return sum;
 });
 
