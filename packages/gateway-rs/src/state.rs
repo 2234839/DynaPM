@@ -475,7 +475,8 @@ pub async fn stop(rt: &ServiceRuntime, stop_timeout_ms: u64) -> Result<(), Strin
         }
         if service.netns {
             let sock = crate::netns::sock_path(&service.name).display().to_string();
-            let kill_pump = format!("pkill -f \"__uds-pump {sock}\" || true");
+            // 括号技巧防自匹配：本 bash 命令行本身含匹配串，裸写 pkill -f 会杀掉自己的 shell
+            let kill_pump = format!("pkill -f \"__uds-pum[p] {sock}\" || true");
             let opts = CommandOptions {
                 timeout_ms: Some(5_000),
                 ..Default::default()

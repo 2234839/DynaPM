@@ -326,6 +326,25 @@ impl Gateway {
         let start_pgid = start_result.unwrap_or_default();
         *rt.start_pgid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
         *rt.pid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
+        // 启动命令退出码 0 ≠ 后端端口已监听（典型 nohup server & 场景），
+        // 与 ensure_service_online 同步走就绪等待，避免手动启动后首个请求 502
+        let (target_host, target_port, target_https) =
+            crate::config::parse_base_url(&rt.config.base).unwrap_or_default();
+        let resolved = crate::config::RouteConfigResolved {
+            route: RouteValue::Host(String::new()),
+            target: rt.config.base.clone(),
+            target_host,
+            target_port,
+            target_https,
+        };
+        let ready = wait_for_backend_ready(&rt.config, &resolved).await;
+        if !ready {
+            rt.note_start_failure();
+            rt.set_status(Status::Offline);
+            let err = format!("服务启动超时: 端口 {} 不可用", rt.config.base);
+            *rt.last_start_error.lock().unwrap() = Some(err.clone());
+            return Err(err);
+        }
         rt.last_start_duration_ms
             .store((now_ms() - start_begun_ms) as i64, Ordering::Relaxed);
         rt.clear_start_failure();
@@ -653,6 +672,14 @@ impl Gateway {
     pub async fn stop_service(&self, rt: Arc<ServiceRuntime>) -> Result<(), String> {
         let lock = self.start_lock(&rt.config.name);
         let _guard = lock.lock().await;
+        // 拿锁后二次校验（仅闲置回收语义适用）：等锁期间可能有新请求到达并完成冷启动，
+        // 此刻有活跃连接则放弃回收——避免把在飞请求打成 502 / 杀掉刚拉起的服务。
+        // admin 手动 stop 不受影响：该分支仅由 idle reaper 的回收路径调用时命中
+        if rt.status() == Status::Online
+            && rt.active_connections.load(Ordering::Relaxed) > 0
+        {
+            return Ok(());
+        }
         if rt.status() == Status::Offline {
             // Offline 短路仅在上游确实无人监听时成立：端口仍被占（进程残留、
             // 用户手动起的 dev server、网关重启后状态机归零）时 disable/stop 必须真杀
@@ -703,8 +730,11 @@ impl Gateway {
                         let rt2 = Arc::clone(&rt);
                         tokio::spawn(async move {
                             // 复查：判定（上面 clone runtimes 时）与真正执行 stop 之间可能有新请求到达，
-                            // 此时杀后端会把在飞请求打成 502；复查不满足 idle 则放弃本次回收
-                            let still_idle = rt2.active_connections.load(Ordering::Relaxed) == 0
+                            // 此时杀后端会把在飞请求打成 502；复查不满足 idle 则放弃本次回收。
+                            // status 复查：期间可能有新请求触发冷启动（Offline→Starting），
+                            // 冷启动刚完成就回收等于白做一轮启动
+                            let still_idle = rt2.status() == Status::Online
+                                && rt2.active_connections.load(Ordering::Relaxed) == 0
                                 && now_ms() as i64 - rt2.last_access_ms.load(Ordering::Relaxed)
                                     > idle_threshold as i64;
                             if !still_idle {
@@ -980,7 +1010,6 @@ impl Gateway {
                 }
                 Ok(Err(e)) => Err(ProxyUpstreamError::Send(e.to_string())),
                 Err(_) => Err(ProxyUpstreamError::Timeout),
-                Err(e) => Err(ProxyUpstreamError::Send(e.to_string())),
             }
         };
             match upstream_result {
@@ -1109,6 +1138,16 @@ impl Gateway {
         path_and_query: String,
         headers: axum::http::HeaderMap,
     ) -> axum::response::Response {
+        // paused（彻底关停）拒绝与代理路径同语义：WS 升级请求不得拉起已禁用的服务
+        if mapping.service.paused.load(Ordering::Relaxed) {
+            return text_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Service Disabled");
+        }
+        // 刷新 last_access：升级握手（101 响应 + on_upgrade 回调调度）期间 ws_bridge
+        // 尚未 fetch_add，闲置回收器若恰在此窗口判定会把刚要建立的桥接杀在半路
+        mapping
+            .service
+            .last_access_ms
+            .store(now_ms() as i64, Ordering::Relaxed);
         // WS 冷请求同样要走按需启动：服务未就绪时直接拒绝，不做升级
         if let Err(e) = self.ensure_ready(&mapping).await {
             logger::warn(&format!("⚠️ 服务不可用: {}", e));
