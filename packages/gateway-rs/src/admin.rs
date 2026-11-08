@@ -194,7 +194,8 @@ fn proc_metrics(rt: &ServiceRuntime) -> serde_json::Value {
     let cpu_percent = match *last {
         Some((prev_j, prev_ms)) if now > prev_ms => {
             let dt_s = (now - prev_ms) as f64 / 1000.0;
-            ((jiffies - prev_j) as f64 / CLOCK_TICKS / dt_s) * 100.0
+            // 饱和减法：子进程退出或 pgid 复用会导致 jiffies 回退，直接相减会下溢回绕成天文数字
+            (jiffies.saturating_sub(prev_j) as f64 / CLOCK_TICKS / dt_s) * 100.0
         }
         _ => 0.0,
     };

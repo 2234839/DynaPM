@@ -91,7 +91,7 @@ DynaPM is built on these great open-source projects:
 
 ## Community
 
-[![Scan to join the developer community](https://tsfullstack.heartstack.space/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
+[![Scan to join the developer community](https://streamhold.heartstack.space/svg/tsfullstack/group/gs.svg?from=dynapm)](https://tsfullstack.heartstack.space/group/gs?from=dynapm)
 
 - 🐛 Bug reports: [GitHub Issues](https://github.com/2234839/DynaPM/issues)
 - 💡 Feature requests: [GitHub Discussions](https://github.com/2234839/DynaPM/discussions)
