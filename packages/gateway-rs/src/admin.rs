@@ -500,6 +500,7 @@ pub async fn service_detail(
     let obj = detail.as_object_mut().unwrap();
     obj.insert("startTimeout".into(), serde_json::json!(rt.config.start_timeout));
     obj.insert("netns".into(), serde_json::json!(rt.config.netns));
+    obj.insert("outbound".into(), serde_json::json!(rt.config.outbound));
     obj.insert("keepWarm".into(), serde_json::json!(rt.config.keep_warm));
     obj.insert("healthCheck".into(), serde_json::json!({ "type": health_check_type_name(&rt.config.health_check) }));
     obj.insert("startCommand".into(), serde_json::json!(rt.config.commands.start));

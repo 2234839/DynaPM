@@ -36,22 +36,36 @@ fn safe_name(service_name: &str) -> String {
 /// 把原始 start 命令包装为 netns 启动命令：
 /// 1. 读 groupfile 杀上一次启动的整个进程组（bash 为组长，泵/服务进程同组；
 ///    网关重启内存态丢失后靠它兜底，否则旧 netns 里的服务进程变孤儿持续泄漏）
-/// 2. 拉起 lo → 后台泵 → 原始启动命令，并把自身 bash pid（= 组长 pgid）写入 groupfile
-pub fn wrap_start_command(start_cmd: &str, service_name: &str, target_port: u16) -> String {
+/// 2. 拉起 lo → （outbound）bind 私有 resolv.conf → 后台泵 → 原始启动命令，
+///    并把自身 bash pid（= 组长 pgid）写入 groupfile
+pub fn wrap_start_command(start_cmd: &str, service_name: &str, target_port: u16, outbound: bool) -> String {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "dynapm-rs".to_string());
     let sock = sock_path(service_name).display().to_string();
     let groupfile = pump_group_path(service_name).display().to_string();
+    // outbound 模式下 DNS 指向 slirp 内置转发器 10.0.2.3；
+    // bind 在 ns 自己的 mount ns 内进行（调用方须给 unshare 加 --mount），不动宿主机文件
+    let dns_setup = if outbound {
+        let resolv = std::env::temp_dir().join(format!("dynapm-{}.resolv", safe_name(service_name))).display().to_string();
+        format!("echo 'nameserver 10.0.2.3' > {resolv}\nmount --bind {resolv} /etc/resolv.conf\n")
+    } else {
+        String::new()
+    };
     format!(
         // start_cmd 尾部常以 `&` 结尾，用换行分隔避免 `& ;` 语法错误
         // kill 的目标是进程组：pgid 前必须带负号（-- -<pgid>），只写 pid 会漏杀组内 node/泵
         "if [ -f {groupfile} ]; then kill -9 -- -$(cat {groupfile}) 2>/dev/null; rm -f {groupfile}; fi
 ip link set lo up
-nohup {exe} __uds-pump {sock} {target_port} >/dev/null 2>&1 &
+{dns_setup}nohup {exe} __uds-pump {sock} {target_port} >/dev/null 2>&1 &
 {start_cmd}
 echo $$ > {groupfile}"
     )
+}
+
+/// 泵进程自身的 pid 文件（outbound 中继需要拿一个 netns 内存活进程的 pid）
+pub fn pump_pid_path(service_name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("dynapm-{}.proc", safe_name(service_name)))
 }
 
 /// 进程组记录文件（组长 bash 的 pid 即 pgid，宿主机可读）
@@ -90,6 +104,91 @@ pub async fn connect_uds(path: &std::path::Path) -> std::io::Result<UnixStream> 
     UnixStream::connect(path).await
 }
 
+/** 从泵子命令的 sock 参数反推 pid 文件路径：/tmp/dynapm-<name>.sock → /tmp/dynapm-<name>.proc
+ *  泵进程不知道服务名，只有 sock 路径；pid 文件与 sock 同目录同名不同后缀 */
+fn sock_path_from_arg(sock: &str) -> Option<std::path::PathBuf> {
+    let file = std::path::Path::new(sock);
+    if file.extension()? != "sock" {
+        return None;
+    }
+    let stem = file.file_stem()?.to_string_lossy().to_string();
+    let name = stem.strip_prefix("dynapm-")?.to_string();
+    Some(std::env::temp_dir().join(format!("dynapm-{}.proc", safe_name(&name))))
+}
+
+/** 探测 slirp4netns 是否可用（outbound 中继唯一工具）。
+ *  pasta 不可用于本场景：它拒绝以 root 运行（自动降权 nobody 后打不开 root 属主的
+ *  user namespace），而网关常在 root/systemd 下运行；slirp4netns 无此限制 */
+fn outbound_tool_available() -> bool {
+    std::process::Command::new("which")
+        .arg("slirp4netns")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/** 为 netns 服务拉起 outbound 中继（在宿主 netns 运行，目标为泵进程所在 namespace）。
+ *  netns 默认只有 lo 无出站网络；pasta/slirp4netns 把 ns 内流量经宿主 socket 转发出去。
+ *  中继进程随 namespace 清空自动退出（kill_on_drop 兜底），无需网关显式回收 */
+pub async fn spawn_outbound_relay(service_name: String) {
+    // 等泵写 pid 文件（冷启动窗口内就绪）
+    let pid_path = pump_pid_path(&service_name);
+    let pid = {
+        let mut waited = 0u64;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_path) {
+                if let Ok(p) = text.trim().parse::<u32>() {
+                    break p;
+                }
+            }
+            if waited >= 15_000 {
+                crate::logger::error(
+                    "netns outbound 启动失败",
+                    Some(&format!("等待泵 pid 文件超时: {}", pid_path.display())),
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            waited += 100;
+        }
+    };
+    let Some(tool) = outbound_tool_available().then_some("slirp4netns") else {
+        crate::logger::error(
+            "netns outbound 启动失败",
+            Some("未找到 slirp4netns，请安装：apt install slirp4netns"),
+        );
+        return;
+    };
+    let mut cmd = tokio::process::Command::new(tool);
+    cmd.kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .arg("--configure")
+        .arg(pid.to_string())
+        .arg("tap0");
+    match cmd.spawn() {
+        Ok(mut child) => {
+            crate::logger::info(&format!(
+                "[{service_name}] netns outbound 中继已启动（{tool}，目标 pid {pid}）"
+            ));
+            // 持有并等待：kill_on_drop 在 Child drop 时生效，若此处不等子进程会立刻被回收
+            if let Err(e) = child.wait().await {
+                crate::logger::error(
+                    "netns outbound 中继退出异常",
+                    Some(&format!("wait {tool}: {e}")),
+                );
+            }
+            crate::logger::info(&format!("[{service_name}] netns outbound 中继已退出"));
+        }
+        Err(e) => crate::logger::error(
+            "netns outbound 启动失败",
+            Some(&format!("spawn {tool}: {e}")),
+        ),
+    }
+}
+
 /// 泵子命令入口（`dynapm-rs __uds-pump <sock> <port>`）
 /// 在 netns 内运行：accept UDS 连接，每条连接 dial 命名空间内后端端口后双向透传
 pub async fn pump_main(sock: String, port: u16) {
@@ -101,6 +200,10 @@ pub async fn pump_main(sock: String, port: u16) {
             return;
         }
     };
+    // pid 文件与 sock 同目录派生：宿主侧 outbound 中继以此定位 netns 内存活进程
+    if let Some(pid_path) = sock_path_from_arg(&sock) {
+        let _ = std::fs::write(pid_path, std::process::id().to_string());
+    }
     loop {
         let Ok((client, _)) = listener.accept().await else {
             continue;

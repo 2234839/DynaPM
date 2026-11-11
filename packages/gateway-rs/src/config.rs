@@ -119,6 +119,9 @@ pub struct ServiceConfigInput {
     /// netns 模式：服务在零权限 user+net namespace 内运行，宿主机零端口占用
     /// （网关经 UDS 泵转发；与 passthrough 互斥）
     pub netns: Option<bool>,
+    /// netns 出站网络：默认 netns 内只有 lo 无任何出站；开启后网关在宿主侧
+    /// 拉起 pasta/slirp4netns 用户态中继，服务可访问外网（需 netns: true）
+    pub outbound: Option<bool>,
     /// 常驻软预热：闲置回收时使用独立的 warmIdleTimeout 判定
     pub keep_warm: Option<bool>,
     /// 允许在该服务域名下访问 /_dynapm 管理面板与 API
@@ -229,6 +232,8 @@ pub struct ServiceConfig {
     pub socks: bool,
     /// netns 模式（宿主机零端口占用，UDS 泵转发）
     pub netns: bool,
+    /// netns 出站网络（pasta/slirp4netns 用户态中继）
+    pub outbound: bool,
     /// 常驻软预热
     pub keep_warm: bool,
     /// 允许该服务域名下访问管理面板
@@ -498,6 +503,7 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
             passthrough: sc.passthrough.unwrap_or(false),
             socks: sc.socks.unwrap_or(false),
             netns: sc.netns.unwrap_or(false),
+            outbound: sc.outbound.unwrap_or(false),
             keep_warm,
             admin_panel,
             warm_idle_timeout: sc
@@ -519,6 +525,12 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
         if service.netns && service.proxy_only {
             return Err(format!(
                 "[{}] netns 模式需要启动命令（由网关拉起进 namespace），不支持 proxyOnly",
+                service.name
+            ));
+        }
+        if service.outbound && !service.netns {
+            return Err(format!(
+                "[{}] outbound 依赖 netns：它是给隔离命名空间补出站网络的中继开关",
                 service.name
             ));
         }

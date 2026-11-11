@@ -39,6 +39,41 @@ DynaPM 网关的 **唯一当前实现**（原 Bun/TS 版已废弃），单文件
 
 **结论：凡是通过 docker 端口映射暴露的后端，healthCheck 必须用 `{"type": "http"}`**（探测 base URL 状态码），tcp 检查只适用于「监听端口的进程就是服务进程本身」的直启场景。
 
+## netns 模式与出站网络（重要）
+
+`netns: true` 把服务进程放进零权限 user+net namespace（`unshare -Urn`）运行：它监听的端口只存在于命名空间内，**宿主机零端口占用**，网关经 UDS 泵转发——这是给 dev server 之类「纯入站」服务做端口隔离用的。
+
+**⚠️ 默认无出站网络**：netns 里只有一块 lo，没有网卡/路由/DNS。这是 `unshare -Urn` 零权限方案的固有代价（veth+NAT 需要宿主 root）。因此：
+
+- **服务不需要主动访问外网**（纯入站 dev server）→ `netns: true`，默认即可
+- **服务需要主动外联**（OAuth/支付回调、调第三方 API、发 webhook）→ 两种选择：
+  1. 不用 netns（端口隔离靠网关自动分配端口 + 域名转发已经达成，netns 对端口隔离本身是多余手段）
+  2. 保留 netns 并显式开启出站：
+
+```json
+{
+  "services": {
+    "tsfullstack": {
+      "netns": true,
+      "outbound": true,
+      "commands": { "start": "..." }
+    }
+  }
+}
+```
+
+`outbound: true`（依赖 `netns: true`，否则配置校验报错）时，网关在宿主侧为该 namespace 自动拉起用户态网络中继 `slirp4netns`（rootless 容器生态的标准组件，网关无需任何特权）：
+
+- 启动命令会被额外包一层 `--mount` namespace，内部 bind 一份私有 `resolv.conf`（DNS 指向 slirp 内置转发器 `10.0.2.3`），不影响宿主机文件
+- 中继随 namespace 内进程全部退出而自动结束，服务每次冷启动网关都会重新拉起中继
+- 不装 slirp4netns 时启动会报错提示：`apt install slirp4netns`
+
+```bash
+sudo apt install slirp4netns
+```
+
+> 注：不选用 pasta/passt——它拒绝以 root 运行（自动降权为 nobody 后打不开 root 属主的 user namespace），而网关常在 root/systemd 环境下运行；slirp4netns 无此限制。
+
 ## 构建与运行
 
 ```bash

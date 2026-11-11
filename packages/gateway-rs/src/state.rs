@@ -399,10 +399,14 @@ pub async fn start(service: &ServiceConfig) -> Result<u32, String> {
     // stdio 直接 null 免掉退出后的 drain 等待与 pipe-EOF 问题
     if service.netns {
         let target_port = health::resolve_service_port(service).unwrap_or(0);
-        let wrapped = crate::netns::wrap_start_command(&service.commands.start, &service.name, target_port);
+        // 先清除上一代泵 pid 文件：outbound 中继的等待循环看到残留文件会立即拿旧 pid 接错 namespace
+        if service.outbound {
+            let _ = std::fs::remove_file(crate::netns::pump_pid_path(&service.name));
+        }
+        let wrapped = crate::netns::wrap_start_command(&service.commands.start, &service.name, target_port, service.outbound);
         opts.collect_output = false;
         let result = executor::execute(
-            &format!("unshare --user --map-root-user --net -- bash -c {}", shell_quote(&wrapped)),
+            &format!("unshare --user --map-root-user --net {}-- bash -c {}", if service.outbound { "--mount " } else { "" }, shell_quote(&wrapped)),
             &opts,
         )
         .await;
@@ -412,6 +416,9 @@ pub async fn start(service: &ServiceConfig) -> Result<u32, String> {
                 result.stderr.trim(),
                 result.stdout.trim()
             ));
+        }
+        if service.outbound {
+            tokio::spawn(crate::netns::spawn_outbound_relay(service.name.clone()));
         }
         return Ok(result.pgid);
     }
@@ -450,14 +457,21 @@ async fn spawn_netns_direct(args: &[String], service: &ServiceConfig) -> Result<
     if let Some(log) = &service.commands.log_file {
         inner = format!("{inner} >> {} 2>&1", shell_quote(log));
     }
-    let wrapped = crate::netns::wrap_start_command(&inner, &service.name, health::resolve_service_port(service).unwrap_or(0));
-    let result = executor::execute(&format!("unshare --user --map-root-user --net -- bash -c {}", shell_quote(&wrapped)), &opts).await;
+    let wrapped = crate::netns::wrap_start_command(&inner, &service.name, health::resolve_service_port(service).unwrap_or(0), service.outbound);
+    // 同上：先清旧泵 pid 文件，防 outbound 中继接错 namespace
+    if service.outbound {
+        let _ = std::fs::remove_file(crate::netns::pump_pid_path(&service.name));
+    }
+    let result = executor::execute(&format!("unshare --user --map-root-user --net {}-- bash -c {}", if service.outbound { "--mount " } else { "" }, shell_quote(&wrapped)), &opts).await;
     if result.exit_code != 0 {
         return Err(format!(
             "启动失败: {}\n{}",
             result.stderr.trim(),
             result.stdout.trim()
         ));
+    }
+    if service.outbound {
+        tokio::spawn(crate::netns::spawn_outbound_relay(service.name.clone()));
     }
     Ok(result.pgid)
 }
