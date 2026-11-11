@@ -1,6 +1,10 @@
 /** admin API baseURL，可配置：通过环境变量 VITE_ADMIN_API_BASE 覆盖，默认同源（dev 走 vite 代理） */
 export const ADMIN_API_BASE: string = import.meta.env.VITE_ADMIN_API_BASE ?? '';
 
+import { createClient, type AdminClient } from './client';
+
+export type { AdminClient };
+
 /** 管理令牌存放 key（localStorage） */
 const TOKEN_KEY = 'dynapm-admin-token';
 
@@ -29,12 +33,6 @@ export function setToken(t: string): void {
 /** 清除令牌（退出登录） */
 export function clearToken(): void {
   localStorage.removeItem(TOKEN_KEY);
-}
-
-/** 带鉴权头的请求头 */
-function authHeaders(): Record<string, string> {
-  const t = getToken();
-  return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
 /** 服务运行状态（与网关 admin API 输出一致） */
@@ -93,21 +91,54 @@ export interface ServiceDetail extends ServiceListItem {
 }
 
 /**
- * 封装的 fetch：拼 baseURL、携带 Bearer 令牌、非 2xx 抛错（401 抛特定错误供上层触发重新输入）
+ * 本地面板客户端：全部端点经由 client.ts 工厂唯一实现（远程面板联邦同构复用），
+ * 401 时清除本地失效令牌。下方导出的函数为兼容既有调用方的薄壳。
  */
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${ADMIN_API_BASE}${path}`, {
-    ...init,
-    headers: { ...authHeaders(), ...(init?.headers as Record<string, string>) },
-  });
-  if (res.status === 401) {
-    clearToken();
-    throw new Error('UNAUTHORIZED');
-  }
-  if (!res.ok) {
-    throw new Error(`API ${path} 请求失败: ${res.status}`);
-  }
-  return res.json() as Promise<T>;
+export const localClient: AdminClient = createClient(ADMIN_API_BASE, getToken, clearToken);
+
+/** 获取服务列表（epoch 游标：代数未变时服务列表为空数组，调用方沿用旧数据跳过重渲染） */
+export function fetchServices(epoch?: number): Promise<{ epoch?: number; services: ServiceListItem[] }> {
+  return localClient.fetchServices(epoch);
+}
+
+/** 获取各服务历史统计（自动翻页聚合到完整结果；from/to 分钟 epoch 窗口，step 聚合粒度） */
+export function fetchStats(fromMin?: number, toMin?: number, step = 15): Promise<{ services: ServiceStats[] }> {
+  return localClient.fetchStats(fromMin, toMin, step);
+}
+
+/** 获取配置文件（authToken 已脱敏，附带 _mtime 用于外部修改检测） */
+export function fetchConfig(): Promise<Record<string, any>> {
+  return localClient.fetchConfig();
+}
+
+/** 保存配置（校验通过后热更或自重启；携带 _mtime 做外部修改冲突检测，冲突时后端返回 409） */
+export function saveConfig(cfg: Record<string, any>): Promise<{ ok: boolean; reloaded?: boolean; restarting?: boolean }> {
+  return localClient.saveConfig(cfg);
+}
+
+/** 获取服务详情 */
+export function fetchServiceDetail(name: string): Promise<ServiceDetail> {
+  return localClient.fetchServiceDetail(name);
+}
+
+/** 启动服务 */
+export function startService(name: string): Promise<unknown> {
+  return localClient.startService(name);
+}
+
+/** 停止服务（下次请求到达会自动按需拉起） */
+export function stopService(name: string): Promise<unknown> {
+  return localClient.stopService(name);
+}
+
+/** 彻底关停：停止进程并禁止按需/手动拉起 */
+export function disableService(name: string): Promise<unknown> {
+  return localClient.disableService(name);
+}
+
+/** 解除彻底关停（恢复可按需拉起，不立即启动） */
+export function enableService(name: string): Promise<unknown> {
+  return localClient.enableService(name);
 }
 
 /** 单个服务历史统计（服务端已按窗口裁剪 + step 聚合 + 扁平编码） */
@@ -125,67 +156,4 @@ export interface StatsPage {
   hasMore?: boolean;
   nextOffset?: number;
   services: ServiceStats[];
-}
-
-/** 获取服务列表（epoch 游标：代数未变时服务列表为空数组，调用方沿用旧数据跳过重渲染） */
-export function fetchServices(epoch?: number): Promise<{ epoch?: number; services: ServiceListItem[] }> {
-  return api(`/_dynapm/api/services${epoch != null ? `?epoch=${epoch}` : ''}`);
-}
-
-/** stats 单页大小：有数据的服务通常远小于服务总数，单页足够；超出时分页拉全 */
-const STATS_PAGE_LIMIT = 500;
-
-/** 获取各服务历史统计（自动翻页聚合到完整结果；from/to 分钟 epoch 窗口，step 聚合粒度） */
-export async function fetchStats(fromMin?: number, toMin?: number, step = 15): Promise<{ services: ServiceStats[] }> {
-  const q = new URLSearchParams();
-  if (fromMin != null) q.set('from', String(fromMin));
-  if (toMin != null) q.set('to', String(toMin));
-  q.set('step', String(step));
-  q.set('limit', String(STATS_PAGE_LIMIT));
-  const all: ServiceStats[] = [];
-  let offset = 0;
-  // 有界翻页：防御性上限，避免后端异常时死循环
-  for (let guard = 0; guard < 100; guard++) {
-    q.set('offset', String(offset));
-    const page = await api<StatsPage>(`/_dynapm/api/stats?${q.toString()}`);
-    all.push(...(page.services ?? []));
-    if (!page.hasMore || !(page.services ?? []).length) break;
-    offset = page.nextOffset ?? offset + (page.services ?? []).length;
-  }
-  return { services: all };
-}
-
-/** 获取配置文件（authToken 已脱敏，附带 _mtime 用于外部修改检测） */
-export function fetchConfig(): Promise<Record<string, any>> {
-  return api('/_dynapm/api/config');
-}
-
-/** 保存配置（校验通过后热更或自重启；携带 _mtime 做外部修改冲突检测，冲突时后端返回 409） */
-export function saveConfig(cfg: Record<string, any>): Promise<{ ok: boolean; reloaded?: boolean; restarting?: boolean }> {
-  return api('/_dynapm/api/config', { method: 'PUT', body: JSON.stringify(cfg, null, 2) });
-}
-
-/** 获取服务详情 */
-export function fetchServiceDetail(name: string): Promise<ServiceDetail> {
-  return api(`/_dynapm/api/services/${encodeURIComponent(name)}`);
-}
-
-/** 启动服务 */
-export function startService(name: string): Promise<unknown> {
-  return api(`/_dynapm/api/services/${encodeURIComponent(name)}/start`, { method: 'POST' });
-}
-
-/** 停止服务（下次请求到达会自动按需拉起） */
-export function stopService(name: string): Promise<unknown> {
-  return api(`/_dynapm/api/services/${encodeURIComponent(name)}/stop`, { method: 'POST' });
-}
-
-/** 彻底关停：停止进程并禁止按需/手动拉起 */
-export function disableService(name: string): Promise<unknown> {
-  return api(`/_dynapm/api/services/${encodeURIComponent(name)}/disable`, { method: 'POST' });
-}
-
-/** 解除彻底关停（恢复可按需拉起，不立即启动） */
-export function enableService(name: string): Promise<unknown> {
-  return api(`/_dynapm/api/services/${encodeURIComponent(name)}/enable`, { method: 'POST' });
 }

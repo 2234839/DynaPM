@@ -38,13 +38,9 @@ pub fn init_dir(dir: Option<PathBuf>) {
     let _ = STATS_DIR.set(dir);
 }
 
-/** 当前 unix 毫秒 */
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+/** 当前 unix 毫秒（唯一实现在 state，禁止各模块重写） */
+#[allow(unused_imports)]
+use crate::state::now_ms;
 
 /** mmap 持久化统计文件（Drop 时 munmap，停止的服务不占驻留内存） */
 pub struct StatsFile {

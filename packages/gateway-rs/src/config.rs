@@ -237,6 +237,18 @@ pub struct ServiceConfig {
     pub warm_idle_timeout: u64,
 }
 
+impl ServiceConfig {
+    /** 当前适用的闲置回收阈值：keepWarm 用独立短阈值。
+     *  0 表示永不回收（长驻服务如 SSH 隧道） */
+    pub fn idle_threshold(&self) -> u64 {
+        if self.keep_warm {
+            self.warm_idle_timeout
+        } else {
+            self.idle_timeout
+        }
+    }
+}
+
 /// 规范化后的路由
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteValue {
@@ -360,10 +372,9 @@ pub fn load_config_from_str(content: &str) -> Result<DynaPMConfig, String> {
     resolve_config(input)
 }
 
-/// 用户级默认配置路径（~/.config/dynapm/dynapm.config.json），目录不存在则创建。
 /// sudo 环境下 HOME=/root 会指错人：优先用 SUDO_USER 的真实 home（getent 解析）
-fn user_config_path() -> std::path::PathBuf {
-    let home = std::env::var("SUDO_USER")
+pub fn user_home() -> String {
+    std::env::var("SUDO_USER")
         .ok()
         .filter(|u| !u.is_empty())
         .and_then(|u| {
@@ -377,7 +388,12 @@ fn user_config_path() -> std::path::PathBuf {
             if field.is_empty() { None } else { Some(field) }
         })
         .or_else(|| std::env::var("HOME").ok())
-        .unwrap_or_else(|| ".".to_string());
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// 用户级默认配置路径（~/.config/dynapm/dynapm.config.json），目录不存在则创建。
+fn user_config_path() -> std::path::PathBuf {
+    let home = user_home();
     let dir = std::path::Path::new(&home).join(".config/dynapm");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("dynapm.config.json")
@@ -491,12 +507,6 @@ fn resolve_config(input: DynaPMConfigInput) -> Result<DynaPMConfig, String> {
         if service.netns && service.passthrough {
             return Err(format!(
                 "[{}] netns 与 passthrough 互斥：TCP 直通需要宿主机端口，netns 模式不占用端口",
-                service.name
-            ));
-        }
-        if service.socks && !service.passthrough {
-            return Err(format!(
-                "[{}] socks 模式依赖 passthrough：需同时声明 passthrough=true",
                 service.name
             ));
         }

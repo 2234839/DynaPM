@@ -194,6 +194,50 @@ impl ServiceRuntime {
         self.status_tx.subscribe()
     }
 
+    /// 刷新最近访问时间（请求到达 / 流式 chunk / 消息转发等一切「有活动」时机）
+    pub fn touch(&self) {
+        self.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
+    }
+
+    /** 闲置判定唯一口径：online、无活跃连接、距上次访问超过该服务适用的阈值
+     *  （keepWarm 用 warmIdleTimeout）。闲置回收器/内存回收/面板倒计时
+     *  都必须经由该方法，禁止手工重写判定组合 */
+    pub fn is_idle(&self) -> bool {
+        if self.status() != Status::Online {
+            return false;
+        }
+        if self.active_connections.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        let threshold = self.config.idle_threshold();
+        threshold > 0
+            && now_ms() as i64 - self.last_access_ms.load(Ordering::Relaxed) > threshold as i64
+    }
+
+    /** 剩余闲置时间（毫秒）：距自然回收还剩多久（永不回收或非可回收态返回 None） */
+    pub fn idle_remaining_ms(&self) -> Option<i64> {
+        if self.status() != Status::Online
+            || self.active_connections.load(Ordering::Relaxed) != 0
+            || self.config.proxy_only
+            || self.config.idle_threshold() == 0
+        {
+            return None;
+        }
+        let threshold = self.config.idle_threshold() as i64;
+        let elapsed = now_ms() as i64 - self.last_access_ms.load(Ordering::Relaxed) as i64;
+        Some((threshold - elapsed).max(0))
+    }
+
+    /** 取得访问活性守卫：计数 +1 并刷新访问时间，Drop 时计数 -1 并把「连接关闭」
+     *  视为最后一次访问（闲置计时从断开时刻重新起算）。
+     *  所有转发路径（HTTP/WS/SSE/TCP 直通）的活性维护必须经由该守卫，
+     *  禁止手工 fetch_add/fetch_sub 配对——漏配对即闲置回收误杀 bug 的根因 */
+    pub fn activity(self: &Arc<Self>) -> ActivityGuard {
+        self.touch();
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        ActivityGuard(Arc::clone(self))
+    }
+
     /// 结算当前运行会话：累计到 total_uptime 并清空 start_time
     /// （stop、后端不可达重置等一切 online->offline 转换都必须副用，否则历史存活漏计）
     pub fn close_session(&self) {
@@ -229,12 +273,41 @@ impl ServiceRuntime {
     }
 }
 
+/// 访问活性守卫：持有期间 active_connections > 0（闲置回收器不杀），
+/// Drop 时计数 -1 并刷新 last_access（连接关闭 = 最后一次访问，
+/// 闲置计时从断开时刻重新起算）。HTTP 流式响应通过 ActivityGuardStream
+/// 把守卫移交给 body 流，生命周期与连接一致
+pub struct ActivityGuard(Arc<ServiceRuntime>);
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.0.touch();
+    }
+}
+
 /// 当前 unix 毫秒
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/** 文件 mtime（unix 毫秒）：配置热更/二进制版本对齐等 mtime 比对统一经由该切面 */
+pub fn file_mtime_ms(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+}
+
+/** 当前可执行文件路径字符串（失败降级 fallback）：日志/自重启/unit 生成等统一经由该切面 */
+pub fn self_exe_path(fallback: &str) -> String {
+    std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| fallback.to_string())
 }
 
 /// 路由映射（Bun 版 RouteMapping 对应物）
@@ -436,11 +509,9 @@ pub async fn stop(rt: &ServiceRuntime, stop_timeout_ms: u64) -> Result<(), Strin
     if pgid.is_none() && service.netns {
         // netns 路径：从 groupfile 恢复组长 pgid（网关崩溃重启后内存态丢失，
         // 不读它则 ns 内服务进程无法被组信号升级，stop 只能杀泵留孤儿）
-        if let Ok(s) = std::fs::read_to_string(crate::netns::pump_group_path(&service.name)) {
-            if let Ok(g) = s.trim().parse::<u32>() {
-                if g > 1 && crate::procreg::group_alive(g) {
-                    pgid = Some(g);
-                }
+        if let Some(g) = crate::netns::read_pump_pgid(&service.name) {
+            if g > 1 && crate::procreg::group_alive(g) {
+                pgid = Some(g);
             }
         }
     }

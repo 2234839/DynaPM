@@ -21,12 +21,16 @@ use tokio::net::{TcpStream, UnixStream};
 
 /// 服务在 netns 内监听后，宿主机侧可探测到的是这个 UDS 文件
 pub fn sock_path(service_name: &str) -> std::path::PathBuf {
-    // 服务名仅作文件名成分，过滤路径分隔符防注入
-    let safe: String = service_name
+    std::env::temp_dir().join(format!("dynapm-{}.sock", safe_name(service_name)))
+}
+
+/** 服务名仅作文件名成分，过滤路径分隔符等非法字符防注入。
+ *  sock_path / pump_group_path 共用，禁止内联重写 */
+fn safe_name(service_name: &str) -> String {
+    service_name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    std::env::temp_dir().join(format!("dynapm-{safe}.sock"))
+        .collect()
 }
 
 /// 把原始 start 命令包装为 netns 启动命令：
@@ -52,11 +56,15 @@ echo $$ > {groupfile}"
 
 /// 进程组记录文件（组长 bash 的 pid 即 pgid，宿主机可读）
 pub fn pump_group_path(service_name: &str) -> std::path::PathBuf {
-    let safe: String = service_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    std::env::temp_dir().join(format!("dynapm-{safe}.pump.pid"))
+    std::env::temp_dir().join(format!("dynapm-{}.pump.pid", safe_name(service_name)))
+}
+
+/** 读取 groupfile 中记录的泵进程组 id（不存在/损坏返回 None）。
+ *  网关重启内存态丢失时靠它兜底杀残留进程组 */
+pub fn read_pump_pgid(service_name: &str) -> Option<u32> {
+    std::fs::read_to_string(pump_group_path(service_name))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 

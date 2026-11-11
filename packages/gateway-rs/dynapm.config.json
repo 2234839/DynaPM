@@ -1,36 +1,38 @@
 {
-  "port": 3000,
+  "adminApi": {
+    "authToken": "",
+    "enabled": true
+  },
   "host": "127.0.0.1",
+  "logging": {
+    "enableRequestLog": false,
+    "enableWebSocketLog": false
+  },
+  "port": 3000,
   "services": {
     "my-app.example.com": {
       "base": "http://127.0.0.1:4100",
       "commands": {
+        "check": "pgrep -f 'bun run server.ts' > /dev/null",
         "start": "cd /srv/my-app && nohup bun run server.ts > logs/app.log 2>&1 &",
-        "stop": "pkill -f 'bun run server.ts' || true",
-        "check": "pgrep -f 'bun run server.ts' > /dev/null"
+        "stop": "pkill -f 'bun run server.ts' || true"
       },
-      "healthCheck": { "type": "tcp" },
+      "healthCheck": {
+        "type": "tcp"
+      },
       "idleTimeout": 300000,
       "startTimeout": 30000
     },
     "siyuan.local": {
-      "port": 6806,
-      "passthrough": true,
       "base": "http://127.0.0.1:6806",
+      "passthrough": true,
+      "port": 6806,
       "proxyOnly": true
     }
   },
-  "adminApi": {
-    "enabled": true,
-    "authToken": ""
-  },
   "timeouts": {
     "proxyTimeoutMs": 30000,
-    "stopWaitMs": 30000,
-    "stopTimeoutMs": 30000
-  },
-  "logging": {
-    "enableRequestLog": false,
-    "enableWebSocketLog": false
+    "stopTimeoutMs": 30000,
+    "stopWaitMs": 30000
   }
 }

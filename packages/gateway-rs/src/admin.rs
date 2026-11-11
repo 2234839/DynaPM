@@ -18,6 +18,39 @@ use futures_util::Stream;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/** 按名查找服务，未找到时直接返回 404 响应。
+ *  所有 :name 路由 handler 统一经由该切面，禁止手工重写 404 样板 */
+fn find_service(gw: &Gateway, name: &str) -> Result<Arc<ServiceRuntime>, axum::response::Response> {
+    match gw.runtime(name) {
+        Some(r) => Ok(r),
+        None => Err(json_response(
+            axum::http::StatusCode::NOT_FOUND,
+            &serde_json::json!({ "error": "Service not found" }),
+        )),
+    }
+}
+
+/** 服务运行时状态的公共 JSON 字段块（列表/详情共享的子集，
+ *  路由归集等列表专属字段由调用方追加） */
+fn service_status_json(rt: &ServiceRuntime) -> serde_json::Value {
+    serde_json::json!({
+        "name": rt.config.name,
+        "base": rt.config.base,
+        "status": rt.status().as_str(),
+        "uptime": rt.session_uptime_ms(),
+        "lastAccessTime": rt.last_access_ms.load(Ordering::Relaxed),
+        "activeConnections": rt.active_connections.load(Ordering::Relaxed),
+        "idleTimeout": rt.config.idle_timeout,
+        "proxyOnly": rt.config.proxy_only,
+        "pid": *rt.pid.lock().unwrap(),
+        "paused": rt.paused.load(Ordering::Relaxed),
+        "requestCount": rt.request_count.load(Ordering::Relaxed),
+        "totalRequestMs": rt.total_request_ms.load(Ordering::Relaxed),
+        "startCount": rt.start_count.load(Ordering::Relaxed),
+        "totalUptime": rt.uptime_ms(),
+    })
+}
+
 /// Origin 是否在跨域白名单内（精确匹配；空白名单 = 禁止一切跨域）
 fn cors_allowed(gw: &Gateway, origin: &str) -> bool {
     let list = gw.admin_cors_origins();
@@ -101,34 +134,16 @@ pub async fn list_services(
         let hosts = hosts_by_service.get(&rt.config.name).cloned().unwrap_or_default();
         let ports = ports_by_service.get(&rt.config.name).cloned().unwrap_or_default();
         // 闲置回收倒计时（ms）：online 且无活跃连接时 = 阈值 - (now - lastAccess)，其余 null
-        let idle_remaining_ms = {
-            let threshold = if rt.config.keep_warm { rt.config.warm_idle_timeout } else { rt.config.idle_timeout };
-            let conns = rt.active_connections.load(Ordering::Relaxed);
-            let elapsed = crate::state::now_ms() as i64 - rt.last_access_ms.load(Ordering::Relaxed) as i64;
-            (rt.status() == Status::Online && conns == 0 && !rt.config.proxy_only)
-                .then(|| (threshold as i64 - elapsed).max(0))
-        };
-        services.push(serde_json::json!({
-            "name": rt.config.name,
-            "base": rt.config.base,
-            "hosts": hosts,
-            "ports": ports,
-            "socks": rt.config.socks,
-            "status": rt.status().as_str(),
-            "uptime": rt.session_uptime_ms(),
-            "lastAccessTime": rt.last_access_ms.load(Ordering::Relaxed),
-            "activeConnections": rt.active_connections.load(Ordering::Relaxed),
-            "idleTimeout": rt.config.idle_timeout,
-            "proxyOnly": rt.config.proxy_only,
-            "pid": *rt.pid.lock().unwrap(),
-            "paused": rt.paused.load(Ordering::Relaxed),
-            "requestCount": rt.request_count.load(Ordering::Relaxed),
-            "totalRequestMs": rt.total_request_ms.load(Ordering::Relaxed),
-            "startCount": rt.start_count.load(Ordering::Relaxed),
-            "totalUptime": rt.uptime_ms(),
-            "idleRemainingMs": idle_remaining_ms,
-            "lastStartDurationMs": rt.last_start_duration_ms.load(Ordering::Relaxed),
-        }));
+        let idle_remaining_ms = rt.idle_remaining_ms();
+        // 列表 = 公共状态字段 + 列表专属字段（路由归集/闲置倒计时/冷启动耗时）
+        let mut item = service_status_json(&rt);
+        let obj = item.as_object_mut().unwrap();
+        obj.insert("hosts".into(), serde_json::json!(hosts));
+        obj.insert("ports".into(), serde_json::json!(ports));
+        obj.insert("socks".into(), serde_json::json!(rt.config.socks));
+        obj.insert("idleRemainingMs".into(), serde_json::json!(idle_remaining_ms));
+        obj.insert("lastStartDurationMs".into(), serde_json::json!(rt.last_start_duration_ms.load(Ordering::Relaxed)));
+        services.push(item);
     }
     json_response(
         axum::http::StatusCode::OK,
@@ -225,12 +240,7 @@ pub async fn get_config() -> axum::response::Response {
         v["adminApi"]["authToken"] = serde_json::json!(TOKEN_REDACTED);
     }
     // 附带文件 mtime：面板用它检测外部修改，避免保存时覆盖磁盘上的新变更
-    let mtime = std::fs::metadata(config_path())
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let mtime = crate::state::file_mtime_ms(&config_path()).unwrap_or(0);
     if let Some(obj) = v.as_object_mut() {
         obj.insert("_mtime".into(), serde_json::json!(mtime));
     }
@@ -264,12 +274,7 @@ pub async fn put_config(
     if let Some(obj) = v.as_object_mut() {
         obj.remove("_mtime");
     }
-    let disk_mtime = std::fs::metadata(config_path())
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let disk_mtime = crate::state::file_mtime_ms(&config_path()).unwrap_or(0);
     let seen_mtime = *gw.config_mtime.lock().unwrap();
     if loaded_mtime > 0 && disk_mtime > 0 && loaded_mtime != disk_mtime && disk_mtime != seen_mtime {
         return json_response(
@@ -295,10 +300,8 @@ pub async fn put_config(
         return json_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &serde_json::json!({ "error": format!("写入配置失败: {e}") }));
     }
     // 记录本次写入的 mtime：后续携带旧 mtime 的保存不再误判为外部冲突
-    if let Ok(m) = std::fs::metadata(config_path()).and_then(|m| m.modified()) {
-        if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
-            *gw.config_mtime.lock().unwrap() = d.as_millis() as u64;
-        }
+    if let Some(m) = crate::state::file_mtime_ms(&config_path()) {
+        *gw.config_mtime.lock().unwrap() = m;
     }
     // 热更判定：仅监听地址（主端口/host/admin端口）变更需要重启重绑 socket；
     // 超时/并发/admin token 已随 reload 原地生效，服务路由变更原子替换不停机
@@ -322,13 +325,10 @@ pub async fn put_config(
 /// CLI 用 binaryMtime/startedAt 判断运行实例是否为旧版本（cargo build 原地替换二进制后，
 /// 运行中进程的启动时刻早于新二进制 mtime 即为旧实例）
 pub async fn get_info() -> axum::response::Response {
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    let exe = crate::state::self_exe_path("");
     let mtime = std::env::current_exe()
         .ok()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
+        .and_then(|p| crate::state::file_mtime_ms(&p))
         .unwrap_or(0);
     json_response(axum::http::StatusCode::OK, &serde_json::json!({
         "pid": std::process::id(),
@@ -386,10 +386,8 @@ pub async fn reload_config(
     }
     gw.reload(&cfg).await;
     // 已 reload 加载过的磁盘状态记为已知：后续面板携带旧 _mtime 保存不误判外部冲突
-    if let Ok(m) = std::fs::metadata(config_path()).and_then(|m| m.modified()) {
-        if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
-            *gw.config_mtime.lock().unwrap() = d.as_millis() as u64;
-        }
+    if let Some(m) = crate::state::file_mtime_ms(&config_path()) {
+        *gw.config_mtime.lock().unwrap() = m;
     }
     json_response(axum::http::StatusCode::OK, &serde_json::json!({ "ok": true, "reloaded": true }))
 }
@@ -490,41 +488,25 @@ pub async fn service_detail(
     Path(name): Path<String>,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    let rt = match gw.runtime(&name) {
-        Some(r) => r,
-        None => {
+    let rt = match find_service(&gw, &name) {
+        Ok(r) => r,
+        Err(resp) => {
             logger::info(&format!("🔍 [Admin API] 查找服务: {name}, 找到: null"));
-            return json_response(
-                axum::http::StatusCode::NOT_FOUND,
-                &serde_json::json!({ "error": "Service not found" }),
-            );
+            return resp;
         }
     };
-    let detail = serde_json::json!({
-        "name": rt.config.name,
-        "base": rt.config.base,
-        "status": rt.status().as_str(),
-        "uptime": rt.session_uptime_ms(),
-        "lastAccessTime": rt.last_access_ms.load(Ordering::Relaxed),
-        "activeConnections": rt.active_connections.load(Ordering::Relaxed),
-        "idleTimeout": rt.config.idle_timeout,
-        "startTimeout": rt.config.start_timeout,
-        "proxyOnly": rt.config.proxy_only,
-        "netns": rt.config.netns,
-        "keepWarm": rt.config.keep_warm,
-        "pid": *rt.pid.lock().unwrap(),
-        "healthCheck": { "type": health_check_type_name(&rt.config.health_check) },
-        "startCommand": rt.config.commands.start,
-        "stopCommand": rt.config.commands.stop.as_deref().unwrap_or(""),
-        "startCount": rt.start_count.load(Ordering::Relaxed),
-        "totalUptime": rt.uptime_ms(),
-        "paused": rt.paused.load(Ordering::Relaxed),
-        "requestCount": rt.request_count.load(Ordering::Relaxed),
-        "totalRequestMs": rt.total_request_ms.load(Ordering::Relaxed),
-        "lastStartError": rt.last_start_error.lock().unwrap().clone(),
-        "startFailStreak": rt.start_fail_streak.load(Ordering::Relaxed),
-        "cooldownRemainingMs": rt.start_cooldown_remaining_ms(),
-    });
+    // 详情 = 公共状态字段 + 详情专属字段（配置与失败诊断信息）
+    let mut detail = service_status_json(&rt);
+    let obj = detail.as_object_mut().unwrap();
+    obj.insert("startTimeout".into(), serde_json::json!(rt.config.start_timeout));
+    obj.insert("netns".into(), serde_json::json!(rt.config.netns));
+    obj.insert("keepWarm".into(), serde_json::json!(rt.config.keep_warm));
+    obj.insert("healthCheck".into(), serde_json::json!({ "type": health_check_type_name(&rt.config.health_check) }));
+    obj.insert("startCommand".into(), serde_json::json!(rt.config.commands.start));
+    obj.insert("stopCommand".into(), serde_json::json!(rt.config.commands.stop.as_deref().unwrap_or("")));
+    obj.insert("lastStartError".into(), serde_json::json!(rt.last_start_error.lock().unwrap().clone()));
+    obj.insert("startFailStreak".into(), serde_json::json!(rt.start_fail_streak.load(Ordering::Relaxed)));
+    obj.insert("cooldownRemainingMs".into(), serde_json::json!(rt.start_cooldown_remaining_ms()));
     json_response(axum::http::StatusCode::OK, &detail)
 }
 
@@ -533,14 +515,9 @@ pub async fn stop_service(
     Path(name): Path<String>,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    let rt = match gw.runtime(&name) {
-        Some(r) => r,
-        None => {
-            return json_response(
-                axum::http::StatusCode::NOT_FOUND,
-                &serde_json::json!({ "error": "Service not found" }),
-            );
-        }
+    let rt = match find_service(&gw, &name) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
     match gw.stop_service(rt).await {
         Ok(()) => json_response(axum::http::StatusCode::OK, &serde_json::json!({ "success": true })),
@@ -556,14 +533,9 @@ pub async fn start_service(
     Path(name): Path<String>,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    let rt = match gw.runtime(&name) {
-        Some(r) => r,
-        None => {
-            return json_response(
-                axum::http::StatusCode::NOT_FOUND,
-                &serde_json::json!({ "error": "Service not found" }),
-            );
-        }
+    let rt = match find_service(&gw, &name) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
     // 彻底关停状态下拒绝手动启动，需先 enable
     if rt.paused.load(Ordering::Relaxed) {
@@ -586,14 +558,9 @@ pub async fn disable_service(
     Path(name): Path<String>,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    let rt = match gw.runtime(&name) {
-        Some(r) => r,
-        None => {
-            return json_response(
-                axum::http::StatusCode::NOT_FOUND,
-                &serde_json::json!({ "error": "Service not found" }),
-            );
-        }
+    let rt = match find_service(&gw, &name) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
     rt.paused.store(true, Ordering::Relaxed);
     crate::procreg::set_paused(&name, true);
@@ -615,14 +582,9 @@ pub async fn enable_service(
     Path(name): Path<String>,
     axum::Extension(gw): axum::Extension<Arc<Gateway>>,
 ) -> axum::response::Response {
-    let rt = match gw.runtime(&name) {
-        Some(r) => r,
-        None => {
-            return json_response(
-                axum::http::StatusCode::NOT_FOUND,
-                &serde_json::json!({ "error": "Service not found" }),
-            );
-        }
+    let rt = match find_service(&gw, &name) {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
     rt.paused.store(false, Ordering::Relaxed);
     crate::procreg::set_paused(&name, false);

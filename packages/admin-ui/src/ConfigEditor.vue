@@ -2,6 +2,8 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { fetchConfig, saveConfig } from './api';
 import { confirmDialog, promptDialog } from './composables/dialog';
+import { usePagination } from './composables/usePagination';
+import { formatDuration } from './utils';
 
 /** 编辑模式 */
 const mode = ref<'visual' | 'json'>('visual');
@@ -38,35 +40,19 @@ const serviceKeys = computed(() => {
     return terms.every((t) => hay.includes(t));
   });
 });
-/** 服务卡片分页：万级服务一次性渲染会冻结主线程 */
-const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
-const pageSize = ref(20);
-const pageNo = ref(1);
-const totalPages = computed(() => Math.max(1, Math.ceil(serviceKeys.value.length / pageSize.value)));
-/** 当前页的服务 key（只渲染这一页的卡片） */
-const renderedKeys = computed(() =>
-  serviceKeys.value.slice((pageNo.value - 1) * pageSize.value, pageNo.value * pageSize.value),
+/** 服务卡片分页：万级服务一次性渲染会冻结主线程（搜索变化自动回第一页） */
+const { pageSize, pageNo, totalPages, renderedSlice: renderedKeys, gotoPage, PAGE_SIZE_OPTIONS } = usePagination(
+  () => serviceKeys.value,
+  'configEditor.pageSize',
+  20,
+  [search],
 );
-/** 过滤条件/页大小变化时回到第一页 */
-watch([search, pageSize], () => {
-  pageNo.value = 1;
-});
-/** 翻页并夹紧到有效范围 */
-function gotoPage(p: number): void {
-  pageNo.value = Math.min(totalPages.value, Math.max(1, p));
-}
 /** 健康检查类型选项 */
 const hcTypes = ['tcp', 'http', 'command', 'none'];
 
-/** 毫秒 → 友好时长（如 10m、1m30s、2h5m） */
+/** 毫秒 → 友好时长（如 10m、1m30s、2h5m；空值空串） */
 function fmtMs(ms?: number): string {
-  if (!ms || ms <= 0) return '';
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return s % 60 ? `${m}m${s % 60}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  return m % 60 ? `${h}h${m % 60}m` : `${h}h`;
+  return formatDuration(ms, 'cfg');
 }
 
 /** 从 raw 配置对象填充表单 */

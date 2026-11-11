@@ -69,6 +69,10 @@ DYNAPM_CONFIG=./dynapm.config.json ./dynapm
 - 🛠️ 内部工具：开发 / 测试环境按需访问
 - 💰 小 VPS 成本优化：用最少的钱跑最多的服务
 
+## 与 systemd socket activation 的关系
+
+systemd 生态也演化出了同样的思路：[Red Hat 这篇博客](https://www.redhat.com/zh-cn/blog/painless-services-implementing-serverless-rootless-podman-and-systemd)演示了用 `.socket` 单元 + `systemd-socket-proxyd` + `StopWhenUnneeded=yes` 做到「请求到达拉起容器、闲置自动停止」。DynaPM 的设计是独立想到这条路的，成文时才发现这篇文章——不谋而合，也印证了「低频服务按需启停」是个真实普遍的需求。区别在于 DynaPM 用一份 JSON 配置 + 单进程网关描述同样的生命周期，并且不依赖 systemd（容器、macOS 等环境同样适用）。
+
 ## 压测数据
 
 复现命令在 `packages/gateway-rs/test/`：

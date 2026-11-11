@@ -5,6 +5,7 @@ import { GridComponent, TooltipComponent, VisualMapComponent } from 'echarts/com
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { useEChart } from './composables/echarts';
+import { pairs } from './utils';
 
 use([HeatmapChart, GridComponent, TooltipComponent, VisualMapComponent, CanvasRenderer]);
 
@@ -27,19 +28,6 @@ export interface ServiceStats {
   proc?: ProcMetrics | null;
 }
 
-/** 扁平区间数组 → [start,end] 对（后端已裁剪到窗口，不再需要 end<0 哨兵） */
-function spanPairs(flat: number[]): [number, number][] {
-  const out: [number, number][] = [];
-  for (let i = 0; i + 1 < flat.length; i += 2) out.push([flat[i]!, flat[i + 1]!]);
-  return out;
-}
-/** 扁平分钟桶数组 → [minute,count] 对 */
-function bucketPairs(flat: number[]): [number, number][] {
-  const out: [number, number][] = [];
-  for (let i = 0; i + 1 < flat.length; i += 2) out.push([flat[i]!, flat[i + 1]!]);
-  return out;
-}
-
 const props = defineProps<{ stats: ServiceStats }>();
 
 /** 当前时间（响应式刷新由父组件轮询驱动） */
@@ -49,7 +37,7 @@ const now = Date.now();
 const timeline = computed(() => {
   const winStart = now - 24 * 3600_000;
   const total = 24 * 3600_000;
-  return spanPairs(props.stats.aliveSpans)
+  return pairs(props.stats.aliveSpans)
     .map(([s, e]) => {
       const end = e < 0 ? now : e;
       return [Math.max(s, winStart), Math.min(end, now)] as [number, number];
@@ -65,7 +53,7 @@ const timeline = computed(() => {
 const aliveHours24h = computed(() => {
   const winStart = now - 24 * 3600_000;
   return (
-    spanPairs(props.stats.aliveSpans).reduce((acc, [s, e]) => {
+    pairs(props.stats.aliveSpans).reduce((acc, [s, e]) => {
       const end = e < 0 ? now : e;
       return acc + Math.max(0, Math.min(end, now) - Math.max(s, winStart));
     }, 0) / 3600_000
@@ -76,7 +64,7 @@ const aliveHours24h = computed(() => {
 const hourBuckets = computed(() => {
   const map = new Map<number, number>();
   const hourNow = Math.floor(now / 3600_000);
-  for (const [m, c] of bucketPairs(props.stats.reqBuckets)) {
+  for (const [m, c] of pairs(props.stats.reqBuckets)) {
     const h = Math.floor(m / 60);
     if (h > hourNow) continue;
     map.set(h, (map.get(h) ?? 0) + c);
@@ -102,7 +90,7 @@ const heatCells = computed(() => {
 const total24h = computed(() => {
   const hourNow = Math.floor(now / 3600_000);
   let sum = 0;
-  for (const [m, c] of bucketPairs(props.stats.reqBuckets)) if (Math.floor(m / 60) > hourNow - 24) sum += c;
+  for (const [m, c] of pairs(props.stats.reqBuckets)) if (Math.floor(m / 60) > hourNow - 24) sum += c;
   return sum;
 });
 

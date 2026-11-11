@@ -6,6 +6,7 @@ import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { useEChart } from './composables/echarts';
 import { persistedRef } from './persistedRef';
+import { pairs } from './utils';
 
 use([HeatmapChart, CustomChart, GridComponent, TooltipComponent, VisualMapComponent, CanvasRenderer]);
 
@@ -15,12 +16,12 @@ use([HeatmapChart, CustomChart, GridComponent, TooltipComponent, VisualMapCompon
  * 低流量服务不会被高流量服务淹没，无请求的格子天然空白，也不存在堆叠/连线编造过渡的问题
  */
 
-/** 单个服务的统计（仅需分钟请求桶），remote 时带面板名前缀 */
+/** 单个服务的统计（仅需分钟请求桶，后端扁平编码），remote 时带面板名前缀 */
 interface SeriesStats {
   name: string;
-  reqBuckets: [number, number][];
-  /** 存活区间 [startMs, endMs]，end=-1 表示进行中 */
-  aliveSpans?: [number, number][];
+  reqBuckets: number[];
+  /** 存活区间扁平数组 [startMs, endMs, …]，end=-1 表示进行中 */
+  aliveSpans?: number[];
   /** 所属面板显示名（本地行为空串） */
   panelName?: string;
 }
@@ -78,14 +79,11 @@ const rows = computed(() =>
       const buckets = new Array<number>(STEPS).fill(0);
       const stepNow = Math.floor(now.value / (STEP_MIN * 60_000));
       // 后端扁平编码 [minute, count, …]，分钟已按 step 对齐
-      for (let i = 0; i + 1 < s.reqBuckets.length; i += 2) {
-        const m = s.reqBuckets[i]!;
-        const c = s.reqBuckets[i + 1]!;
+      for (const [m, c] of pairs(s.reqBuckets)) {
         const idx = STEPS - 1 - (stepNow - Math.floor(m / STEP_MIN));
         if (idx >= 0 && idx < STEPS) buckets[idx] += c;
       }
-      const spans: [number, number][] = [];
-      for (let i = 0; i + 1 < s.aliveSpans.length; i += 2) spans.push([s.aliveSpans[i]!, s.aliveSpans[i + 1]!]);
+      const spans = pairs(s.aliveSpans ?? []);
       return { name: s.name, buckets, aliveSpans: spans };
     })
     .filter((s) => s.buckets.some((v) => v > 0))

@@ -69,6 +69,10 @@ Now visiting `http://app.example.com:3000` starts the service automatically. For
 - 🛠️ Internal tools: on-demand access for dev / staging environments
 - 💰 Small VPS cost optimization: run the most services with the least money
 
+## vs. systemd socket activation
+
+The systemd ecosystem arrived at the same idea independently on its side: [this Red Hat post](https://www.redhat.com/zh-cn/blog/painless-services-implementing-serverless-rootless-podman-and-systemd) demonstrates on-demand container start with idle auto-stop using `.socket` units + `systemd-socket-proxyd` + `StopWhenUnneeded=yes`. DynaPM was designed on its own — we only found this article afterwards. The convergence confirms that "on-demand start/stop for low-traffic services" is a real, widespread need. The difference: DynaPM describes the same lifecycle with a single JSON config and a single gateway process, and doesn't depend on systemd (works in containers, macOS, etc.).
+
 ## Benchmarks
 
 Reproduce with the scripts in `packages/gateway-rs/test/`:

@@ -36,14 +36,7 @@ fn render_unit() -> Result<String, String> {
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "root".into()));
-    let user_home = std::env::var("SUDO_USER")
-        .ok()
-        .and_then(|u| {
-            let out = std::process::Command::new("getent").arg("passwd").arg(&u).output().ok()?;
-            String::from_utf8_lossy(&out.stdout).split(':').nth(5).map(|s| s.to_string())
-        })
-        .or_else(|| std::env::var("HOME").ok())
-        .unwrap_or_else(|| "/root".into());
+    let user_home = crate::config::user_home();
     // fnm 用户级 node 工具链注入：fnm 会话 bin（/run/user/<uid>/fnm_multishells/...）
     // 随 shell 会话变化无法写死，但 default 别名目录是稳定路径；
     // 不注入则网关冷启动 pnpm/npm/node 全部 127
@@ -173,18 +166,9 @@ pub fn service_subcommand(args: &[String]) {
  * 然后轮询等它回来。网关未运行时静默跳过（下次启动自然用新二进制）
  */
 fn ensure_gateway_up_to_date(cfg: &serde_json::Value) {
-    let main_port = cfg.get("port").and_then(|p| p.as_u64()).unwrap_or(80) as u16;
-    let admin_port = cfg
-        .pointer("/adminApi/port")
-        .and_then(|p| p.as_u64())
-        .unwrap_or(main_port as u64) as u16;
-    let token = cfg.pointer("/adminApi/authToken").and_then(|t| t.as_str()).unwrap_or("");
     let Some(own_mtime) = std::env::current_exe()
         .ok()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
+        .and_then(|p| crate::state::file_mtime_ms(&p))
     else {
         return;
     };
@@ -192,8 +176,7 @@ fn ensure_gateway_up_to_date(cfg: &serde_json::Value) {
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap();
-    let auth = format!("Bearer {token}");
-    let base = format!("http://127.0.0.1:{admin_port}/_dynapm/api");
+    let (base, auth) = cli_admin_base(cfg);
     let Ok(resp) = client
         .get(format!("{base}/info"))
         .header("Authorization", &auth)
@@ -267,17 +250,8 @@ fn candidate_config_paths() -> Vec<std::path::PathBuf> {
     }
     paths.push(std::path::PathBuf::from("dynapm.config.json"));
     // 用户级默认：与 config.rs 的解析规则保持一致（~/.config/dynapm/dynapm.config.json）
-    let home = std::env::var("SUDO_USER")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .and_then(|u| {
-            let out = std::process::Command::new("getent").arg("passwd").arg(&u).output().ok()?;
-            String::from_utf8_lossy(&out.stdout).split(':').nth(5).map(|s| s.to_string())
-        })
-        .or_else(|| std::env::var("HOME").ok());
-    if let Some(home) = home {
-        paths.push(std::path::Path::new(&home).join(".config/dynapm/dynapm.config.json"));
-    }
+    let home = crate::config::user_home();
+    paths.push(std::path::Path::new(&home).join(".config/dynapm/dynapm.config.json"));
     paths
 }
 
@@ -431,8 +405,12 @@ pub fn add_subcommand(args: &[String]) {
         std::process::exit(1);
     };
 
-    // 配置文件（不存在则创建最小骨架）
-    let cfg_path = crate::config::config_path();
+    // 配置文件（不存在则创建最小骨架）。
+    // 优先跟随运行中网关实例所用的配置（探测 /info 应答者）——cwd 存在示例/其他项目
+    // 配置时，按 cwd 解析会把服务写错文件且热加载找不到实例；无运行实例才落回本地解析
+    let cfg_path = probe_running_admin()
+        .map(|(_, _, p)| p)
+        .unwrap_or_else(crate::config::config_path);
     let mut cfg: serde_json::Value = if cfg_path.exists() {
         serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap_or_else(|e| {
             eprintln!("❌ 读取 {} 失败: {e}", cfg_path.display());
@@ -516,11 +494,21 @@ pub fn add_subcommand(args: &[String]) {
     // 41000 是上游端口，域名路由只需 host + base 指向上游
     // stop/check 留空：关停由网关 pgid 簿记 + 端口反查收编（procreg）负责，
     // 字符串匹配（pkill -f "--port N"）会误杀无关进程且停不干净，不再生成
+    // 日志集中放在 ~/.dynapm/logs/（pm2 风格），不污染用户项目目录；
+    // host 作为文件名天然唯一（同一 host 只有一条服务配置）
+    let log_path = crate::config::user_home() + "/.dynapm/logs/" + &host;
+    let _ = std::fs::create_dir_all(
+        std::path::Path::new(&log_path)
+            .parent()
+            .expect("日志路径必有父目录"),
+    );
     let svc = serde_json::json!({
         "host": host,
         "base": format!("http://127.0.0.1:{port}"),
         "commands": {
-            "start": format!("cd {dir_str} && nohup {pm} run {script} --port {port} > .dynapm.log 2>&1 &")
+            "start": format!(
+                "cd {dir_str} && nohup {pm} run {script} --port {port} > {log_path} 2>&1 &"
+            )
         },
         "healthCheck": { "type": "tcp" },
         "idleTimeout": 300000,

@@ -52,8 +52,6 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeWs {
     }
 }
 
-/// 请求体最大大小（10MB），防止 DoS 攻击（与 Bun 版一致）
-pub const MAX_REQUEST_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// 闲置检查间隔（毫秒）
 const IDLE_CHECK_INTERVAL_MS: u64 = 3000;
 
@@ -315,17 +313,6 @@ impl Gateway {
         if rt.status() == Status::Online || rt.config.proxy_only {
             return Ok(());
         }
-        rt.set_status(Status::Starting);
-        let start_begun_ms = now_ms();
-        let start_result = crate::state::start(&rt.config).await;
-        if let Err(e) = start_result {
-            rt.note_start_failure();
-            rt.set_status(Status::Offline);
-            return Err(e);
-        }
-        let start_pgid = start_result.unwrap_or_default();
-        *rt.start_pgid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
-        *rt.pid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
         // 启动命令退出码 0 ≠ 后端端口已监听（典型 nohup server & 场景），
         // 与 ensure_service_online 同步走就绪等待，避免手动启动后首个请求 502
         let (target_host, target_port, target_https) =
@@ -337,11 +324,50 @@ impl Gateway {
             target_port,
             target_https,
         };
-        let ready = wait_for_backend_ready(&rt.config, &resolved).await;
+        self.cold_start_locked(rt, &resolved, &rt.config.base).await
+    }
+
+    /** 冷启动状态机公共体（调用方必须已持有 start 锁与冷启动信号量，
+     *  并完成各自的前置策略——ensure 的冷却/内存回收、手动启动的清冷却）：
+     *  starting -> state::start -> 就绪等待 -> online 簿记 + 事件发布；
+     *  netns 服务附带旧进程组清理与 UDS 客户端失效。
+     *  唯一实现，禁止在任何入口内联重写 */
+    async fn cold_start_locked(
+        &self,
+        rt: &Arc<ServiceRuntime>,
+        resolved: &crate::config::RouteConfigResolved,
+        target: &str,
+    ) -> Result<(), String> {
+        let cfg = &rt.config;
+        rt.set_status(Status::Starting);
+        // 冷启动前整组清理旧进程：bash/泵/服务进程同属一个 pgid（bash 为组长），
+        // 只杀泵会让旧 netns 里的服务进程变成无人转发的孤儿（内存持续泄漏）
+        if cfg.netns {
+            if let Some(g) = *rt.start_pgid.lock().unwrap() {
+                crate::executor::kill_process_group(g);
+            }
+            // 防御性清理旧进程组：网关重启内存态丢失（start_pgid 为 None）时靠 groupfile 兜底
+            if let Some(g) = crate::netns::read_pump_pgid(&cfg.name) {
+                crate::executor::kill_process_group(g);
+            }
+            let _ = std::fs::remove_file(crate::netns::pump_group_path(&cfg.name));
+        }
+        let start_begun_ms = now_ms();
+        let start_result = crate::state::start(cfg).await;
+        if let Err(e) = start_result {
+            rt.note_start_failure();
+            rt.set_status(Status::Offline);
+            *rt.last_start_error.lock().unwrap() = Some(e.clone());
+            return Err(e);
+        }
+        let start_pgid = start_result.unwrap_or_default();
+        *rt.start_pgid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
+        *rt.pid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
+        let ready = wait_for_backend_ready(cfg, resolved).await;
         if !ready {
             rt.note_start_failure();
             rt.set_status(Status::Offline);
-            let err = format!("服务启动超时: 端口 {} 不可用", rt.config.base);
+            let err = format!("服务启动超时: 端口 {target} 不可用");
             *rt.last_start_error.lock().unwrap() = Some(err.clone());
             return Err(err);
         }
@@ -351,7 +377,15 @@ impl Gateway {
         rt.set_status(Status::Online);
         *rt.start_time_ms.lock().unwrap() = Some(now_ms() as i64);
         rt.start_count.fetch_add(1, Ordering::Relaxed);
-        self.publish_event(format!(r#"{{"type":"start","service":"{}"}}"#, rt.config.name));
+        // netns 服务每次冷启动都会重建 netns + UDS 泵（新 socket inode），
+        // 必须丢弃旧 UDS 客户端（其连接池里的长连接指向已死的旧泵），否则转发 502
+        if cfg.netns {
+            self.uds_clients.lock().unwrap().remove(&cfg.name);
+        }
+        self.publish_event(format!(
+            r#"{{"type":"start","service":"{}"}}"#,
+            rt.config.name
+        ));
         Ok(())
     }
 
@@ -540,11 +574,7 @@ impl Gateway {
             })
             .collect();
         // 剩余闲置时间最小者优先（最接近自然回收的先杀）
-        victims.sort_by_key(|rt| {
-            let threshold = if rt.config.keep_warm { rt.config.warm_idle_timeout } else { rt.config.idle_timeout };
-            let elapsed = now_ms() as i64 - rt.last_access_ms.load(Ordering::Relaxed) as i64;
-            (threshold as i64 - elapsed).max(0)
-        });
+        victims.sort_by_key(|rt| rt.idle_remaining_ms().unwrap_or(i64::MAX));
         for rt in victims {
             // 逐个杀并观察内存恢复，够用即停
             if let Some((avail, total)) = Self::mem_available_total() {
@@ -573,9 +603,6 @@ impl Gateway {
     pub async fn ensure_service_online(&self, mapping: &Arc<RouteMapping>) -> Result<(), String> {
         let rt = &mapping.service;
         let cfg = &rt.config;
-        if cfg.proxy_only || rt.status() == Status::Online {
-            return Ok(());
-        }
         if cfg.proxy_only || rt.status() == Status::Online {
             return Ok(());
         }
@@ -611,58 +638,7 @@ impl Gateway {
             return Ok(());
         }
 
-        rt.set_status(Status::Starting);
-        // 冷启动前整组清理旧进程：bash/泵/服务进程同属一个 pgid（bash 为组长），
-        // 只杀泵会让旧 netns 里的服务进程变成无人转发的孤儿（内存持续泄漏）
-        let stale_pgid = *rt.start_pgid.lock().unwrap();
-        if cfg.netns {
-            if let Some(g) = stale_pgid {
-                crate::executor::kill_process_group(g);
-            }
-            // 防御性清理旧进程组：网关重启内存态丢失（start_pgid 为 None）时靠 groupfile 兜底
-            let groupfile = crate::netns::pump_group_path(&cfg.name);
-            if let Ok(pgid) = std::fs::read_to_string(&groupfile) {
-                if let Ok(g) = pgid.trim().parse::<u32>() {
-                    crate::executor::kill_process_group(g);
-                }
-                let _ = std::fs::remove_file(&groupfile);
-            }
-        }
-        let start_begun_ms = now_ms();
-        let start_result = crate::state::start(cfg).await;
-        if let Err(e) = start_result {
-            rt.note_start_failure();
-            rt.set_status(Status::Offline);
-            *rt.last_start_error.lock().unwrap() = Some(e.clone());
-            return Err(e);
-        }
-        let start_pgid = start_result.unwrap_or_default();
-        *rt.start_pgid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
-        *rt.pid.lock().unwrap() = if start_pgid > 0 { Some(start_pgid) } else { None };
-        let ready = wait_for_backend_ready(cfg, &to_resolved(mapping)).await;
-        if !ready {
-            rt.note_start_failure();
-            rt.set_status(Status::Offline);
-            let err = format!("服务启动超时: 端口 {} 不可用", mapping.target);
-            *rt.last_start_error.lock().unwrap() = Some(err.clone());
-            return Err(err);
-        }
-        rt.last_start_duration_ms
-            .store((now_ms() - start_begun_ms) as i64, Ordering::Relaxed);
-        rt.clear_start_failure();
-        rt.set_status(Status::Online);
-        *rt.start_time_ms.lock().unwrap() = Some(now_ms() as i64);
-        rt.start_count.fetch_add(1, Ordering::Relaxed);
-        // netns 服务每次冷启动都会重建 netns + UDS 泵（新 socket inode），
-        // 必须丢弃旧 UDS 客户端（其连接池里的长连接指向已死的旧泵），否则转发 502
-        if cfg.netns {
-            self.uds_clients.lock().unwrap().remove(&cfg.name);
-        }
-        self.publish_event(format!(
-            r#"{{"type":"start","service":"{}"}}"#,
-            rt.config.name
-        ));
-        Ok(())
+        self.cold_start_locked(rt, &to_resolved(mapping), &mapping.target).await
     }
 
     /// 停止服务（状态机：online -> stopping -> offline）
@@ -707,24 +683,10 @@ impl Gateway {
                 };
                 for rt in runtimes {
                     let cfg = &rt.config;
-                    if cfg.proxy_only {
+                    if cfg.proxy_only || cfg.idle_threshold() == 0 {
                         continue;
                     }
-                    let idle_threshold = if cfg.keep_warm {
-                        cfg.warm_idle_timeout
-                    } else {
-                        cfg.idle_timeout
-                    };
-                    // idleTimeout/warmIdleTimeout = 0 表示永不回收（长驻服务如 SSH 隧道）
-                    if idle_threshold == 0 {
-                        continue;
-                    }
-                    let now = now_ms();
-                    if rt.status() == Status::Online
-                        && rt.active_connections.load(Ordering::Relaxed) == 0
-                        && now as i64 - rt.last_access_ms.load(Ordering::Relaxed)
-                            > idle_threshold as i64
-                    {
+                    if rt.is_idle() {
                         logger::info(&format!("🛌 [{}] 闲置超时，正在停止...", cfg.name));
                         let gw2 = Arc::clone(&gw);
                         let rt2 = Arc::clone(&rt);
@@ -733,10 +695,7 @@ impl Gateway {
                             // 此时杀后端会把在飞请求打成 502；复查不满足 idle 则放弃本次回收。
                             // status 复查：期间可能有新请求触发冷启动（Offline→Starting），
                             // 冷启动刚完成就回收等于白做一轮启动
-                            let still_idle = rt2.status() == Status::Online
-                                && rt2.active_connections.load(Ordering::Relaxed) == 0
-                                && now_ms() as i64 - rt2.last_access_ms.load(Ordering::Relaxed)
-                                    > idle_threshold as i64;
+                            let still_idle = rt2.is_idle();
                             if !still_idle {
                                 logger::info(&format!("↩️ [{}] 回收前复查发现新请求，跳过本次闲置停止", rt2.config.name));
                                 return;
@@ -843,18 +802,7 @@ impl Gateway {
     ) -> axum::response::Response {
         let rt = &mapping.service;
         let cfg = &rt.config;
-        rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
-
-        // 413 预检：content-length 声明超限直接拒绝
-        if let Some(len) = declared_content_length(&headers) {
-            if len > MAX_REQUEST_BODY_SIZE {
-                logger::warn(&format!(
-                    "⚠️ [{}] 请求体超过 {MAX_REQUEST_BODY_SIZE} 字节，返回 413",
-                    cfg.name
-                ));
-                return text_response(axum::http::StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
-            }
-        }
+        rt.touch();
 
         // 彻底关停（paused）：拒绝代理与按需拉起，返回 503（区别于 stop：stop 后下次请求会自动拉起）
         if rt.paused.load(Ordering::Relaxed) {
@@ -886,12 +834,10 @@ impl Gateway {
     ) -> axum::response::Response {
         let rt = &mapping.service;
         let cfg = &rt.config;
-        rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
-        rt.active_connections.fetch_add(1, Ordering::Relaxed);
-        // 连接计数守卫：不能只挂在函数作用域——本函数返回后 body 仍在流式泵送，
+        // 活性守卫：不能只挂在函数作用域——本函数返回后 body 仍在流式泵送，
         // 若此刻就减计数，闲置回收会把「响应头已回、body 未传完」的服务误判为闲置
         // （典型受害者：秒回 chunked 后长流式输出的服务），故把守卫移交给响应体流
-        let guard = ConnGuardForStream(Arc::clone(rt));
+        let guard = rt.activity();
         let proxy_started_at = std::time::Instant::now();
 
         let scheme = if mapping.target_https { "https" } else { "http" };
@@ -916,14 +862,9 @@ impl Gateway {
             proxy_headers.insert(reqwest::header::HOST, hv);
         }
 
-        // 请求体纯流式透传（双向流式战略）：收到即转发、不缓冲，
-        // 大小计数（chunked 超限即中断并回 413）
-        let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut pending_body = Some(axum::body::Body::from_stream(LimitedStream::new(
-            body.into_data_stream(),
-            MAX_REQUEST_BODY_SIZE,
-            Arc::clone(&overflow),
-        )));
+        // 请求体纯流式透传（双向流式战略）：收到即转发、不缓冲、不限大小，
+        // body 大小语义完全由后端服务定义（网关只做中转不做业务判断）
+        let mut pending_body = Some(body);
 
         // 状态缓存过期兑底：网关认为 Online 但后端进程已被外部杀掉（如部署脚本 pkill）时，
         // 首个请求会连接失败；此时重置为 offline 并冷启动后重试一次，保证「请求到达即服务可用」。
@@ -966,7 +907,7 @@ impl Gateway {
             })();
             let req = match build {
                 Ok(r) => r,
-                Err(e) => return proxy_request_error_response(e, cfg, rt, &overflow),
+                Err(e) => return proxy_request_error_response(e, cfg, rt, bodyless),
             };
             let send_fut = tokio::time::timeout(
                 Duration::from_millis(self.params().proxy_timeout_ms),
@@ -974,14 +915,11 @@ impl Gateway {
             );
             match send_fut.await {
                 Ok(Ok(resp)) => {
-                    let mut out = http::Response::builder().status(resp.status());
-                    for (k, v) in resp.headers().iter() {
-                        out = out.header(k, v);
-                    }
-                    Ok(out
-                        .body(axum::body::Body::new(resp.into_body()))
-                        .unwrap_or_else(|_| http::Response::builder().status(502).body(Default::default()).unwrap()))
-                }
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let body = axum::body::Body::new(resp.into_body());
+                    Ok(build_upstream_response(status, &headers, body))
+                },
                 Ok(Err(e)) => Err(ProxyUpstreamError::Send(e.to_string())),
                 Err(_) => Err(ProxyUpstreamError::Timeout),
             }
@@ -1000,14 +938,11 @@ impl Gateway {
             // reqwest 响应统一为 http::Response<axum Body>（与 UDS 分支同型）
             match send_fut.await {
                 Ok(Ok(r)) => {
-                    let mut out = http::Response::builder().status(r.status());
-                    for (k, v) in r.headers().iter() {
-                        out = out.header(k, v);
-                    }
-                    Ok(out
-                        .body(axum::body::Body::from_stream(r.bytes_stream()))
-                        .unwrap_or_else(|_| http::Response::builder().status(502).body(Default::default()).unwrap()))
-                }
+                    let status = r.status();
+                    let headers = r.headers().clone();
+                    let body = axum::body::Body::from_stream(r.bytes_stream());
+                    Ok(build_upstream_response(status, &headers, body))
+                },
                 Ok(Err(e)) => Err(ProxyUpstreamError::Send(e.to_string())),
                 Err(_) => Err(ProxyUpstreamError::Timeout),
             }
@@ -1015,9 +950,6 @@ impl Gateway {
             match upstream_result {
                 Ok(r) => break Ok(r),
                 Err(e) => {
-                    if overflow.load(Ordering::Relaxed) {
-                        break Err(e);
-                    }
                     // 后端不可达时将非 proxyOnly 服务状态重置为 offline
                     let was_online = !cfg.proxy_only && rt.status() == Status::Online;
                     if was_online {
@@ -1043,41 +975,13 @@ impl Gateway {
 
         let upstream = match upstream {
             Ok(r) => r,
-            Err(e) => {
-                if overflow.load(Ordering::Relaxed) {
-                    return text_response(axum::http::StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
-                }
-                logger::error(&format!("❌ [{}] 代理请求错误", cfg.name), Some(&e.to_string()));
-                if matches!(e, ProxyUpstreamError::Timeout) {
-                    return text_response(axum::http::StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout");
-                }
-                if !bodyless {
-                    // 后端在请求体发送中断开连接（如对不存在端点提前回 404 不读 body 即断连）：
-                    // 不合成 502，直接断开客户端连接，转发行为与后端对齐
-                    let gone = futures_util::stream::once(async {
-                        Err::<bytes::Bytes, std::io::Error>(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            "upstream closed during request body transfer",
-                        ))
-                    });
-                    // body 立即出错 → hyper 在写出响应头之前直接断开连接（不合成 502 文本响应）
-                    return http::Response::builder()
-                        .status(axum::http::StatusCode::BAD_GATEWAY)
-                        .body(axum::body::Body::from_stream(gone))
-                        .unwrap_or_else(|_| http::Response::builder().status(502).body(Default::default()).unwrap());
-                }
-                return text_response(axum::http::StatusCode::BAD_GATEWAY, "Bad Gateway");
-            }
+            Err(e) => return proxy_request_error_response(e, cfg, rt, bodyless),
         };
 
         // 请求指标：请求数（含分钟桶历史）+ 上游响应耗时（转发开始→响应头返回）
         rt.record_request();
         rt.total_request_ms
             .fetch_add(proxy_started_at.elapsed().as_millis() as i64, Ordering::Relaxed);
-
-        if overflow.load(Ordering::Relaxed) {
-            return text_response(axum::http::StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
-        }
 
         let status_code = axum::http::StatusCode::from_u16(upstream.status().as_u16())
             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
@@ -1119,7 +1023,7 @@ impl Gateway {
         // 长流式响应（chunked padding/SSE）期间闲置回收器不会误杀服务
         let rt_for_stream = Arc::clone(rt);
         let body = Body::from_stream(body.into_data_stream().map(move |item| {
-            rt_for_stream.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
+            rt_for_stream.touch();
             item
         }));
         let mut out = axum::response::Response::builder().status(status_code);
@@ -1143,11 +1047,8 @@ impl Gateway {
             return text_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Service Disabled");
         }
         // 刷新 last_access：升级握手（101 响应 + on_upgrade 回调调度）期间 ws_bridge
-        // 尚未 fetch_add，闲置回收器若恰在此窗口判定会把刚要建立的桥接杀在半路
-        mapping
-            .service
-            .last_access_ms
-            .store(now_ms() as i64, Ordering::Relaxed);
+        // 尚未取得守卫，闲置回收器若恰在此窗口判定会把刚要建立的桥接杀在半路
+        mapping.service.touch();
         // WS 冷请求同样要走按需启动：服务未就绪时直接拒绝，不做升级
         if let Err(e) = self.ensure_ready(&mapping).await {
             logger::warn(&format!("⚠️ 服务不可用: {}", e));
@@ -1180,8 +1081,8 @@ impl Gateway {
     ) {
         let rt = Arc::clone(&mapping.service);
         let cfg = &rt.config;
-        rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
-        rt.active_connections.fetch_add(1, Ordering::Relaxed);
+        // 活性守卫：桥接全程持有，连接关闭时 Drop 自动减计数并把关闭视为最后一次访问
+        let _guard = rt.activity();
         // 桥接停滞超时：链路无字节进展超过 stallTimeoutMs 即断开（0 = 禁用）
         let stall_timeout_ms = self.params().stall_timeout_ms;
 
@@ -1267,7 +1168,7 @@ impl Gateway {
                     &format!("❌ [{}] WS 上游连接失败: {upstream_url}", cfg.name),
                     Some(&e.to_string()),
                 );
-                rt.active_connections.fetch_sub(1, Ordering::Relaxed);
+                drop(_guard);
                 return;
             }
         };
@@ -1276,104 +1177,72 @@ impl Gateway {
             logger::info(&format!("🔌 [{}] WS 已连接上游 {upstream_url}", cfg.name));
         }
 
-        let (mut up_sink, mut up_stream) = upstream.split();
-        let (mut client_sink, mut client_stream) = client_ws.split();
+        let (up_sink, up_stream) = upstream.split();
+        let (client_sink, client_stream) = client_ws.split();
 
-        // 客户端 -> 上游
+        // 客户端 -> 上游（转换闭包内含断开原因日志）
         let rt_c2u = Arc::clone(&rt);
         let c2u = tokio::spawn(async move {
-            while let Some(msg) = client_stream.next().await {
-                let converted = match msg {
-                    Ok(WsMessage::Text(t)) => Some(TungsteniteMessage::Text(t.to_string())),
-                    Ok(WsMessage::Binary(b)) => Some(TungsteniteMessage::Binary(b.into())),
-                    Ok(WsMessage::Ping(p)) => Some(TungsteniteMessage::Ping(p.into())),
-                    Ok(WsMessage::Pong(p)) => Some(TungsteniteMessage::Pong(p.into())),
-                    Ok(WsMessage::Close(f)) => Some(TungsteniteMessage::Close(f.map(|f| {
-                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                            code: f.code.into(),
-                            reason: f.reason.to_string().into(),
-                        }
-                    }))),
-                    Err(e) => {
-                        // 不静默：上游断开原因必须可见（否则 WS 断开无法排查）
-                        logger::warn(&format!(
-                            "⚠️ [{}] WS 客户端->上游读取错误，断开桥接: {e}",
-                            rt_c2u.config.name
-                        ));
-                        None
+            let conv = move |msg| match msg {
+                Ok(WsMessage::Text(t)) => Some(TungsteniteMessage::Text(t.to_string())),
+                Ok(WsMessage::Binary(b)) => Some(TungsteniteMessage::Binary(b.into())),
+                Ok(WsMessage::Ping(p)) => Some(TungsteniteMessage::Ping(p.into())),
+                Ok(WsMessage::Pong(p)) => Some(TungsteniteMessage::Pong(p.into())),
+                Ok(WsMessage::Close(f)) => Some(TungsteniteMessage::Close(f.map(|f| {
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: f.code.into(),
+                        reason: f.reason.to_string().into(),
                     }
-                };
-                match converted {
-                    Some(m) => {
-                        // 慢客户端阻塞反向链路时，上游 send 会持续背压停滞；
-                        // 超过 proxyTimeoutMs 无进展即断开，防连接永久挂住
-                        let send = if stall_timeout_ms > 0 {
-                            tokio::time::timeout(Duration::from_millis(stall_timeout_ms), up_sink.send(m))
-                        } else {
-                            // 未启用停滞超时：永不超时（等价裸 send）
-                            tokio::time::timeout(Duration::from_secs(86400 * 365), up_sink.send(m))
-                        };
-                        if matches!(send.await, Err(_) | Ok(Err(_))) {
-                            break;
-                        }
-                    }
-                    None => break,
+                }))),
+                Err(e) => {
+                    // 不静默：断开原因必须可见（否则 WS 断开无法排查）
+                    logger::warn(&format!(
+                        "⚠️ [{}] WS 客户端->上游读取错误，断开桥接: {e}",
+                        rt_c2u.config.name
+                    ));
+                    None
                 }
-            }
-            let _ = up_sink.close().await;
+            };
+            ws_pump(up_sink, client_stream, conv, stall_timeout_ms, None).await;
         });
 
-        // 上游 -> 客户端
+        // 上游 -> 客户端（停滞日志文案提前捕取，避免与转换闭包竞争所有权）
         let rt_u2c = Arc::clone(&rt);
+        let u2c_stall_log = (stall_timeout_ms > 0).then(|| {
+            format!(
+                "⚠️ [{}] WS 客户端响应停滞超过 {stall_timeout_ms}ms，断开桥接",
+                rt_u2c.config.name
+            )
+        });
         let u2c = tokio::spawn(async move {
-            while let Some(msg) = up_stream.next().await {
-                let converted = match msg {
-                    Ok(TungsteniteMessage::Text(t)) => Some(WsMessage::Text(t.as_str().into())),
-                    Ok(TungsteniteMessage::Binary(b)) => Some(WsMessage::Binary(b.to_vec().into())),
-                    Ok(TungsteniteMessage::Ping(p)) => Some(WsMessage::Ping(p.to_vec().into())),
-                    Ok(TungsteniteMessage::Pong(p)) => Some(WsMessage::Pong(p.to_vec().into())),
-                    Ok(TungsteniteMessage::Close(f)) => {
-                        // 关闭码/原因透传给客户端（不透传会变成无码关闭=1005）
-                        let f = f.map(|f| axum::extract::ws::CloseFrame {
-                            code: f.code.into(),
-                            reason: f.reason.to_string().into(),
-                        });
-                        Some(WsMessage::Close(f))
-                    }
-                    Err(e) => {
-                        logger::warn(&format!(
-                            "⚠️ [{}] WS 上游->客户端读取错误，断开桥接: {e}",
-                            rt_u2c.config.name
-                        ));
-                        None
-                    }
-                    Ok(TungsteniteMessage::Frame(_)) => None,
-                };
-                match converted {
-                    Some(m) => {
-                        // 慢客户端停滞超时：client_sink.send 背压超过 proxyTimeoutMs 即断开
-                        let send = if stall_timeout_ms > 0 {
-                            tokio::time::timeout(Duration::from_millis(stall_timeout_ms), client_sink.send(m))
-                        } else {
-                            tokio::time::timeout(Duration::from_secs(86400 * 365), client_sink.send(m))
-                        };
-                        if matches!(send.await, Err(_) | Ok(Err(_))) {
-                            logger::warn(&format!(
-                                "⚠️ [{}] WS 客户端响应停滞超过 {stall_timeout_ms}ms，断开桥接",
-                                rt_u2c.config.name
-                            ));
-                            break;
-                        }
-                    }
-                    None => break,
+            let conv = move |msg| match msg {
+                Ok(TungsteniteMessage::Text(t)) => Some(WsMessage::Text(t.as_str().into())),
+                Ok(TungsteniteMessage::Binary(b)) => Some(WsMessage::Binary(b.to_vec().into())),
+                Ok(TungsteniteMessage::Ping(p)) => Some(WsMessage::Ping(p.to_vec().into())),
+                Ok(TungsteniteMessage::Pong(p)) => Some(WsMessage::Pong(p.to_vec().into())),
+                Ok(TungsteniteMessage::Close(f)) => {
+                    // 关闭码/原因透传给客户端（不透传会变成无码关闭=1005）
+                    let f = f.map(|f| axum::extract::ws::CloseFrame {
+                        code: f.code.into(),
+                        reason: f.reason.to_string().into(),
+                    });
+                    Some(WsMessage::Close(f))
                 }
-            }
-            let _ = client_sink.close().await;
+                Err(e) => {
+                    logger::warn(&format!(
+                        "⚠️ [{}] WS 上游->客户端读取错误，断开桥接: {e}",
+                        rt_u2c.config.name
+                    ));
+                    None
+                }
+                Ok(TungsteniteMessage::Frame(_)) => None,
+            };
+            ws_pump(client_sink, up_stream, conv, stall_timeout_ms, u2c_stall_log).await;
         });
 
-        // 连接计数在桥任务结束后统一扣减一次（c2u/u2c 两个转发任务不再各自扣，否则净 -1）
+        // 桥任务结束后统一释放守卫（c2u/u2c 两个转发任务不各自持有，否则净 -1）
         let _ = tokio::join!(c2u, u2c);
-        rt.active_connections.fetch_sub(1, Ordering::Relaxed);
+        drop(_guard);
 
         if logger::ws_log_enabled() {
             logger::info(&format!("🔌 [{}] WS 连接已关闭", cfg.name));
@@ -1413,7 +1282,7 @@ impl Gateway {
                 }
                 let mapping = Arc::clone(&mapping);
                 let rt = Arc::clone(&mapping.service);
-                rt.last_access_ms.store(now_ms() as i64, Ordering::Relaxed);
+                rt.touch();
 
                 // 按需启动：passthrough 也支持冷启动
                 let gw2 = Arc::clone(&gw);
@@ -1453,13 +1322,13 @@ impl Gateway {
                             return;
                         }
                     }
-                    rt.active_connections.fetch_add(1, Ordering::Relaxed);
+                    let _guard = rt.activity();
                     let (mut cr, mut cw) = tokio::io::split(client);
                     let (mut tr, mut tw) = tokio::io::split(target);
                     let up = tokio::io::copy(&mut cr, &mut tw);
                     let down = tokio::io::copy(&mut tr, &mut cw);
                     let _ = tokio::join!(up, down);
-                    rt.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    drop(_guard);
                 });
             }
         })
@@ -1512,14 +1381,6 @@ impl Gateway {
 }
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// 声明的 content-length（无头时 None）
-fn declared_content_length(headers: &HeaderMap) -> Option<usize> {
-    headers
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<usize>().ok())
-}
 
 /// 纯文本响应
 pub fn text_response(status: axum::http::StatusCode, text: &str) -> axum::response::Response {
@@ -1656,16 +1517,72 @@ impl std::fmt::Display for ProxyUpstreamError {
     }
 }
 
-/// 上游错误 -> 统一错误响应（413/502/504 + 后端不可达时状态重置）
+/** 上游响应归一：复制状态与响应头，构造失败时降级 502。
+ *  UDS（hyper 直连）与 reqwest 两分支共用，禁止内联重写 */
+fn build_upstream_response(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body: axum::body::Body,
+) -> http::Response<axum::body::Body> {
+    let mut out = http::Response::builder().status(status);
+    for (k, v) in headers.iter() {
+        out = out.header(k, v);
+    }
+    out.body(body)
+        .unwrap_or_else(|_| http::Response::builder().status(502).body(Default::default()).unwrap())
+}
+
+/** 停滞超时包装：timeout_ms = 0 表示永不超时（等价裸 await）；
+ *  返回 None 表示超时中断 */
+async fn maybe_timeout<F: std::future::Future>(timeout_ms: u64, fut: F) -> Option<F::Output> {
+    if timeout_ms > 0 {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await.ok()
+    } else {
+        Some(fut.await)
+    }
+}
+
+/** WS 单向泵：读 stream、经 convert 转换后写 sink；
+ *  convert 返回 None（错误/不可转换消息）或 send 停滞超时即断开。
+ *  c2u/u2c 两个方向共用，仅消息枚举与转换闭包不同 */
+async fn ws_pump<Si, St, Mo, F>(
+    mut sink: Si,
+    mut stream: St,
+    mut convert: F,
+    stall_timeout_ms: u64,
+    // 停滞断开时的日志文案（None = 不记日志）
+    stall_log: Option<String>,
+) where
+    Si: futures_util::Sink<Mo> + Unpin,
+    Si::Error: std::fmt::Display,
+    St: futures_util::Stream + Unpin,
+    F: FnMut(St::Item) -> Option<Mo>,
+{
+    while let Some(item) = stream.next().await {
+        let Some(m) = convert(item) else { break };
+        match maybe_timeout(stall_timeout_ms, sink.send(m)).await {
+            Some(Ok(())) => {}
+            Some(Err(_)) => break,
+            None => {
+                if let Some(msg) = &stall_log {
+                    logger::warn(msg);
+                }
+                break;
+            }
+        }
+    }
+    let _ = sink.close().await;
+}
+
+/// 上游错误 -> 统一错误响应（502/504 + 后端不可达时状态重置）。
 fn proxy_request_error_response(
     e: ProxyUpstreamError,
     cfg: &crate::config::ServiceConfig,
     rt: &Arc<ServiceRuntime>,
-    overflow: &Arc<std::sync::atomic::AtomicBool>,
+    // 无请求体（可重放）：后端在请求体发送中断连时不合成 502 文本，
+    // 直接断开客户端连接与后端行为对齐
+    bodyless: bool,
 ) -> axum::response::Response {
-    if overflow.load(Ordering::Relaxed) {
-        return text_response(axum::http::StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
-    }
     logger::error(&format!("❌ [{}] 代理请求错误", cfg.name), Some(&e.to_string()));
     if !cfg.proxy_only && rt.status() == Status::Online {
         logger::info(&format!("🔄 [{}] 后端不可达，重置状态为 offline", cfg.name));
@@ -1674,6 +1591,21 @@ fn proxy_request_error_response(
     }
     if matches!(e, ProxyUpstreamError::Timeout) {
         return text_response(axum::http::StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout");
+    }
+    if !bodyless {
+        // 后端在请求体发送中断开连接（如对不存在端点提前回 404 不读 body 即断连）：
+        // 不合成 502，直接断开客户端连接，转发行为与后端对齐
+        let gone = futures_util::stream::once(async {
+            Err::<bytes::Bytes, std::io::Error>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "upstream closed during request body transfer",
+            ))
+        });
+        // body 立即出错 → hyper 在写出响应头之前直接断开连接（不合成 502 文本响应）
+        return http::Response::builder()
+            .status(axum::http::StatusCode::BAD_GATEWAY)
+            .body(axum::body::Body::from_stream(gone))
+            .unwrap_or_else(|_| http::Response::builder().status(502).body(Default::default()).unwrap());
     }
     text_response(axum::http::StatusCode::BAD_GATEWAY, "Bad Gateway")
 }
@@ -1732,21 +1664,13 @@ impl tokio::io::AsyncWrite for WsUpstreamStream {
     }
 }
 
-/// 连接计数守卫流：把 proxy_request 的连接计数守卫挂在响应体流上，
-/// body 传完或流被 drop（客户端断开/出错）时才释放计数。
+/// 连接计数守卫流：把 proxy_request 的活性守卫挂在响应体流上，
+/// body 传完或流被 drop（客户端断开/出错）时才释放。
 /// 函数作用域守卫会在「响应头返回即 return」时提前释放，导致长流式响应
 /// 期间服务被闲置回收器误杀（active_connections==0 但流仍在传输）
 struct ConnectionGuardStream<S> {
     inner: S,
-    _guard: Option<ConnGuardForStream>,
-}
-
-/// 守卫句柄类型（与 proxy_request 内部 ConnGuard 同构，独立定义避免作用域纠缠）
-struct ConnGuardForStream(Arc<ServiceRuntime>);
-impl Drop for ConnGuardForStream {
-    fn drop(&mut self) {
-        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
-    }
+    _guard: Option<crate::state::ActivityGuard>,
 }
 
 impl<S> futures_util::Stream for ConnectionGuardStream<S>
@@ -1832,58 +1756,6 @@ where
         }
     }
 }
-
-/// 请求体大小限制流：计数超限时置位 overflow 标记并中断流（发送失败 -> 413）
-struct LimitedStream<S> {
-    inner: S,
-    remaining: usize,
-    overflow: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl<S> LimitedStream<S> {
-    fn new(
-        inner: S,
-        max: usize,
-        overflow: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
-        Self { inner, remaining: max, overflow }
-    }
-}
-
-impl<S> futures_util::Stream for LimitedStream<S>
-where
-    S: futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
-{
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
-            std::task::Poll::Ready(Some(Ok(chunk))) => {
-                if chunk.len() > self.remaining {
-                    self.overflow.store(true, Ordering::Relaxed);
-                    return std::task::Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "payload too large",
-                    ))));
-                }
-                self.remaining -= chunk.len();
-                std::task::Poll::Ready(Some(Ok(chunk)))
-            }
-            std::task::Poll::Ready(Some(Err(e))) => {
-                std::task::Poll::Ready(Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-
 
 /// isRunning 的运行时便捷封装（admin API 用）
 #[allow(dead_code)]

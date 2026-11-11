@@ -1,23 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import {
   fetchServices,
-  fetchServiceDetail,
-  startService,
-  stopService,
-  disableService,
-  enableService,
+  fetchStats,
   captureTokenFromHash,
   getToken,
   clearToken,
   setToken,
-  fetchStats,
+  localClient,
+  type AdminClient,
   type ServiceListItem,
   type ServiceDetail,
   type ServiceStats,
 } from './api';
-import { fetchConfig, saveConfig } from './api';
 import { persistedRef } from './persistedRef';
+import { formatDuration } from './utils';
+import { usePagination } from './composables/usePagination';
 import StatsCharts from './StatsCharts.vue';
 import GlobalChart from './GlobalChart.vue';
 import ConfigEditor from './ConfigEditor.vue';
@@ -179,24 +177,18 @@ const sortedRows = computed(() => {
     return String(va).localeCompare(String(vb)) * dir;
   });
 });
-/** 每页行数选项与默认值：万级服务全量渲染会拖死主线程，分页控制单次 DOM 规模 */
-const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200];
-/** 每页行数（用户选择本地持久化） */
-const pageSize = persistedRef('table.pageSize', 50);
-/** 当前页（1 起）；筛选/搜索/排序/页大小变化时重置到第一页 */
-const pageNo = ref(1);
-const totalPages = computed(() => Math.max(Math.ceil(sortedRows.value.length / pageSize.value), 1));
-watch([visibleRows, () => searchKw.value, () => filterPanel.value, () => statusFilter.value, sortKey, pageSize], () => {
-  pageNo.value = 1;
-});
-/** 当前页实际渲染的行 */
-const renderedRows = computed(() =>
-  sortedRows.value.slice((pageNo.value - 1) * pageSize.value, pageNo.value * pageSize.value),
-);
-/** 翻页：n 越界自动夹紧 */
-function gotoPage(n: number): void {
-  pageNo.value = Math.min(Math.max(n, 1), totalPages.value);
+/** 行 -> 面板 API 客户端路由：本地行走 localClient，远程行按 panelId 构造 PanelClient（唯一收口处） */
+function clientFor(row: FedRow): AdminClient {
+  return row.remote ? new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!) : localClient;
 }
+
+/** 每页行数选项与默认值：万级服务全量渲染会拖死主线程，分页控制单次 DOM 规模（筛选/排序变化自动回第一页） */
+const { pageSize, pageNo, totalPages, renderedSlice: renderedRows, gotoPage, PAGE_SIZE_OPTIONS } = usePagination(
+  () => sortedRows.value,
+  'table.pageSize',
+  50,
+  [searchKw, filterPanel, statusFilter, sortKey],
+);
 /** 点击表头切换排序：同列循环 升序→降序→取消 */
 function toggleSort(key: string): void {
   if (sortKey.value !== key) {
@@ -234,13 +226,10 @@ const editSaving = ref(false);
 /** 进入原地编辑：拉取配置定位该服务条目填充表单（本地/远程面板同构 API） */
 async function startEdit(row: FedRow): Promise<void> {
   editError.value = '';
-  const client = row.remote ? new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!) : null;
+  const client = clientFor(row);
   const name = row.svc.name;
   try {
-    const [detail, cfg] = await Promise.all([
-      row.remote ? client!.fetchServiceDetail(name) : fetchServiceDetail(name),
-      row.remote ? client!.fetchConfig() : fetchConfig(),
-    ]);
+    const [detail, cfg] = await Promise.all([client.fetchServiceDetail(name), client.fetchConfig()]);
     /** 配置键是 host（面板 name 可能是 base 地址），从详情取 host 定位 */
     const host = (detail.host as string) ?? name;
     const svc = cfg.services?.[host];
@@ -276,9 +265,9 @@ async function saveEdit(): Promise<void> {
     editError.value = '编辑目标已不存在';
     return;
   }
-  const client = row.remote ? new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!) : null;
-  const getConfig = () => (row.remote ? client!.fetchConfig() : fetchConfig());
-  const putConfig = (cfg: Record<string, any>) => (row.remote ? client!.saveConfig(cfg) : saveConfig(cfg));
+  const client = clientFor(row);
+  const getConfig = () => client.fetchConfig();
+  const putConfig = (cfg: Record<string, any>) => client.saveConfig(cfg);
   editSaving.value = true;
   try {
     const cfg = await getConfig();
@@ -406,9 +395,7 @@ async function toggleDetail(row: FedRow): Promise<void> {
     return;
   }
   try {
-    const detail = row.remote
-      ? await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).fetchServiceDetail(row.svc.name)
-      : await fetchServiceDetail(row.svc.name);
+    const detail = await clientFor(row).fetchServiceDetail(row.svc.name);
     details.value.set(key, detail);
     expanded.value = new Set(expanded.value).add(key);
   } catch (e) {
@@ -416,15 +403,11 @@ async function toggleDetail(row: FedRow): Promise<void> {
   }
 }
 
-/** 启动服务 */
-async function onStart(row: FedRow): Promise<void> {
+/** 服务操作统一入口：按行路由客户端执行动作，成功后刷新，全程锁定该行按钮 */
+async function runAction(row: FedRow, action: 'startService' | 'stopService' | 'disableService' | 'enableService'): Promise<void> {
   busy.value = row.uid;
   try {
-    if (row.remote) {
-      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).startService(row.svc.name);
-    } else {
-      await startService(row.svc.name);
-    }
+    await clientFor(row)[action](row.svc.name);
     await refresh();
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -433,57 +416,26 @@ async function onStart(row: FedRow): Promise<void> {
   }
 }
 
+/** 启动服务 */
+function onStart(row: FedRow): Promise<void> {
+  return runAction(row, 'startService');
+}
+
 /** 停止服务（下次请求会自动按需拉起） */
-async function onStop(row: FedRow): Promise<void> {
-  busy.value = row.uid;
-  try {
-    if (row.remote) {
-      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).stopService(row.svc.name);
-    } else {
-      await stopService(row.svc.name);
-    }
-    await refresh();
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    busy.value = '';
-  }
+function onStop(row: FedRow): Promise<void> {
+  return runAction(row, 'stopService');
 }
 
 /** 彻底关停（停止并禁止按需拉起） */
 async function onDisable(row: FedRow): Promise<void> {
   const scope = row.remote ? `远程面板「${row.panelName}」的服务` : '服务';
   if (!(await confirmDialog(`彻底关停${scope} ${row.svc.name}？之后请求到达不会自动拉起，需手动解除。`, { danger: true, okText: '彻底关停' }))) return;
-  busy.value = row.uid;
-  try {
-    if (row.remote) {
-      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).disableService(row.svc.name);
-    } else {
-      await disableService(row.svc.name);
-    }
-    await refresh();
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    busy.value = '';
-  }
+  await runAction(row, 'disableService');
 }
 
 /** 解除彻底关停 */
-async function onEnable(row: FedRow): Promise<void> {
-  busy.value = row.uid;
-  try {
-    if (row.remote) {
-      await new PanelClient(remotePanels.value.find((p) => p.id === row.panelId)!).enableService(row.svc.name);
-    } else {
-      await enableService(row.svc.name);
-    }
-    await refresh();
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    busy.value = '';
-  }
+function onEnable(row: FedRow): Promise<void> {
+  return runAction(row, 'enableService');
 }
 
 /** 状态徽标样式类 */
@@ -491,14 +443,6 @@ function statusClass(status: string): string {
   return `status-${status}`;
 }
 
-/** 格式化运行时长（入参毫秒） */
-function formatUptime(ms: number): string {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
-  return `${Math.floor(s / 86400)}d${Math.floor((s % 86400) / 3600)}h`;
-}
 
 /** 启动耗时格式化：秒级显示（冷启动排障用） */
 function formatMs(ms: number): string {
@@ -508,12 +452,12 @@ function formatMs(ms: number): string {
 /** 存活/回收合并单元格文案：online 显示存活时长+回收倒计时，已停回退显示历史累计存活 */
 function uptimeCell(svc: ServiceListItem): { main: string; sub: string | null; title: string } {
   if (svc.status === 'online') {
-    const main = formatUptime(svc.uptime);
+    const main = formatDuration(svc.uptime);
     if (svc.idleRemainingMs == null) return { main, sub: null, title: '有活跃连接，不回收' };
-    const sub = svc.idleRemainingMs <= 60_000 ? `${Math.ceil(svc.idleRemainingMs / 1000)}s后停` : `${formatUptime(svc.idleRemainingMs)}后停`;
-    return { main, sub, title: `闲置 ${formatUptime(svc.idleTimeout)} 后自动停止，剩余 ${formatUptime(svc.idleRemainingMs)}` };
+    const sub = svc.idleRemainingMs <= 60_000 ? `${Math.ceil(svc.idleRemainingMs / 1000)}s后停` : `${formatDuration(svc.idleRemainingMs)}后停`;
+    return { main, sub, title: `闲置 ${formatDuration(svc.idleTimeout)} 后自动停止，剩余 ${formatDuration(svc.idleRemainingMs)}` };
   }
-  if (svc.totalUptime) return { main: '总 ' + formatUptime(svc.totalUptime), sub: null, title: '历史累计存活时间' };
+  if (svc.totalUptime) return { main: '总 ' + formatDuration(svc.totalUptime), sub: null, title: '历史累计存活时间' };
   return { main: '-', sub: null, title: '' };
 }
 
@@ -751,10 +695,10 @@ onMounted(() => {
                 <span>最后访问</span><code>{{ formatTime(details.get(row.uid)!.lastAccessTime) }}</code>
                 <span>闲置回收</span>
                 <template v-if="editingSvc === row.uid"><div class="inline-field"><input v-model.number="editForm.idleSec" type="number" min="0" /><small class="hint">秒</small></div></template>
-                <code v-else>{{ formatUptime(details.get(row.uid)!.idleTimeout) }}</code>
+                <code v-else>{{ formatDuration(details.get(row.uid)!.idleTimeout) }}</code>
                 <span>启动超时</span>
                 <template v-if="editingSvc === row.uid"><div class="inline-field"><input v-model.number="editForm.startSec" type="number" min="1" /><small class="hint">秒</small></div></template>
-                <code v-else>{{ formatUptime(details.get(row.uid)!.startTimeout ?? 0) }}</code>
+                <code v-else>{{ formatDuration(details.get(row.uid)!.startTimeout ?? 0) }}</code>
                 <span>启动命令</span>
                 <template v-if="editingSvc === row.uid"><textarea v-model="editForm.startCommand" rows="2"></textarea></template>
                 <code v-else class="cmd">{{ details.get(row.uid)!.startCommand || '-' }}</code>
@@ -779,12 +723,6 @@ onMounted(() => {
         </template>
         <tr v-for="pe in panelErrors" :key="pe.id">
           <td colspan="8" class="panel-error">⚠️ 远程面板「{{ pe.name }}」拉取失败：{{ pe.error }}</td>
-        </tr>
-        <tr v-if="hiddenRowCount > 0">
-          <td colspan="8" class="empty">
-            已隐藏 {{ hiddenRowCount }} 个服务（大列表全量渲染会拖慢页面），用上方搜索定位目标，或
-            <button class="btn" @click="showAll = true">显示全部</button>
-          </td>
         </tr>
         <tr v-if="!visibleRows.length && !loading">
           <td colspan="8" class="empty">{{ fedRows.length ? '无匹配服务' : '暂无服务' }}</td>
